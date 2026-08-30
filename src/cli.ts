@@ -40,8 +40,8 @@ const USAGE = `用法：opennext-r2-prune [选项]
 
 退出码：0 成功 / 1 参数或校验失败 / 2 写入规则失败`;
 
-async function main(argv: string[]): Promise<number> {
-  const { values } = parseArgs({
+function parseCliArgs(argv: string[]) {
+  return parseArgs({
     args: argv,
     options: {
       bucket: { type: "string" },
@@ -64,7 +64,19 @@ async function main(argv: string[]): Promise<number> {
       help: { type: "boolean", short: "h" },
     },
     strict: true,
-  });
+  }).values;
+}
+
+async function main(argv: string[]): Promise<number> {
+  let values: ReturnType<typeof parseCliArgs>;
+  try {
+    values = parseCliArgs(argv);
+  } catch (error) {
+    // 未知开关、缺参数值等：报结论加用法。这类是 parseArgs 抛的原生 TypeError，
+    // 不在文件末尾那张「预期内失败」清单里，漏在这儿就会变成一段 Node 堆栈。
+    console.error(`${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
+    return 1;
+  }
 
   if (values.help) {
     console.log(USAGE);

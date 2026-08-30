@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { R2Store, S3Error } from "../src/store.ts";
+import { XmlAssumptionError } from "../src/xml.ts";
 
 const CREDS = {
   endpoint: "https://acct123.r2.cloudflarestorage.com",
@@ -53,6 +54,18 @@ describe("listBuildIds", () => {
 
     expect(await store.listBuildIds("incremental-cache")).toEqual(["b1", "b2"]);
     expect(new URL(calls[1]!.url).searchParams.get("continuation-token")).toBe("tok");
+  });
+
+  it("说还有下一页却没给游标时中止，不返回残缺的列表", async () => {
+    // 残缺的列表会让没列到的 build 被当成「目录已空」，规则被误回收，目录再没人清理
+    const { fetchImpl } = stub([
+      ok(`<ListBucketResult><IsTruncated>true</IsTruncated>
+        <CommonPrefixes><Prefix>incremental-cache/b1/</Prefix></CommonPrefixes>
+      </ListBucketResult>`),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    await expect(store.listBuildIds("incremental-cache")).rejects.toThrow(XmlAssumptionError);
   });
 
   it("前缀为空时列举 bucket 根下的一级目录", async () => {

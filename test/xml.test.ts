@@ -27,25 +27,31 @@ describe("parseListObjects", () => {
     expect(result.isTruncated).toBe(false);
   });
 
-  it("解析对象及其写入时间", () => {
-    // key 的形状来自 OpenNext 的 computeCacheKey：<prefix>/<buildId>/<sha256>.<cacheType>
+  it("取出分页字段", () => {
     const xml = `<ListBucketResult>
       <IsTruncated>true</IsTruncated>
       <NextContinuationToken>tok123</NextContinuationToken>
-      <Contents>
-        <Key>incremental-cache/build1/${"a".repeat(64)}.cache</Key>
-        <LastModified>2026-08-20T09:03:11.000Z</LastModified>
-      </Contents>
+      <CommonPrefixes><Prefix>incremental-cache/b1/</Prefix></CommonPrefixes>
     </ListBucketResult>`;
     const result = parseListObjects(xml);
-    expect(result.objects).toHaveLength(1);
-    expect(result.objects[0]!.lastModified?.toISOString()).toBe("2026-08-20T09:03:11.000Z");
+    expect(result.isTruncated).toBe(true);
     expect(result.nextContinuationToken).toBe("tok123");
   });
 
-  it("遇到含 XML 转义字符的 key 就报错，而不是猜一个反转义结果", () => {
-    const xml = `<ListBucketResult><Contents><Key>a&amp;b</Key></Contents></ListBucketResult>`;
+  it("目录名含 XML 转义字符就报错，而不是猜一个反转义结果", () => {
+    // 这些值会被拿去拼删除规则
+    const xml = `<ListBucketResult><CommonPrefixes><Prefix>a&amp;b/</Prefix></CommonPrefixes></ListBucketResult>`;
     expect(() => parseListObjects(xml)).toThrow(XmlAssumptionError);
+  });
+
+  it("<Contents> 一概不解析：无关的对象名不该打断整次运行", () => {
+    // --allow-root-prefix 下 bucket 根上的任意文件都会出现在这里，它们与 build 判定无关
+    const xml = `<ListBucketResult>
+      <IsTruncated>false</IsTruncated>
+      <CommonPrefixes><Prefix>b1/</Prefix></CommonPrefixes>
+      <Contents><Key>导出记录 2026.csv</Key></Contents>
+    </ListBucketResult>`;
+    expect(parseListObjects(xml).commonPrefixes).toEqual(["b1/"]);
   });
 });
 

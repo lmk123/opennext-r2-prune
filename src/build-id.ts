@@ -17,7 +17,15 @@ export class BuildIdProbeError extends Error {
 }
 
 export function buildIdUrlFor(siteUrl: string): string {
-  return new URL("/BUILD_ID", siteUrl).toString();
+  try {
+    return new URL("/BUILD_ID", siteUrl).toString();
+  } catch {
+    // 最常见的是漏了协议（SITE_URL=example.com）。不包一层，调用方拿到的是 URL
+    // 构造器的原生 TypeError，会绕过 cli 的错误分类直接甩出堆栈。
+    throw new BuildIdProbeError(
+      `站点地址不是合法的 URL：${JSON.stringify(siteUrl)}。请带上协议，例如 https://example.com。`,
+    );
+  }
 }
 
 export async function probeBuildId(

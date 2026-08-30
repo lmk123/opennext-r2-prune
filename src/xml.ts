@@ -1,9 +1,8 @@
 /**
  * 极简 XML 读写，只覆盖本工具用到的两种响应：ListObjectsV2 与 lifecycle 配置。
  *
- * 之所以敢手写而不引 XML 解析器：我们真正需要「解析成值」的字段只有 buildId 和缓存
- * 对象的 key，而它们的字符集被 OpenNext 的 computeCacheKey 约束死了
- * （`${prefix}/${buildId}/${sha256}.${cacheType}`），不含 XML 转义字符。
+ * 之所以敢手写而不引 XML 解析器：我们真正需要「解析成值」的字段只有 buildId，
+ * 它来自 CommonPrefixes，字符集被 OpenNext 的目录布局约束死了，不含 XML 转义字符。
  * 一旦出现转义字符就说明假设不成立，此时报错而不是猜（见 assertLiteral）。
  *
  * 用户自己在 bucket 上配的 lifecycle 规则则完全不解析，整块 XML 原样搬运，
@@ -47,36 +46,25 @@ function text(xml: string, tag: string): string | undefined {
 }
 
 export interface ListObjectsResult {
-  /** Delimiter 模式下的 CommonPrefixes，已剥掉请求前缀与结尾斜杠 */
+  /** Delimiter 模式下的 CommonPrefixes，原样保留（含请求前缀与结尾斜杠） */
   commonPrefixes: string[];
-  /**
-   * 响应里直接列出的对象。列 build 目录只看 CommonPrefixes，没人读这个字段 ——
-   * 留着是因为解析它的过程会对每个 Key 跑一遍布局断言，那道校验仍然有价值。
-   */
-  objects: { key: string; lastModified: Date | undefined }[];
   isTruncated: boolean;
   nextContinuationToken: string | undefined;
 }
 
+/**
+ * 只取 CommonPrefixes 与分页字段。<Contents> 里的对象 key 一概不碰：build 目录全靠
+ * CommonPrefixes 认，key 从不参与拼规则，对它做布局断言只会让一个毫不相干的对象名
+ * （--allow-root-prefix 下 bucket 根上随便一个带空格的文件）把整次运行打断。
+ */
 export function parseListObjects(xml: string): ListObjectsResult {
   const commonPrefixes = blocks(xml, "CommonPrefixes")
     .map((block) => text(block, "Prefix"))
     .filter((p): p is string => p !== undefined)
     .map((p) => assertLiteral(p, "CommonPrefixes 中的 Prefix"));
 
-  const objects = blocks(xml, "Contents").map((block) => {
-    const key = assertLiteral(text(block, "Key") ?? "", "对象 Key");
-    const raw = text(block, "LastModified");
-    const parsed = raw ? new Date(raw) : undefined;
-    return {
-      key,
-      lastModified: parsed && !Number.isNaN(parsed.getTime()) ? parsed : undefined,
-    };
-  });
-
   return {
     commonPrefixes,
-    objects,
     isTruncated: text(xml, "IsTruncated")?.trim() === "true",
     nextContinuationToken: text(xml, "NextContinuationToken"),
   };

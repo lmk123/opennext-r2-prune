@@ -10,6 +10,11 @@ describe("buildIdUrlFor", () => {
     expect(buildIdUrlFor("https://example.com")).toBe("https://example.com/BUILD_ID");
     expect(buildIdUrlFor("https://example.com/blog")).toBe("https://example.com/BUILD_ID");
   });
+
+  it("地址不合法时报错，而不是甩出 URL 构造器的原生 TypeError", () => {
+    // SITE_URL=example.com（漏了协议）是最常见的写法
+    expect(() => buildIdUrlFor("example.com")).toThrow(BuildIdProbeError);
+  });
 });
 
 describe("probeBuildId", () => {

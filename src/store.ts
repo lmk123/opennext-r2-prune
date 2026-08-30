@@ -6,6 +6,7 @@ import {
   parseLifecycle,
   parseListObjects,
   renderLifecycle,
+  XmlAssumptionError,
 } from "./xml.ts";
 
 /**
@@ -115,6 +116,14 @@ export class R2Store {
       for (const commonPrefix of result.commonPrefixes) {
         const buildId = commonPrefix.slice(normalized.length).replace(/\/$/, "");
         if (buildId) found.push(buildId);
+      }
+      // 还有下一页却没给游标：拿着残缺的列表往下走，没列到的 build 会被当成「目录已空」
+      // 把规则回收掉，那些目录就再没人清理了 —— 而且全程 0 退出，看不出漏了东西。
+      if (result.isTruncated && !result.nextContinuationToken) {
+        throw new XmlAssumptionError(
+          "列举结果说还有下一页（IsTruncated=true）却没有 NextContinuationToken，" +
+            "无法确认已经看到全部 build，已中止。",
+        );
       }
       token = result.isTruncated ? result.nextContinuationToken : undefined;
     } while (token);
