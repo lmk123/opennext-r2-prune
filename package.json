@@ -1,0 +1,45 @@
+{
+  "name": "opennext-r2-prune",
+  "version": "0.0.0",
+  "description": "Delete stale build caches from your Cloudflare R2 bucket for @opennextjs/cloudflare (OpenNext) Next.js deployments",
+  "keywords": [
+    "opennextjs-cloudflare",
+    "opennext",
+    "cloudflare",
+    "r2",
+    "nextjs",
+    "isr",
+    "cache",
+    "build-id",
+    "cleanup",
+    "prune"
+  ],
+  "license": "MIT",
+  "author": "lmk123",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "opennext-r2-prune": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "start": "node --experimental-strip-types src/cli.ts"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
