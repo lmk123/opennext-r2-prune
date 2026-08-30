@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type OwnRule,
   parseLifecycle,
   parseListObjects,
   renderLifecycle,
@@ -68,7 +69,13 @@ describe("parseLifecycle", () => {
   it("按 ID 前缀分拣自有规则与外部规则", () => {
     const parsed = parseLifecycle(doc);
     expect(parsed.own).toEqual([
-      { buildId: "oldbuild1", prefix: "incremental-cache/oldbuild1/" },
+      {
+        buildId: "oldbuild1",
+        prefix: "incremental-cache/oldbuild1/",
+        expireDays: 1,
+        style: "filter",
+        enabled: true,
+      },
     ]);
     expect(parsed.foreign).toHaveLength(1);
     expect(parsed.foreign[0]).toContain("keep-user-logs");
@@ -76,7 +83,7 @@ describe("parseLifecycle", () => {
 
   it("写回时原样保留外部规则", () => {
     const parsed = parseLifecycle(doc);
-    const xml = renderLifecycle(parsed, { expireDays: 1, style: "filter" });
+    const xml = renderLifecycle(parsed);
     expect(xml).toContain("<ID>keep-user-logs</ID>");
     expect(xml).toContain("<Prefix>logs/</Prefix>");
     expect(xml).toContain("<Days>30</Days>");
@@ -90,9 +97,7 @@ describe("parseLifecycle", () => {
     </Rule></LifecycleConfiguration>`;
     const parsed = parseLifecycle(withEntity);
     expect(parsed.own).toHaveLength(0);
-    expect(renderLifecycle(parsed, { expireDays: 1, style: "filter" })).toContain(
-      "tmp &amp; scratch",
-    );
+    expect(renderLifecycle(parsed)).toContain("tmp &amp; scratch");
   });
 
   it("也认老式的、Prefix 直接挂在 Rule 下的写法", () => {
@@ -101,26 +106,62 @@ describe("parseLifecycle", () => {
       <Prefix>incremental-cache/b2/</Prefix><Expiration><Days>1</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
     expect(parseLifecycle(bare).own).toEqual([
-      { buildId: "b2", prefix: "incremental-cache/b2/" },
+      {
+        buildId: "b2",
+        prefix: "incremental-cache/b2/",
+        expireDays: 1,
+        style: "bare",
+        enabled: true,
+      },
     ]);
+  });
+
+  it("解析出过期天数与式样，好让判定层发现选项变了", () => {
+    const doc7 = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:b3</ID><Status>Disabled</Status>
+      <Filter><Prefix>incremental-cache/b3/</Prefix></Filter><Expiration><Days>7</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    expect(parseLifecycle(doc7).own[0]).toEqual({
+      buildId: "b3",
+      prefix: "incremental-cache/b3/",
+      expireDays: 7,
+      style: "filter",
+      enabled: false,
+    });
   });
 });
 
 describe("renderLifecycle", () => {
-  it("两种 Prefix 包装式样都能生成", () => {
-    const doc = { own: [{ buildId: "b1", prefix: "incremental-cache/b1/" }], foreign: [] };
-    expect(renderLifecycle(doc, { expireDays: 1, style: "filter" })).toContain(
+  const rule = (overrides: Partial<OwnRule> = {}): OwnRule => ({
+    buildId: "b1",
+    prefix: "incremental-cache/b1/",
+    expireDays: 1,
+    style: "filter",
+    enabled: true,
+    ...overrides,
+  });
+
+  it("两种 Prefix 包装式样都按规则自身的字段生成", () => {
+    expect(renderLifecycle({ own: [rule()], foreign: [] })).toContain(
       "<Filter><Prefix>incremental-cache/b1/</Prefix></Filter>",
     );
-    const bare = renderLifecycle(doc, { expireDays: 2, style: "bare" });
+    const bare = renderLifecycle({
+      own: [rule({ style: "bare", expireDays: 2 })],
+      foreign: [],
+    });
     expect(bare).toContain("<Prefix>incremental-cache/b1/</Prefix>");
     expect(bare).not.toContain("<Filter>");
     expect(bare).toContain("<Days>2</Days>");
   });
 
   it("拒绝把带可疑字符的 buildId 写进规则", () => {
-    const doc = { own: [{ buildId: "b<1", prefix: "incremental-cache/b/" }], foreign: [] };
-    expect(() => renderLifecycle(doc, { expireDays: 1, style: "filter" })).toThrow(
+    expect(() => renderLifecycle({ own: [rule({ buildId: "b<1" })], foreign: [] })).toThrow(
+      XmlAssumptionError,
+    );
+  });
+
+  it("过期天数不合法时拒绝写入", () => {
+    expect(() => renderLifecycle({ own: [rule({ expireDays: 0 })], foreign: [] })).toThrow(
       XmlAssumptionError,
     );
   });

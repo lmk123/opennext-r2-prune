@@ -1,4 +1,5 @@
 import { AwsClient } from "aws4fetch";
+import { normalizePrefix } from "./prefix.ts";
 import {
   type LifecycleDoc,
   parseErrorMessage,
@@ -27,13 +28,16 @@ export interface StoreOptions {
 }
 
 export class S3Error extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
+  // 显式声明字段而不用构造函数参数属性：那是 Node 的类型擦除模式跑不了的语法，
+  // 而 package.json 的 start 脚本正是靠它直接跑源码
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
     super(message);
     this.name = "S3Error";
+    this.status = status;
+    this.code = code;
   }
 }
 
@@ -96,7 +100,7 @@ export class R2Store {
    * Delimiter 让 R2 在服务端折叠，通常一个请求就够 —— 不需要遍历任何缓存对象。
    */
   async listBuildIds(prefix: string): Promise<string[]> {
-    const normalized = withTrailingSlash(prefix);
+    const normalized = normalizePrefix(prefix);
     const found: string[] = [];
     let token: string | undefined;
 
@@ -126,7 +130,7 @@ export class R2Store {
   async probeBuild(prefix: string, buildId: string): Promise<Date | null> {
     const url = new URL(this.#base);
     url.searchParams.set("list-type", "2");
-    url.searchParams.set("prefix", `${withTrailingSlash(prefix)}${buildId}/`);
+    url.searchParams.set("prefix", `${normalizePrefix(prefix)}${buildId}/`);
     url.searchParams.set("max-keys", "1");
 
     const result = parseListObjects(await (await this.#request(url.toString())).text());
@@ -146,22 +150,14 @@ export class R2Store {
     }
   }
 
-  async putLifecycle(
-    doc: LifecycleDoc,
-    opts: { expireDays: number; style: "filter" | "bare" },
-  ): Promise<void> {
-    const body = renderLifecycle(doc, opts);
+  async putLifecycle(doc: LifecycleDoc): Promise<void> {
+    const body = renderLifecycle(doc);
     const headers: Record<string, string> = { "Content-Type": "application/xml" };
     const md5 = this.#opts.md5Base64?.(body);
     if (md5) headers["Content-MD5"] = md5;
 
     await this.#request(`${this.#base}?lifecycle`, { method: "PUT", body, headers });
   }
-}
-
-function withTrailingSlash(prefix: string): string {
-  const trimmed = prefix.replace(/^\/+|\/+$/g, "");
-  return trimmed ? `${trimmed}/` : "";
 }
 
 function extractCode(xml: string): string | undefined {

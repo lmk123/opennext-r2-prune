@@ -78,11 +78,22 @@ export function parseListObjects(xml: string): ListObjectsResult {
   };
 }
 
-/** 一条由本工具管理的规则。用户自有规则不会被解析成这个形状。 */
+/**
+ * 一条由本工具管理的规则。用户自有规则不会被解析成这个形状。
+ *
+ * 字段是完整的：判定层要拿它与「期望的样子」逐字段比对，才能发现选项变了
+ * （比如换了 --expire-days 或 --lifecycle-style）需要重写。
+ */
 export interface OwnRule {
   buildId: string;
   /** 规则实际作用的前缀，形如 `incremental-cache/<buildId>/` */
   prefix: string;
+  /** 过期天数。0 表示从现有配置里没解析出合法的 <Expiration><Days>，必然与期望值不等 */
+  expireDays: number;
+  /** Prefix 的包装形式：包在 <Filter> 里还是直接挂在 <Rule> 下 */
+  style: "filter" | "bare";
+  /** <Status> 是否为 Enabled */
+  enabled: boolean;
 }
 
 export interface LifecycleDoc {
@@ -114,34 +125,44 @@ export function parseLifecycle(xml: string): LifecycleDoc {
     const buildId = assertLiteral(id.slice(RULE_ID_PREFIX.length), "规则 ID 中的 buildId");
     // Prefix 既可能直接挂在 Rule 下（老式），也可能包在 Filter 里（v2）
     const filter = text(block, "Filter");
-    const prefix = text(filter ?? block, "Prefix") ?? text(block, "Prefix") ?? "";
-    own.push({ buildId, prefix: assertLiteral(prefix, "规则中的 Prefix") });
+    const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
+    const prefix = filterPrefix ?? text(block, "Prefix") ?? "";
+    const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
+    own.push({
+      buildId,
+      prefix: assertLiteral(prefix, "规则中的 Prefix"),
+      expireDays: Number.isInteger(days) && days > 0 ? days : 0,
+      style: filterPrefix === undefined ? "bare" : "filter",
+      enabled: text(block, "Status")?.trim() === "Enabled",
+    });
   }
 
   return { own, foreign };
 }
 
 /**
- * 生成写回用的完整配置。别人的规则原样排在前面，本工具的规则重新渲染。
- * Prefix 的包装形式（Filter 与否）由 style 决定 —— 实测 R2 认哪种就传哪种。
+ * 生成写回用的完整配置。别人的规则原样排在前面，本工具的规则按各自的字段重新渲染
+ * —— 内容全部由判定层决定，这里只负责序列化。
  */
-export function renderLifecycle(
-  doc: LifecycleDoc,
-  opts: { expireDays: number; style: "filter" | "bare" },
-): string {
+export function renderLifecycle(doc: LifecycleDoc): string {
   const rules = doc.own.map((rule) => {
     assertLiteral(rule.buildId, "待写入规则的 buildId");
     assertLiteral(rule.prefix, "待写入规则的 Prefix");
+    if (!Number.isInteger(rule.expireDays) || rule.expireDays < 1) {
+      throw new XmlAssumptionError(
+        `待写入规则 ${rule.buildId} 的过期天数不合法：${rule.expireDays}，S3 要求至少 1 天。`,
+      );
+    }
     const prefixXml =
-      opts.style === "filter"
+      rule.style === "filter"
         ? `<Filter><Prefix>${rule.prefix}</Prefix></Filter>`
         : `<Prefix>${rule.prefix}</Prefix>`;
     return (
       `<Rule>` +
       `<ID>${ruleId(rule.buildId)}</ID>` +
-      `<Status>Enabled</Status>` +
+      `<Status>${rule.enabled ? "Enabled" : "Disabled"}</Status>` +
       prefixXml +
-      `<Expiration><Days>${opts.expireDays}</Days></Expiration>` +
+      `<Expiration><Days>${rule.expireDays}</Days></Expiration>` +
       `</Rule>`
     );
   });

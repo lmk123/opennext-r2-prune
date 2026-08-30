@@ -16,7 +16,7 @@ const CREDS = {
 };
 
 /** 一个按 URL 派发的假 R2 */
-function fakeR2(opts: { buildIds: string[]; lifecycle?: string }) {
+function fakeR2(opts: { buildIds: string[]; lifecycle?: string; probeFails?: boolean }) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -31,6 +31,12 @@ function fakeR2(opts: { buildIds: string[]; lifecycle?: string }) {
     }
 
     if (url.searchParams.get("max-keys") === "1") {
+      if (opts.probeFails) {
+        return new Response(
+          "<Error><Code>AccessDenied</Code><Message>没有 List 权限</Message></Error>",
+          { status: 403 },
+        );
+      }
       return new Response(`<ListBucketResult><Contents>
         <Key>x</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>
       </Contents></ListBucketResult>`);
@@ -101,6 +107,23 @@ describe("collectPlan", () => {
     const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["b1"] });
     expect(state.onlineBuildId).toBeNull();
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b2"]);
+  });
+
+  it("部署时间探测失败不影响清理，只是没有时间可展示", async () => {
+    const { store } = fakeR2({ buildIds: ["live", "old1"], probeFails: true });
+    const warnings: string[] = [];
+
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      siteUrl: "https://example.com",
+      fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
+      onWarn: (message) => warnings.push(message),
+    });
+
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.expire[0]!.lastModified).toBeNull();
+    expect(warnings).toHaveLength(2);
   });
 
   it("已有规则的 build 目录清空后，规则被标记回收", async () => {

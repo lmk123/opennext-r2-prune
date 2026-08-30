@@ -42,6 +42,18 @@ describe("probeBuildId", () => {
     ).rejects.toThrow(/不像一个 build id/);
   });
 
+  it("带上防缓存头，避免中间缓存返回上一个版本的 id", async () => {
+    // 拿到陈旧的 id，就等于把线上正在服务的 build 判成作废
+    let init: RequestInit | undefined;
+    const capture = (async (_url: string, options: RequestInit) => {
+      init = options;
+      return new Response("live", { headers: { "content-type": "text/plain" } });
+    }) as unknown as typeof fetch;
+
+    await probeBuildId("https://example.com/BUILD_ID", capture);
+    expect(new Headers(init!.headers).get("cache-control")).toContain("no-cache");
+  });
+
   it("网络失败报错", async () => {
     const failing = (async () => {
       throw new Error("ECONNREFUSED");

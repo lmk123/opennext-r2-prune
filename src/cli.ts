@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { BuildIdProbeError } from "./build-id.ts";
-import { PlanError, type PrunePlan } from "./plan.ts";
+import { type ExpireState, PlanError, type PrunePlan } from "./plan.ts";
 import { R2Store, S3Error } from "./store.ts";
 import { collectPlan } from "./run.ts";
 import { XmlAssumptionError } from "./xml.ts";
@@ -31,7 +31,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --lifecycle-style <式样>      filter（默认）或 bare，规则里 Prefix 的包装形式
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
-  --json                       输出机器可读的结果
+  --json                       输出机器可读的结果（写入之后才输出，含 written 字段）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
   --verbose                    打印重试等额外信息
   --help, -h                   显示本帮助
@@ -124,53 +124,74 @@ async function main(argv: string[]): Promise<number> {
     buildIdUrl: values["build-id-url"],
     keep,
     force: values.force,
+    expireDays,
+    style,
+    onWarn: (message) => console.error(`  ${message}`),
   });
 
   const { plan } = state;
+  // --json 时 stdout 只放最后那一份 JSON，人类可读的内容一律改走 stderr
+  const note = (message: string) => (json ? console.error(message) : console.log(message));
 
-  if (json) {
-    console.log(JSON.stringify(toJson(state.onlineBuildId, prefix, plan), null, 2));
-  } else {
-    printPlan(state.onlineBuildId, state.probedFrom, bucket!, prefix, plan);
-  }
+  if (!json) printPlan(state.onlineBuildId, state.probedFrom, bucket!, prefix, plan);
+
+  let written = false;
+  let cancelled = false;
+  let failure: string | undefined;
+  let code = 0;
 
   if (!plan.changed) {
-    if (!json) console.log("\n规则已经是最新的，无需改动。");
-    return 0;
-  }
-
-  if (values["dry-run"]) {
-    if (!json) console.log("\n--dry-run：未写入任何改动。");
-    return 0;
-  }
-
-  if (!values.yes) {
-    if (!process.stdin.isTTY) {
-      console.error("\n非交互环境下需要显式传 --yes 才会写入规则。");
-      return 1;
+    note("\n规则已经是最新的，无需改动。");
+  } else if (values["dry-run"]) {
+    note("\n--dry-run：未写入任何改动。");
+  } else if (!values.yes && !process.stdin.isTTY) {
+    console.error("\n非交互环境下需要显式传 --yes 才会写入规则。");
+    code = 1;
+  } else if (!values.yes && !(await confirm())) {
+    cancelled = true;
+    note("已取消。");
+  } else {
+    try {
+      await store.putLifecycle(plan.nextDoc);
+      written = true;
+      const added = plan.expire.filter((b) => b.state === "new").length;
+      const updated = plan.expire.filter((b) => b.state === "updated").length;
+      note(
+        `\n已写入规则：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 条。` +
+          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
+      );
+    } catch (error) {
+      failure = describe(error);
+      console.error(`\n写入 lifecycle 规则失败：${failure}`);
+      code = 2;
     }
-    if (!(await confirm())) {
-      console.log("已取消。");
-      return 0;
-    }
   }
 
-  try {
-    await store.putLifecycle(plan.nextDoc, { expireDays, style });
-  } catch (error) {
-    console.error(`\n写入 lifecycle 规则失败：${describe(error)}`);
-    return 2;
-  }
-
-  if (!json) {
-    const added = plan.expire.filter((b) => b.isNew).length;
+  // 写完再输出，这样 written 反映的是真实结果而不只是意图
+  if (json) {
     console.log(
-      `\n已写入规则：新增 ${added} 条，回收 ${plan.reclaim.length} 条。` +
-        `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
+      JSON.stringify(
+        {
+          ...toJson(state.onlineBuildId, prefix, plan),
+          expireDays,
+          style,
+          written,
+          cancelled,
+          error: failure ?? null,
+        },
+        null,
+        2,
+      ),
     );
   }
-  return 0;
+  return code;
 }
+
+const EXPIRE_NOTE: Record<ExpireState, string> = {
+  new: "新增规则",
+  updated: "改写规则（原规则与当前前缀 / 过期设置不符）",
+  pending: "规则已存在，R2 仍在删",
+};
 
 function printPlan(
   onlineBuildId: string | null,
@@ -191,8 +212,9 @@ function printPlan(
   if (plan.expire.length > 0) {
     console.log(`\n交给 R2 删除 ${plan.expire.length} 个 build：`);
     for (const build of plan.expire) {
-      const note = build.isNew ? "新增规则" : "规则已存在，R2 仍在删";
-      console.log(`  删除  ${build.buildId}  ${fmtDate(build.lastModified)}  ${note}`);
+      console.log(
+        `  删除  ${build.buildId}  ${fmtDate(build.lastModified)}  ${EXPIRE_NOTE[build.state]}`,
+      );
     }
   }
 
@@ -227,19 +249,21 @@ function toJson(onlineBuildId: string | null, prefix: string, plan: PrunePlan) {
     expire: plan.expire.map((b) => ({
       buildId: b.buildId,
       lastModified: b.lastModified?.toISOString() ?? null,
-      isNew: b.isNew,
+      state: b.state,
     })),
     reclaim: plan.reclaim,
   };
 }
 
 function fmtDate(date: Date | null): string {
-  if (!date) return "（目录为空）  ";
+  // 不在 bucket 里（--force）或时间探测失败时都没有可展示的时间
+  if (!date) return "（时间未知）  ";
   return date.toISOString().slice(0, 16).replace("T", " ");
 }
 
 async function confirm(): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // 提示走 stderr，免得把 --json 的 stdout 弄脏
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
     const answer = await rl.question("\n写入以上规则？[y/N] ");
     return /^y(es)?$/i.test(answer.trim());

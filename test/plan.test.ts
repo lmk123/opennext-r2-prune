@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix } from "../src/plan.ts";
-import type { LifecycleDoc } from "../src/xml.ts";
+import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
@@ -9,6 +9,20 @@ function input(overrides: Partial<PlanInput> = {}): PlanInput {
     keep: [{ buildId: "online1", reason: "online" }],
     current: { own: [], foreign: [] },
     prefix: "incremental-cache",
+    expireDays: 1,
+    style: "filter",
+    ...overrides,
+  };
+}
+
+/** 一条「本工具上次就该写成这样」的规则 */
+function ownRule(buildId: string, overrides: Partial<OwnRule> = {}): OwnRule {
+  return {
+    buildId,
+    prefix: `incremental-cache/${buildId}/`,
+    expireDays: 1,
+    style: "filter",
+    enabled: true,
     ...overrides,
   };
 }
@@ -18,7 +32,7 @@ describe("保留集", () => {
     const plan = makePlan(input());
     expect(plan.keep.map((b) => b.buildId)).toEqual(["online1"]);
     expect(plan.expire.map((b) => b.buildId)).toEqual(["old1", "old2"]);
-    expect(plan.expire.every((b) => b.isNew)).toBe(true);
+    expect(plan.expire.every((b) => b.state === "new")).toBe(true);
   });
 
   it("--keep 能追加保留", () => {
@@ -96,7 +110,7 @@ describe("规则合并与回收", () => {
   it("已经空掉的目录，其规则被回收", () => {
     const plan = makePlan(
       input({
-        current: withRules([{ buildId: "gone", prefix: "incremental-cache/gone/" }]),
+        current: withRules([ownRule("gone")]),
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
@@ -106,18 +120,16 @@ describe("规则合并与回收", () => {
   it("重新上线的 build，其残留规则被立即摘除", () => {
     const plan = makePlan(
       input({
-        current: withRules([{ buildId: "online1", prefix: "incremental-cache/online1/" }]),
+        current: withRules([ownRule("online1")]),
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "online1", reason: "revived" }]);
     expect(plan.nextDoc.own.map((r) => r.buildId)).not.toContain("online1");
   });
 
-  it("已有规则的 build 不重复添加，并标记为非新增", () => {
-    const plan = makePlan(
-      input({ current: withRules([{ buildId: "old1", prefix: "incremental-cache/old1/" }]) }),
-    );
-    expect(plan.expire.find((b) => b.buildId === "old1")!.isNew).toBe(false);
+  it("已有规则且内容一致的 build 不重复添加，标记为仍在删", () => {
+    const plan = makePlan(input({ current: withRules([ownRule("old1")]) }));
+    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("pending");
     expect(plan.nextDoc.own.filter((r) => r.buildId === "old1")).toHaveLength(1);
   });
 
@@ -137,6 +149,36 @@ describe("规则合并与回收", () => {
     expect(plan.changed).toBe(false);
   });
 
+  it("换了 --expire-days 要改写规则，不能当作没变", () => {
+    const plan = makePlan(input({ current: withRules([ownRule("old1")]), expireDays: 7 }));
+    expect(plan.changed).toBe(true);
+    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("updated");
+    expect(plan.nextDoc.own.every((r) => r.expireDays === 7)).toBe(true);
+  });
+
+  it("换了 --lifecycle-style 同样要改写", () => {
+    const plan = makePlan(input({ current: withRules([ownRule("old1")]), style: "bare" }));
+    expect(plan.changed).toBe(true);
+    expect(plan.nextDoc.own.every((r) => r.style === "bare")).toBe(true);
+  });
+
+  it("已有规则的前缀对不上当前 --prefix 时，改写而不是沿用", () => {
+    const plan = makePlan(
+      input({ current: withRules([ownRule("old1", { prefix: "old-cache/old1/" })]) }),
+    );
+    expect(plan.changed).toBe(true);
+    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("updated");
+    expect(plan.nextDoc.own.find((r) => r.buildId === "old1")!.prefix).toBe(
+      "incremental-cache/old1/",
+    );
+  });
+
+  it("自有规则被手动停用时重新启用", () => {
+    const plan = makePlan(input({ current: withRules([ownRule("old1", { enabled: false })]) }));
+    expect(plan.changed).toBe(true);
+    expect(plan.nextDoc.own.every((r) => r.enabled)).toBe(true);
+  });
+
   it("规则前缀带结尾斜杠，避免某个 buildId 是另一个的前缀时误删", () => {
     const plan = makePlan(input({ existing: ["online1", "abc", "abcdef"] }));
     expect(plan.nextDoc.own.map((r) => r.prefix)).toEqual([
@@ -144,5 +186,13 @@ describe("规则合并与回收", () => {
       "incremental-cache/abcdef/",
     ]);
     expect(rulePrefix("incremental-cache/", "abc")).toBe("incremental-cache/abc/");
+  });
+
+  it("缓存放在 bucket 根下时，规则前缀不能多出前导斜杠", () => {
+    // 多一个前导斜杠，规则就作用在一个不存在的 key 空间上，一个对象都删不掉
+    expect(rulePrefix("", "abc")).toBe("abc/");
+    expect(rulePrefix("/", "abc")).toBe("abc/");
+    const plan = makePlan(input({ prefix: "" }));
+    expect(plan.nextDoc.own.map((r) => r.prefix)).toEqual(["old1/", "old2/"]);
   });
 });

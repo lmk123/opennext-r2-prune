@@ -17,9 +17,15 @@ export interface RunOptions {
   /** 显式保留的 build id */
   keep?: string[];
   force?: boolean;
+  /** 规则的过期天数，默认 1 */
+  expireDays?: number;
+  /** 规则里 Prefix 的包装形式，默认 filter */
+  style?: "filter" | "bare";
   fetchImpl?: typeof fetch;
   /** 探测近似部署时间时的并发数 */
   concurrency?: number;
+  /** 非致命问题的提示出口 */
+  onWarn?: (message: string) => void;
 }
 
 export interface RunState {
@@ -44,7 +50,12 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const existing = await opts.store.listBuildIds(opts.prefix);
   const lastModified = new Map<string, Date | null>();
   await mapWithConcurrency(existing, opts.concurrency ?? 8, async (buildId) => {
-    lastModified.set(buildId, await opts.store.probeBuild(opts.prefix, buildId));
+    try {
+      lastModified.set(buildId, await opts.store.probeBuild(opts.prefix, buildId));
+    } catch (error) {
+      // 近似时间纯粹用于展示，取不到就留空 —— 不值得让整次清理失败
+      opts.onWarn?.(`读取 ${buildId} 的部署时间失败，本次不展示该时间：${String(error)}`);
+    }
   });
 
   const current = await opts.store.getLifecycle();
@@ -58,6 +69,8 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       keep: keeps,
       current,
       prefix: opts.prefix,
+      expireDays: opts.expireDays ?? 1,
+      style: opts.style ?? "filter",
       force: opts.force,
     }),
   };

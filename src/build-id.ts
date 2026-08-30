@@ -26,7 +26,13 @@ export async function probeBuildId(
 ): Promise<string> {
   let response: Response;
   try {
-    response = await fetchImpl(url, { redirect: "follow" });
+    response = await fetchImpl(url, {
+      redirect: "follow",
+      // 必须拿到此刻真正在服务的 id：中间缓存（CDN、公司代理）若返回上一个版本的
+      // BUILD_ID，本工具就会把线上正在用的那个 build 判成作废，把活着的缓存删光。
+      cache: "no-store",
+      headers: { "cache-control": "no-cache, no-store, max-age=0", pragma: "no-cache" },
+    });
   } catch (error) {
     throw new BuildIdProbeError(`请求 ${url} 失败：${String(error)}`);
   }

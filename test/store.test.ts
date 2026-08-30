@@ -55,6 +55,18 @@ describe("listBuildIds", () => {
     expect(new URL(calls[1]!.url).searchParams.get("continuation-token")).toBe("tok");
   });
 
+  it("前缀为空时列举 bucket 根下的一级目录", async () => {
+    const { calls, fetchImpl } = stub([
+      ok(`<ListBucketResult><IsTruncated>false</IsTruncated>
+        <CommonPrefixes><Prefix>b1/</Prefix></CommonPrefixes>
+      </ListBucketResult>`),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    expect(await store.listBuildIds("")).toEqual(["b1"]);
+    expect(new URL(calls[0]!.url).searchParams.get("prefix")).toBe("");
+  });
+
   it("前缀写成 /incremental-cache/ 也能正常工作", async () => {
     const { calls, fetchImpl } = stub([
       ok(`<ListBucketResult><IsTruncated>false</IsTruncated>
@@ -115,10 +127,18 @@ describe("lifecycle", () => {
       md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
     });
 
-    await store.putLifecycle(
-      { own: [{ buildId: "b1", prefix: "incremental-cache/b1/" }], foreign: [] },
-      { expireDays: 1, style: "filter" },
-    );
+    await store.putLifecycle({
+      own: [
+        {
+          buildId: "b1",
+          prefix: "incremental-cache/b1/",
+          expireDays: 1,
+          style: "filter",
+          enabled: true,
+        },
+      ],
+      foreign: [],
+    });
 
     const request = calls[0]!;
     expect(request.method).toBe("PUT");
