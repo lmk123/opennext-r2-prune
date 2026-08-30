@@ -90,6 +90,11 @@ R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配
   其它 lifecycle 规则会原样保留。
 - 探测 `/BUILD_ID` 时带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
   把线上正在服务的 build 判成作废 —— 这是它能造成的最坏后果，所以必须绕开缓存。
+- **前缀为空默认拒绝运行**。那意味着把 bucket 根下的每个一级目录都当成 build 缓存，`assets/`、
+  `backups/` 这类非缓存目录会一并被挂上删除规则 —— 这是本工具唯一能删到非缓存数据的路径。
+  bucket 确实只用来存 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
+- bucket 里某个目录的对象名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
+  降级成警告 —— 那些值会被用来拼删除规则。
 
 ## 已知限制
 
@@ -113,6 +118,8 @@ pnpm build
 首次对真实 bucket 使用时，有两处依赖 R2 的具体行为，如果报错就调整对应开关：
 
 - 规则里 `Prefix` 的包装形式默认用 S3 v2 的 `<Filter><Prefix>`。R2 若不认，改用
-  `--lifecycle-style bare`。
+  `--lifecycle-style bare`。注意 S3 的 GET 会把裸 `<Prefix>` 规范化成 `<Filter><Prefix>` 再
+  返回，所以「已有规则读回来是 filter」不作为改写理由（否则 `bare` 会每次运行都重写一遍规则，
+  永远收敛不了）；切到 `bare` 后，规则会在下一次真正需要写入时一并换成新式样。
 - 写入时默认带 `Content-MD5`。可用 `npx wrangler r2 bucket lifecycle list <BUCKET>`
   核对规则是否如实写进去了。

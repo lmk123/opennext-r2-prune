@@ -1,6 +1,7 @@
 import { buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import { type KeepReason, makePlan, type PrunePlan } from "./plan.ts";
 import type { R2Store } from "./store.ts";
+import { XmlAssumptionError } from "./xml.ts";
 
 /**
  * 把「探测 → 列举 → 判定」串起来。与 cli.ts 分开是为了这一层不依赖任何 Node API：
@@ -17,6 +18,8 @@ export interface RunOptions {
   /** 显式保留的 build id */
   keep?: string[];
   force?: boolean;
+  /** 承认「前缀为空、缓存直接放在 bucket 根下」这种布局 */
+  allowRootPrefix?: boolean;
   /** 规则的过期天数，默认 1 */
   expireDays?: number;
   /** 规则里 Prefix 的包装形式，默认 filter */
@@ -53,7 +56,10 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     try {
       lastModified.set(buildId, await opts.store.probeBuild(opts.prefix, buildId));
     } catch (error) {
-      // 近似时间纯粹用于展示，取不到就留空 —— 不值得让整次清理失败
+      // 近似时间纯粹用于展示，取不到就留空 —— 不值得让整次清理失败。
+      // XmlAssumptionError 例外：它意味着目录内容不符合本工具的布局假设，那正是
+      // 「别再往下写删除规则」的信号，必须原样抛出去。
+      if (error instanceof XmlAssumptionError) throw error;
       opts.onWarn?.(`读取 ${buildId} 的部署时间失败，本次不展示该时间：${String(error)}`);
     }
   });
@@ -72,6 +78,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       expireDays: opts.expireDays ?? 1,
       style: opts.style ?? "filter",
       force: opts.force,
+      allowRootPrefix: opts.allowRootPrefix,
     }),
   };
 }

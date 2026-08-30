@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { collectPlan } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
 import { R2Store } from "../src/store.ts";
+import { XmlAssumptionError } from "../src/xml.ts";
 
 /**
  * 端到端串一遍，重点盯住一件事：任何一条安全校验没过时，
@@ -16,7 +17,12 @@ const CREDS = {
 };
 
 /** 一个按 URL 派发的假 R2 */
-function fakeR2(opts: { buildIds: string[]; lifecycle?: string; probeFails?: boolean }) {
+function fakeR2(opts: {
+  buildIds: string[];
+  lifecycle?: string;
+  probeFails?: boolean;
+  probeKey?: string;
+}) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -38,7 +44,7 @@ function fakeR2(opts: { buildIds: string[]; lifecycle?: string; probeFails?: boo
         );
       }
       return new Response(`<ListBucketResult><Contents>
-        <Key>x</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>
+        <Key>${opts.probeKey ?? "x"}</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>
       </Contents></ListBucketResult>`);
     }
 
@@ -124,6 +130,26 @@ describe("collectPlan", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
     expect(state.plan.expire[0]!.lastModified).toBeNull();
     expect(warnings).toHaveLength(2);
+  });
+
+  it("目录内容不符合布局假设时中止，不降级成警告", async () => {
+    // 时间探测失败可以容忍，但 XmlAssumptionError 说的是「这个 bucket 不长 OpenNext 的样」，
+    // 那是别再往下写删除规则的信号
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      probeKey: "tmp &amp; scratch/x.cache",
+    });
+
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        siteUrl: "https://example.com",
+        fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
+        onWarn: () => {},
+      }),
+    ).rejects.toThrow(XmlAssumptionError);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("已有规则的 build 目录清空后，规则被标记回收", async () => {

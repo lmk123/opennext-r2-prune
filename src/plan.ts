@@ -62,11 +62,24 @@ export interface PlanInput {
   style: "filter" | "bare";
   /** 跳过「保留集必须存在于 bucket」这条校验 */
   force?: boolean;
+  /** 承认「前缀为空、缓存直接放在 bucket 根下」这种布局 */
+  allowRootPrefix?: boolean;
 }
 
 export function makePlan(input: PlanInput): PrunePlan {
   const { existing, current, prefix, expireDays, style } = input;
   const existingSet = new Set(existing);
+
+  // 前缀为空时，「一级目录」就是 bucket 根下的全部目录 —— 除缓存外还堆着别的东西
+  // （静态资源、备份……）的 bucket 会把它们统统当成作废 build 挂上删除规则。
+  // 这是本工具唯一能删到非缓存数据的路径，所以要求显式承认。
+  if (normalizePrefix(prefix) === "" && !input.allowRootPrefix) {
+    throw new PlanError(
+      "--prefix 为空意味着把 bucket 根下的每一个一级目录都当成 build 缓存，" +
+        "非缓存目录（assets/、backups/ 等）会一并被挂上删除规则。\n" +
+        "确认这个 bucket 只用来存 OpenNext 缓存，可加 --allow-root-prefix。",
+    );
+  }
 
   // 同一个 buildId 可能既被探测到又被 --keep 传入，线上探测的原因优先展示
   const keepMap = new Map<string, KeepReason>();
@@ -153,9 +166,21 @@ function sameRule(before: OwnRule | undefined, after: OwnRule): boolean {
     before !== undefined &&
     before.prefix === after.prefix &&
     before.expireDays === after.expireDays &&
-    before.style === after.style &&
+    sameStyle(before.style, after.style) &&
     before.enabled === after.enabled
   );
+}
+
+/**
+ * 式样是否算一致。S3 的 GetBucketLifecycle(v2) 会把写入时裸挂在 <Rule> 下的 <Prefix>
+ * 规范化成 <Filter><Prefix>，所以「读回来是 filter」无法区分服务端规范化与上次就写的
+ * filter。若在这个方向上较真，`--lifecycle-style bare` 的每次运行都会把全部规则判成要
+ * 改写、重发一次 PUT，changed 永远为 true，收敛不了。
+ * 反方向仍然较真：读回来是 bare 就说明服务端不做规范化，此时式样确实不符。
+ * 已有 filter 规则本身就证明 R2 认 <Filter>，所以这里不会挡住真正需要的切换。
+ */
+function sameStyle(before: OwnRule["style"], after: OwnRule["style"]): boolean {
+  return before === after || (before === "filter" && after === "bare");
 }
 
 function expireState(before: OwnRule | undefined, after: OwnRule): ExpireState {

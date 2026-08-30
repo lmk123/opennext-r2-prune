@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { BuildIdProbeError } from "./build-id.ts";
 import { type ExpireState, PlanError, type PrunePlan } from "./plan.ts";
+import { normalizePrefix } from "./prefix.ts";
 import { R2Store, S3Error } from "./store.ts";
 import { collectPlan } from "./run.ts";
 import { XmlAssumptionError } from "./xml.ts";
@@ -33,6 +34,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written 字段）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
+  --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
   --verbose                    打印重试等额外信息
   --help, -h                   显示本帮助
 
@@ -57,6 +59,7 @@ async function main(argv: string[]): Promise<number> {
       yes: { type: "boolean", short: "y" },
       json: { type: "boolean" },
       force: { type: "boolean" },
+      "allow-root-prefix": { type: "boolean" },
       verbose: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
@@ -124,6 +127,7 @@ async function main(argv: string[]): Promise<number> {
     buildIdUrl: values["build-id-url"],
     keep,
     force: values.force,
+    allowRootPrefix: values["allow-root-prefix"],
     expireDays,
     style,
     onWarn: (message) => console.error(`  ${message}`),
@@ -200,7 +204,7 @@ function printPlan(
   prefix: string,
   plan: PrunePlan,
 ): void {
-  console.log(`bucket: ${bucket}    前缀: ${prefix}/`);
+  console.log(`bucket: ${bucket}    前缀: ${normalizePrefix(prefix) || "（bucket 根）"}`);
   if (onlineBuildId) console.log(`线上 BUILD_ID: ${onlineBuildId}  （读自 ${probedFrom}）`);
 
   console.log(`\n保留 ${plan.keep.length} 个 build：`);
