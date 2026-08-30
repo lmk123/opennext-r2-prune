@@ -49,6 +49,10 @@ function text(xml: string, tag: string): string | undefined {
 export interface ListObjectsResult {
   /** Delimiter 模式下的 CommonPrefixes，已剥掉请求前缀与结尾斜杠 */
   commonPrefixes: string[];
+  /**
+   * 响应里直接列出的对象。列 build 目录只看 CommonPrefixes，没人读这个字段 ——
+   * 留着是因为解析它的过程会对每个 Key 跑一遍布局断言，那道校验仍然有价值。
+   */
   objects: { key: string; lastModified: Date | undefined }[];
   isTruncated: boolean;
   nextContinuationToken: string | undefined;

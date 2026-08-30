@@ -5,7 +5,6 @@ import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
     existing: ["online1", "old1", "old2"],
-    lastModified: new Map(),
     keep: [{ buildId: "online1", reason: "online" }],
     current: { own: [], foreign: [] },
     prefix: "incremental-cache",
@@ -59,15 +58,6 @@ describe("保留集", () => {
     );
     expect(plan.keep).toHaveLength(1);
     expect(plan.keep[0]!.reason).toBe("online");
-  });
-
-  it("近似时间只是展示，不影响判定", () => {
-    const old = new Date("2020-01-01T00:00:00Z");
-    const plan = makePlan(
-      input({ lastModified: new Map([["online1", old], ["old1", new Date()]]) }),
-    );
-    expect(plan.keep[0]!.lastModified).toBe(old);
-    expect(plan.expire.map((b) => b.buildId)).toEqual(["old1", "old2"]);
   });
 });
 

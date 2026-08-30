@@ -80,28 +80,6 @@ describe("listBuildIds", () => {
   });
 });
 
-describe("probeBuild", () => {
-  it("只取一个对象的写入时间", async () => {
-    const { calls, fetchImpl } = stub([
-      ok(`<ListBucketResult><Contents>
-        <Key>incremental-cache/b1/${"a".repeat(64)}.cache</Key>
-        <LastModified>2026-08-20T09:03:11.000Z</LastModified>
-      </Contents></ListBucketResult>`),
-    ]);
-    const store = new R2Store({ ...CREDS, fetchImpl });
-
-    const at = await store.probeBuild("incremental-cache", "b1");
-    expect(at?.toISOString()).toBe("2026-08-20T09:03:11.000Z");
-    expect(new URL(calls[0]!.url).searchParams.get("max-keys")).toBe("1");
-  });
-
-  it("目录已空时返回 null", async () => {
-    const { fetchImpl } = stub([ok("<ListBucketResult></ListBucketResult>")]);
-    const store = new R2Store({ ...CREDS, fetchImpl });
-    expect(await store.probeBuild("incremental-cache", "b1")).toBeNull();
-  });
-});
-
 describe("lifecycle", () => {
   it("从未配过规则的 bucket 返回 404，当作空配置", async () => {
     const { fetchImpl } = stub([

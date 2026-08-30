@@ -9,7 +9,7 @@ import {
 } from "./xml.ts";
 
 /**
- * R2 的 S3 兼容接口，只实现本工具用到的四个操作。
+ * R2 的 S3 兼容接口，只实现本工具用到的三个操作。
  * 刻意不碰任何 Node 专属 API，这样将来整块搬进 Cloudflare Worker 也不用改。
  */
 
@@ -120,21 +120,6 @@ export class R2Store {
     } while (token);
 
     return found;
-  }
-
-  /**
-   * 取该 build 目录里字典序第一个对象的写入时间，作为部署时间的近似值。
-   * populateCache 在部署时一次性写入绝大多数对象，所以这个近似足够用来给人看。
-   * 返回 null 表示目录已经空了。
-   */
-  async probeBuild(prefix: string, buildId: string): Promise<Date | null> {
-    const url = new URL(this.#base);
-    url.searchParams.set("list-type", "2");
-    url.searchParams.set("prefix", `${normalizePrefix(prefix)}${buildId}/`);
-    url.searchParams.set("max-keys", "1");
-
-    const result = parseListObjects(await (await this.#request(url.toString())).text());
-    return result.objects[0]?.lastModified ?? null;
   }
 
   async getLifecycle(): Promise<LifecycleDoc> {

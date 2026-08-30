@@ -16,13 +16,11 @@ export type ExpireState = "new" | "updated" | "pending";
 
 export interface KeptBuild {
   buildId: string;
-  lastModified: Date | null;
   reason: KeepReason;
 }
 
 export interface ExpiringBuild {
   buildId: string;
-  lastModified: Date | null;
   state: ExpireState;
 }
 
@@ -50,8 +48,6 @@ export class PlanError extends Error {
 export interface PlanInput {
   /** bucket 里当前还有对象的 build 目录 */
   existing: string[];
-  /** 各 build 的近似部署时间，仅用于展示 */
-  lastModified: Map<string, Date | null>;
   /** 要保留的 build 及其原因 */
   keep: { buildId: string; reason: KeepReason }[];
   current: LifecycleDoc;
@@ -137,14 +133,9 @@ export function makePlan(input: PlanInput): PrunePlan {
   }
 
   return {
-    keep: [...keepMap].map(([buildId, reason]) => ({
-      buildId,
-      lastModified: input.lastModified.get(buildId) ?? null,
-      reason,
-    })),
+    keep: [...keepMap].map(([buildId, reason]) => ({ buildId, reason })),
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,
-      lastModified: input.lastModified.get(rule.buildId) ?? null,
       state: expireState(currentById.get(rule.buildId), rule),
     })),
     reclaim,

@@ -17,12 +17,7 @@ const CREDS = {
 };
 
 /** 一个按 URL 派发的假 R2 */
-function fakeR2(opts: {
-  buildIds: string[];
-  lifecycle?: string;
-  probeFails?: boolean;
-  probeKey?: string;
-}) {
+function fakeR2(opts: { buildIds: string[]; lifecycle?: string }) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -34,18 +29,6 @@ function fakeR2(opts: {
         opts.lifecycle ?? "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>",
         { status: opts.lifecycle ? 200 : 404 },
       );
-    }
-
-    if (url.searchParams.get("max-keys") === "1") {
-      if (opts.probeFails) {
-        return new Response(
-          "<Error><Code>AccessDenied</Code><Message>没有 List 权限</Message></Error>",
-          { status: 403 },
-        );
-      }
-      return new Response(`<ListBucketResult><Contents>
-        <Key>${opts.probeKey ?? "x"}</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified>
-      </Contents></ListBucketResult>`);
     }
 
     const prefixes = opts.buildIds
@@ -77,8 +60,6 @@ describe("collectPlan", () => {
     expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live"]);
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1", "old2"]);
     expect(state.plan.changed).toBe(true);
-    // 近似时间来自每个目录一次的探测
-    expect(state.plan.expire[0]!.lastModified?.toISOString()).toBe("2026-01-02T03:04:05.000Z");
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
@@ -115,30 +96,26 @@ describe("collectPlan", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b2"]);
   });
 
-  it("部署时间探测失败不影响清理，只是没有时间可展示", async () => {
-    const { store } = fakeR2({ buildIds: ["live", "old1"], probeFails: true });
-    const warnings: string[] = [];
+  it("发给 R2 的请求数与 build 数量无关", async () => {
+    const olds = Array.from({ length: 50 }, (_, i) => `old${i}`);
+    const { store, calls } = fakeR2({ buildIds: ["live", ...olds] });
 
     const state = await collectPlan({
       store,
       prefix: "incremental-cache",
       siteUrl: "https://example.com",
       fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
-      onWarn: (message) => warnings.push(message),
     });
 
-    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
-    expect(state.plan.expire[0]!.lastModified).toBeNull();
-    expect(warnings).toHaveLength(2);
+    expect(state.plan.expire).toHaveLength(50);
+    // 只有「列一次目录」和「读一次规则」，50 个 build 和 3 个 build 一样多
+    expect(calls).toHaveLength(2);
   });
 
-  it("目录内容不符合布局假设时中止，不降级成警告", async () => {
-    // 时间探测失败可以容忍，但 XmlAssumptionError 说的是「这个 bucket 不长 OpenNext 的样」，
-    // 那是别再往下写删除规则的信号
-    const { store, calls } = fakeR2({
-      buildIds: ["live", "old1"],
-      probeKey: "tmp &amp; scratch/x.cache",
-    });
+  it("目录名不符合布局假设时中止，不猜也不降级", async () => {
+    // 这些值会被拿去拼删除规则，含 XML 转义字符就说明这个 bucket 不长 OpenNext 的样，
+    // 那是别再往下写规则的信号
+    const { store, calls } = fakeR2({ buildIds: ["live", "tmp &amp; scratch"] });
 
     await expect(
       collectPlan({
@@ -146,7 +123,6 @@ describe("collectPlan", () => {
         prefix: "incremental-cache",
         siteUrl: "https://example.com",
         fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
-        onWarn: () => {},
       }),
     ).rejects.toThrow(XmlAssumptionError);
     expect(calls.every((c) => c.method === "GET")).toBe(true);

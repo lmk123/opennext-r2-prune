@@ -130,7 +130,6 @@ async function main(argv: string[]): Promise<number> {
     allowRootPrefix: values["allow-root-prefix"],
     expireDays,
     style,
-    onWarn: (message) => console.error(`  ${message}`),
   });
 
   const { plan } = state;
@@ -210,15 +209,13 @@ function printPlan(
   console.log(`\n保留 ${plan.keep.length} 个 build：`);
   for (const build of plan.keep) {
     const why = build.reason === "online" ? "线上正在使用" : "--keep 指定";
-    console.log(`  保留  ${build.buildId}  ${fmtDate(build.lastModified)}  ${why}`);
+    console.log(`  保留  ${build.buildId}  ${why}`);
   }
 
   if (plan.expire.length > 0) {
     console.log(`\n交给 R2 删除 ${plan.expire.length} 个 build：`);
     for (const build of plan.expire) {
-      console.log(
-        `  删除  ${build.buildId}  ${fmtDate(build.lastModified)}  ${EXPIRE_NOTE[build.state]}`,
-      );
+      console.log(`  删除  ${build.buildId}  ${EXPIRE_NOTE[build.state]}`);
     }
   }
 
@@ -245,24 +242,10 @@ function toJson(onlineBuildId: string | null, prefix: string, plan: PrunePlan) {
     prefix,
     onlineBuildId,
     changed: plan.changed,
-    keep: plan.keep.map((b) => ({
-      buildId: b.buildId,
-      lastModified: b.lastModified?.toISOString() ?? null,
-      reason: b.reason,
-    })),
-    expire: plan.expire.map((b) => ({
-      buildId: b.buildId,
-      lastModified: b.lastModified?.toISOString() ?? null,
-      state: b.state,
-    })),
+    keep: plan.keep,
+    expire: plan.expire,
     reclaim: plan.reclaim,
   };
-}
-
-function fmtDate(date: Date | null): string {
-  // 不在 bucket 里（--force）或时间探测失败时都没有可展示的时间
-  if (!date) return "（时间未知）  ";
-  return date.toISOString().slice(0, 16).replace("T", " ");
 }
 
 async function confirm(): Promise<boolean> {
