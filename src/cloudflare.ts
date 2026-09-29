@@ -4,8 +4,9 @@
  * build-id.ts。和 store.ts 一样不碰任何 Node 专属 API。
  */
 
+import { type OnRetry, withRetry } from "./retry.ts";
+
 const API_BASE = "https://api.cloudflare.com/client/v4";
-const MAX_ATTEMPTS = 3;
 const PAGE_SIZE = 100;
 /** 预览最多 500 个，100 一页只要 5 页；翻到这么多页说明分页参数没被认，不能无限翻下去 */
 const MAX_PAGES = 50;
@@ -14,7 +15,7 @@ export interface CloudflareApiOptions {
   accountId: string;
   apiToken: string;
   fetchImpl?: typeof fetch;
-  onRetry?: (attempt: number, reason: string) => void;
+  onRetry?: OnRetry;
 }
 
 export class CloudflareApiError extends Error {
@@ -43,7 +44,7 @@ interface Envelope<T> {
   success: boolean;
   result: T;
   errors?: { code: number; message: string }[];
-  result_info?: { page?: number; per_page?: number; total_pages?: number };
+  result_info?: { page?: number; per_page?: number; total_pages?: number; total_count?: number };
 }
 
 export class CloudflareApi {
@@ -71,25 +72,38 @@ export class CloudflareApi {
     return result.urls ?? [];
   }
 
+  /**
+   * 翻页的终点必须有据可依：漏掉一页预览，它们的 build 就会被挂上删除规则，而且全程 0 退出。
+   * 依次认 total_pages、total_count、服务端回报的 per_page；三者都没有时一直翻到空页为止，
+   * 同一个预览在后面的页里又出现，说明分页参数没被认（比如接口其实是游标分页），当场中止。
+   */
   async listPreviews(worker: string): Promise<Preview[]> {
     const previews: Preview[] = [];
+    const seen = new Set<string>();
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) {
-        throw new CloudflareApiError(
-          0,
-          "pagination",
-          `列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受，无法确认已经看到全部预览。`,
-        );
+        throw paginationError(`列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`);
       }
       const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[]>(
         `/workers/workers/${encodeURIComponent(worker)}/previews`,
         { page: String(page), per_page: String(PAGE_SIZE) },
       );
-      for (const p of result) previews.push({ name: p.name, urls: p.urls ?? [] });
+      for (const p of result) {
+        if (seen.has(p.name)) {
+          throw paginationError(`第 ${page} 页又出现了预览 ${p.name}，分页参数可能没被接受`);
+        }
+        seen.add(p.name);
+        previews.push({ name: p.name, urls: p.urls ?? [] });
+      }
 
-      const done =
-        info?.total_pages !== undefined ? page >= info.total_pages : result.length < PAGE_SIZE;
-      if (done) return previews;
+      if (result.length === 0) return previews;
+      if (info?.total_pages !== undefined) {
+        if (page >= info.total_pages) return previews;
+      } else if (info?.total_count !== undefined) {
+        if (previews.length >= info.total_count) return previews;
+      } else if (info?.per_page !== undefined) {
+        if (result.length < info.per_page) return previews;
+      }
     }
   }
 
@@ -98,53 +112,40 @@ export class CloudflareApi {
     for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
 
     const doFetch = this.#opts.fetchImpl ?? fetch;
-    let lastError: unknown;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      let response: Response;
-      try {
-        response = await doFetch(url.toString(), {
-          headers: { authorization: `Bearer ${this.#opts.apiToken}` },
-        });
-      } catch (error) {
-        lastError = error;
-        if (attempt === MAX_ATTEMPTS) break;
-        this.#opts.onRetry?.(attempt, String(error));
-        await backoff(attempt);
-        continue;
-      }
-
-      if ((response.status >= 500 || response.status === 429) && attempt < MAX_ATTEMPTS) {
-        this.#opts.onRetry?.(attempt, `HTTP ${response.status}`);
-        await backoff(attempt);
-        continue;
-      }
-
-      let body: Envelope<T>;
-      try {
-        body = (await response.json()) as Envelope<T>;
-      } catch {
-        throw new CloudflareApiError(
-          response.status,
-          String(response.status),
-          `GET ${url.pathname} 返回的不是 JSON（HTTP ${response.status}）`,
-        );
-      }
-      if (!response.ok || !body.success) {
-        const first = body.errors?.[0];
-        throw new CloudflareApiError(
-          response.status,
-          String(first?.code ?? response.status),
-          `GET ${url.pathname} 失败：${first?.message ?? `HTTP ${response.status}`}`,
-        );
-      }
-      return body;
+    let response: Response;
+    try {
+      response = await withRetry(
+        () => doFetch(url.toString(), { headers: { authorization: `Bearer ${this.#opts.apiToken}` } }),
+        this.#opts.onRetry,
+      );
+    } catch (error) {
+      // 重试耗尽的网络层失败也归成「预期内的失败」，否则 cli 会甩出一整段堆栈
+      throw new CloudflareApiError(0, "network", `GET ${url.pathname} 请求失败：${String(error)}`);
     }
 
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    let body: Envelope<T>;
+    try {
+      body = (await response.json()) as Envelope<T>;
+    } catch {
+      throw new CloudflareApiError(
+        response.status,
+        String(response.status),
+        `GET ${url.pathname} 返回的不是 JSON（HTTP ${response.status}）`,
+      );
+    }
+    if (!response.ok || !body.success) {
+      const first = body.errors?.[0];
+      throw new CloudflareApiError(
+        response.status,
+        String(first?.code ?? response.status),
+        `GET ${url.pathname} 失败：${first?.message ?? `HTTP ${response.status}`}`,
+      );
+    }
+    return body;
   }
 }
 
-function backoff(attempt: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 2 ** (attempt - 1) * 500));
+function paginationError(reason: string): CloudflareApiError {
+  return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部预览，已中止。`);
 }

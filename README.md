@@ -46,7 +46,7 @@ bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
 
 花在 R2 上的永远只有三个请求：列目录、读规则、写规则。第一步的请求数则随「近期版本数 +
 预览数」增长：列一次 deployments、每个近期版本读一次 URL 再读一次 `BUILD_ID`、列一次预览、
-每个预览读一次 `BUILD_ID`（并发进行）。
+每个预览读一次 `BUILD_ID`。近期版本与预览各自并发探测。
 
 因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
 直接告诉你「规则已经是最新的，无需改动」。
@@ -90,7 +90,12 @@ BUILD_ID，它只负责告诉我们该去读哪些地址。
   上的 `/BUILD_ID`。预览 URL 永远指向该预览最新的一次部署。
 
 近期线上或预览的 build 不在 bucket 里是正常的（旧 build 早已删完，或预览绑了别的 bucket），
-计划里会单独列出、不报错；最新线上版本或 `--keep` 的不在 bucket 里则照常报错。
+计划里会单独列出、不报错；最新线上版本或 `--keep` 的不在 bucket 里则照常报错 —— 哪怕同一个
+build 同时也是近期版本或预览。
+
+读版本的 `/BUILD_ID` 依赖版本预览 URL，Worker 需开启 workers.dev 与 `preview_urls`。
+**实现了 Durable Object 的 Worker（例如用了 OpenNext 的 DO 队列或 DO tag cache）不会生成版本
+预览 URL**，`--worker` 对它不可用，请改用下面的 `--url` 加 `--keep`。
 
 API token 需要 **Account › Workers Scripts › Read** 权限。
 

@@ -263,4 +263,21 @@ describe("多来源保留集", () => {
       makePlan(input({ keep: [{ buildId: "bogus", reason: "online" }] })),
     ).toThrow(/不存在/);
   });
+
+  it("--keep 的 build 同时是近期版本时，不在 bucket 里仍要报错", () => {
+    const keep = [
+      { buildId: "online1", reason: "online" as const },
+      { buildId: "typo", reason: "recent" as const, source: "version v1" },
+      { buildId: "typo", reason: "explicit" as const },
+    ];
+    expect(() => makePlan(input({ keep }))).toThrow(/typo/);
+
+    // --force 时它留在 keep 里（展示原因仍按优先级取 recent），不会被挪进 absent
+    const plan = makePlan(input({ keep, force: true }));
+    expect(plan.keep.map((b) => [b.buildId, b.reason])).toEqual([
+      ["online1", "online"],
+      ["typo", "recent"],
+    ]);
+    expect(plan.absent).toEqual([]);
+  });
 });

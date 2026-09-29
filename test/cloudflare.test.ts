@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CloudflareApi, CloudflareApiError } from "../src/cloudflare.ts";
 
 const ok = (result: unknown, resultInfo?: unknown) =>
@@ -60,10 +60,38 @@ describe("CloudflareApi", () => {
     expect(calls).toHaveLength(2);
   });
 
-  it("没有 result_info 时，一页没装满就算翻完", async () => {
-    const { api: cf, calls } = api(() => ok([{ name: "only" }]));
+  it("没有 result_info 时一直翻到空页，不拿「没装满」当终点", async () => {
+    const { api: cf, calls } = api((url) =>
+      url.searchParams.get("page") === "1" ? ok([{ name: "only" }]) : ok([]),
+    );
     expect(await cf.listPreviews("w")).toEqual([{ name: "only", urls: [] }]);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("服务端把每页压到 50 条时照样翻完，不漏预览", async () => {
+    const all = Array.from({ length: 120 }, (_, i) => ({ name: `p${i}` }));
+    const { api: cf, calls } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return ok(all.slice((page - 1) * 50, page * 50), { page, per_page: 50, total_count: 120 });
+    });
+    expect(await cf.listPreviews("w")).toHaveLength(120);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("只回报了 per_page 时，按它判断最后一页", async () => {
+    const { api: cf, calls } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const names = page === 1 ? ["a", "b"] : ["c"];
+      return ok(names.map((name) => ({ name })), { page, per_page: 2 });
+    });
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["a", "b", "c"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("page 参数被忽略（比如其实是游标分页）时，第二页重复即中止", async () => {
+    const { api: cf, calls } = api(() => ok([{ name: "a" }, { name: "b" }], { cursor: "next" }));
+    await expect(cf.listPreviews("w")).rejects.toMatchObject({ code: "pagination" });
+    expect(calls).toHaveLength(2);
   });
 
   it("分页参数不被认、每页都满时不会无限翻下去", async () => {
@@ -85,6 +113,24 @@ describe("CloudflareApi", () => {
       status: 404,
       code: "10007",
     });
+  });
+
+  it("网络层失败重试耗尽后归成 CloudflareApiError，不甩原生错误", async () => {
+    vi.useFakeTimers();
+    try {
+      const { api: cf, calls } = api(() => {
+        throw new TypeError("fetch failed");
+      });
+      const result = expect(cf.listDeployments("w")).rejects.toMatchObject({
+        name: "CloudflareApiError",
+        code: "network",
+      });
+      await vi.runAllTimersAsync();
+      await result;
+      expect(calls).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("响应不是 JSON 时给出可读的错误", async () => {

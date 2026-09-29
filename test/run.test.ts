@@ -174,6 +174,8 @@ function fakeCloudflare(opts: {
         });
       }
       if (url.pathname.endsWith("/previews")) {
+        // 只有一页：没有 result_info，所以客户端会一直翻到空页
+        if (url.searchParams.get("page") !== "1") return json([]);
         return json(
           Object.keys(opts.previews ?? {}).map((name) => ({
             name,
@@ -223,6 +225,58 @@ describe("collectPlan + Cloudflare API", () => {
     expect(cf.probed).not.toContain("v0");
     expect(state.cloudflare).toEqual({ deploymentsScanned: 5, previews: 0 });
     expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("近期版本按窗口并发探测，只探凑数可能用到的 deployment", async () => {
+    const cf = fakeCloudflare({
+      // v4 只改了 secret；窗口 1 = v4..v2（凑到 b3、b2），窗口 2 只差 1 个 = v1
+      deployments: [["v4"], ["v3"], ["v2"], ["v1"], ["v0"]],
+      versions: { v4: "b3", v3: "b3", v2: "b2", v1: "b1", v0: "b0" },
+    });
+    const { store } = fakeR2({ buildIds: ["b3", "b2", "b1", "b0"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b3", "b2", "b1"]);
+    expect(cf.probed.filter((id) => id.startsWith("v")).sort()).toEqual(["v1", "v2", "v3", "v4"]);
+    expect(state.cloudflare?.deploymentsScanned).toBe(4);
+  });
+
+  it("concurrency 或 recentBuilds 小于 1 时照常工作，不留空洞也不卡死", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v2"], ["v1"]],
+      versions: { v2: "b2", v1: "b1" },
+      previews: { "feat-a": "bA" },
+    });
+    const { store } = fakeR2({ buildIds: ["b2", "b1", "bA"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w", recentBuilds: 0 },
+      fetchImpl: cf.fetchImpl,
+      concurrency: 0,
+    });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b2", "bA"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b1"]);
+  });
+
+  it("只走 Cloudflare 时 onlineBuildIds 给出最新 deployment 的 build", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["vnew", "vold"], ["vold"]],
+      versions: { vnew: "bNew", vold: "bOld" },
+    });
+    const { store } = fakeR2({ buildIds: ["bNew", "bOld"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.onlineBuildId).toBeNull();
+    expect(state.onlineBuildIds).toEqual(["bNew", "bOld"]);
   });
 
   it("--recent-builds 可调", async () => {
@@ -327,7 +381,7 @@ describe("collectPlan + Cloudflare API", () => {
         cloudflare: { api: cf.api, worker: "w" },
         fetchImpl: cf.fetchImpl,
       }),
-    ).rejects.toThrow(/没有可访问的 URL/);
+    ).rejects.toThrow(/没有可访问的 URL[\s\S]*Durable Object/);
   });
 
   it("线上 build 不在 bucket 里仍然报错", async () => {

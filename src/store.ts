@@ -1,5 +1,6 @@
 import { AwsClient } from "aws4fetch";
 import { normalizePrefix } from "./prefix.ts";
+import { type OnRetry, withRetry } from "./retry.ts";
 import {
   type LifecycleDoc,
   parseErrorMessage,
@@ -25,7 +26,7 @@ export interface StoreOptions {
    */
   md5Base64?: (body: string) => string;
   fetchImpl?: typeof fetch;
-  onRetry?: (attempt: number, reason: string) => void;
+  onRetry?: OnRetry;
 }
 
 export class S3Error extends Error {
@@ -41,8 +42,6 @@ export class S3Error extends Error {
     this.code = code;
   }
 }
-
-const MAX_ATTEMPTS = 3;
 
 export class R2Store {
   readonly #client: AwsClient;
@@ -62,38 +61,18 @@ export class R2Store {
 
   async #request(url: string, init?: RequestInit): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
-    let lastError: unknown;
+    const response = await withRetry(
+      async () => doFetch(await this.#client.sign(url, init)),
+      this.#opts.onRetry,
+    );
+    if (response.status < 400) return response;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      let response: Response;
-      try {
-        const signed = await this.#client.sign(url, init);
-        response = await doFetch(signed);
-      } catch (error) {
-        // 网络层失败同样值得重试
-        lastError = error;
-        if (attempt === MAX_ATTEMPTS) break;
-        this.#opts.onRetry?.(attempt, String(error));
-        await backoff(attempt);
-        continue;
-      }
-
-      if (response.status < 400) return response;
-      if ((response.status >= 500 || response.status === 429) && attempt < MAX_ATTEMPTS) {
-        this.#opts.onRetry?.(attempt, `HTTP ${response.status}`);
-        await backoff(attempt);
-        continue;
-      }
-
-      const body = await response.text();
-      throw new S3Error(
-        response.status,
-        extractCode(body) ?? String(response.status),
-        parseErrorMessage(body),
-      );
-    }
-
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    const body = await response.text();
+    throw new S3Error(
+      response.status,
+      extractCode(body) ?? String(response.status),
+      parseErrorMessage(body),
+    );
   }
 
   /**
@@ -156,8 +135,4 @@ export class R2Store {
 
 function extractCode(xml: string): string | undefined {
   return /<Code>([\s\S]*?)<\/Code>/.exec(xml)?.[1];
-}
-
-function backoff(attempt: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 2 ** (attempt - 1) * 500));
 }

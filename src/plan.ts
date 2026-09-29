@@ -93,31 +93,41 @@ export function makePlan(input: PlanInput): PrunePlan {
     );
   }
 
-  // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示
+  // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示；
+  // 但「必须在 bucket 里」要看全部来源：--keep 了一个恰好也是历史版本的 id，填错时照样得报出来
   const keepMap = new Map<string, KeptBuild>();
+  const mustExist = new Set<string>();
   for (const build of input.keep) {
     const seen = keepMap.get(build.buildId);
     if (!seen || KEEP_PRIORITY.indexOf(build.reason) < KEEP_PRIORITY.indexOf(seen.reason)) {
       keepMap.set(build.buildId, build);
     }
+    if (!MAY_BE_ABSENT.has(build.reason)) mustExist.add(build.buildId);
   }
 
   if (keepMap.size === 0) {
     throw new PlanError("保留集为空，拒绝继续 —— 那会把所有 build 缓存都标记为删除。");
   }
 
-  const absent = [...keepMap.values()].filter(
-    (b) => !existingSet.has(b.buildId) && MAY_BE_ABSENT.has(b.reason),
-  );
-  const missing = [...keepMap.values()]
-    .filter((b) => !existingSet.has(b.buildId) && !MAY_BE_ABSENT.has(b.reason))
-    .map((b) => b.buildId);
+  const keep: KeptBuild[] = [];
+  const absent: KeptBuild[] = [];
+  const missing: string[] = [];
+  for (const build of keepMap.values()) {
+    if (existingSet.has(build.buildId)) keep.push(build);
+    else if (!mustExist.has(build.buildId)) absent.push(build);
+    else {
+      // 加了 --force 仍留在 keep 里：它是用户坚持要保留的，只是眼下不在 bucket 里
+      keep.push(build);
+      missing.push(build.buildId);
+    }
+  }
   if (missing.length > 0 && !input.force) {
     throw new PlanError(
       `要保留的 build 在 bucket 里不存在：${missing.join(", ")}。\n` +
         `通常意味着 bucket、--prefix、站点域名或 --worker 有一个填错了。确认无误可加 --force 跳过这项检查。`,
     );
   }
+  const absentIds = new Set(absent.map((b) => b.buildId));
 
   const expireIds = existing.filter((id) => !keepMap.has(id));
   if (expireIds.length > 0 && expireIds.length === existing.length) {
@@ -136,7 +146,7 @@ export function makePlan(input: PlanInput): PrunePlan {
       buildId: rule.buildId,
       // 本来就不在 bucket 里的预览 / 历史 build 没什么可「复活」的，目录空了就是空了
       reason:
-        keepMap.has(rule.buildId) && !absent.some((b) => b.buildId === rule.buildId)
+        keepMap.has(rule.buildId) && !absentIds.has(rule.buildId)
           ? ("revived" as const)
           : ("emptied" as const),
     }));
@@ -161,7 +171,7 @@ export function makePlan(input: PlanInput): PrunePlan {
   }
 
   return {
-    keep: [...keepMap.values()].filter((b) => !absent.includes(b)),
+    keep,
     absent,
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,

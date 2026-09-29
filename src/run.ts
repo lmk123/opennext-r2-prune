@@ -39,7 +39,10 @@ export interface CloudflareSource {
 }
 
 export interface RunState {
+  /** --url / --build-id-url 探测到的线上 build，与 probedFrom 成对 */
   onlineBuildId: string | null;
+  /** 此刻承载线上流量的全部 build：--url 探测到的加上最新 deployment 里的（灰度时不止一个） */
+  onlineBuildIds: string[];
   probedFrom: string | null;
   /** 走了 Cloudflare API 时的概要：翻看了几条 deployment、有几个预览 */
   cloudflare: { deploymentsScanned: number; previews: number } | null;
@@ -73,6 +76,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
 
   return {
     onlineBuildId,
+    onlineBuildIds: [...new Set(keeps.filter((b) => b.reason === "online").map((b) => b.buildId))],
     probedFrom: probeUrl ?? null,
     cloudflare,
     plan: makePlan({
@@ -103,7 +107,8 @@ async function collectCloudflareKeeps(
   concurrency: number,
 ): Promise<{ keeps: KeptBuild[]; deploymentsScanned: number; previews: number }> {
   const { api, worker } = source;
-  const wanted = source.recentBuilds ?? 3;
+  // 小于 1 时窗口大小为 0，下面的循环永远走不动
+  const wanted = Math.max(1, source.recentBuilds ?? 3);
   const keeps: KeptBuild[] = [];
 
   const deployments = await api.listDeployments(worker);
@@ -111,25 +116,36 @@ async function collectCloudflareKeeps(
     throw new BuildIdProbeError(`Worker ${worker} 没有任何 deployment，请确认 --worker 填对了。`);
   }
 
+  // 按窗口往回翻：每个窗口里的 version 并发探测。窗口大小取「还差几个」—— 每条 deployment
+  // 至多贡献一个新 build（灰度除外），所以窗口里的都是凑数可能要用到的，不会为了凑数把
+  // 全部历史 version 都探一遍；没有只改配置的部署时一轮就够
   const byVersion = new Map<string, string>();
   const distinct = new Set<string>();
   let scanned = 0;
-  for (const [index, deployment] of deployments.entries()) {
-    if (index > 0 && distinct.size >= wanted) break;
-    scanned++;
-    for (const versionId of deployment.versionIds) {
-      let buildId = byVersion.get(versionId);
-      if (buildId === undefined) {
-        buildId = await probeVersion(api, worker, versionId, fetchImpl);
-        byVersion.set(versionId, buildId);
+  const enough = (index: number) => index > 0 && distinct.size >= wanted;
+  for (let start = 0; start < deployments.length && !enough(start); ) {
+    const window = deployments.slice(start, start + Math.max(1, wanted - distinct.size));
+    const pending = [...new Set(window.flatMap((d) => d.versionIds))].filter((id) => !byVersion.has(id));
+    const buildIds = await mapWithConcurrency(pending, concurrency, (versionId) =>
+      probeVersion(api, worker, versionId, fetchImpl),
+    );
+    pending.forEach((versionId, i) => byVersion.set(versionId, buildIds[i]!));
+
+    for (const [offset, deployment] of window.entries()) {
+      const index = start + offset;
+      if (enough(index)) break;
+      scanned++;
+      for (const versionId of deployment.versionIds) {
+        const buildId = byVersion.get(versionId)!;
+        distinct.add(buildId);
+        keeps.push({
+          buildId,
+          reason: index === 0 ? "online" : "recent",
+          source: `version ${versionId.slice(0, 8)}`,
+        });
       }
-      distinct.add(buildId);
-      keeps.push({
-        buildId,
-        reason: index === 0 ? "online" : "recent",
-        source: `version ${versionId.slice(0, 8)}`,
-      });
     }
+    start += window.length;
   }
 
   const previews = await api.listPreviews(worker);
@@ -160,7 +176,9 @@ async function probeVersion(
   const url = (await api.getVersionUrls(worker, versionId))[0];
   if (!url) {
     throw new BuildIdProbeError(
-      `${label} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与 preview_urls。`,
+      `${label} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与 preview_urls。\n` +
+        `注意：实现了 Durable Object 的 Worker（例如用了 OpenNext 的 DO 队列或 DO tag cache）` +
+        `不会生成版本预览 URL，开了也没用 —— 这种情况请改用 --url 与 --keep。`,
     );
   }
   return withContext(label, () => probeBuildId(buildIdUrlFor(url), fetchImpl));
@@ -185,7 +203,8 @@ async function mapWithConcurrency<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+  // limit 小于 1 时一个 worker 都起不来，结果里会全是空洞
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
     while (cursor < items.length) {
       const index = cursor++;
       results[index] = await fn(items[index]!);

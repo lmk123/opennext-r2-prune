@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { BuildIdProbeError } from "./build-id.ts";
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
-import { type ExpireState, type KeptBuild, PlanError, type PrunePlan } from "./plan.ts";
+import { type ExpireState, type KeptBuild, PlanError } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
 import { R2Store, S3Error } from "./store.ts";
 import { collectPlan, type RunState } from "./run.ts";
@@ -129,9 +129,16 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const recentBuilds = Number(values["recent-builds"] ?? 3);
-  if (!Number.isInteger(recentBuilds) || recentBuilds < 1) {
+  // 只认纯数字：Number() 会把 "0x3"、"1e1"、" 3 " 都当成合法整数
+  const recentBuildsRaw = values["recent-builds"] ?? "3";
+  const recentBuilds = Number(recentBuildsRaw);
+  if (!/^\d+$/.test(recentBuildsRaw) || recentBuilds < 1) {
     console.error("--recent-builds 必须是不小于 1 的整数");
+    return 1;
+  }
+  // 没有 --worker 就没有近期版本可翻，悄悄忽略会让人以为保住了近几个 build
+  if (values["recent-builds"] !== undefined && !worker) {
+    console.error("--recent-builds 需要配合 --worker 与 --api-token 使用");
     return 1;
   }
 
@@ -218,7 +225,7 @@ async function main(argv: string[]): Promise<number> {
     console.log(
       JSON.stringify(
         {
-          ...toJson(state.onlineBuildId, prefix, plan),
+          ...toJson(state, prefix),
           expireDays,
           style,
           written,
@@ -255,6 +262,8 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   console.log(`bucket: ${bucket}    前缀: ${normalizePrefix(prefix) || "（bucket 根）"}`);
   if (state.onlineBuildId) {
     console.log(`线上 BUILD_ID: ${state.onlineBuildId}  （读自 ${state.probedFrom}）`);
+  } else if (state.onlineBuildIds.length > 0) {
+    console.log(`线上 BUILD_ID: ${state.onlineBuildIds.join(", ")}  （读自最新的 deployment）`);
   }
   if (state.cloudflare) {
     console.log(
@@ -300,12 +309,17 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   }
 }
 
-function toJson(onlineBuildId: string | null, prefix: string, plan: PrunePlan) {
+function toJson(state: RunState, prefix: string) {
+  const { plan, onlineBuildIds } = state;
   return {
     prefix,
-    onlineBuildId,
+    // 只走 --worker 时也要有值；灰度中线上不止一个 build，单个字段说不清，看 onlineBuildIds
+    onlineBuildId: state.onlineBuildId ?? (onlineBuildIds.length === 1 ? onlineBuildIds[0] : null),
+    onlineBuildIds,
+    cloudflare: state.cloudflare,
     changed: plan.changed,
-    keep: plan.keep,
+    // keep 仍是完整的保留集；其中不在 bucket 里的另见 absent
+    keep: [...plan.keep, ...plan.absent],
     absent: plan.absent,
     expire: plan.expire,
     reclaim: plan.reclaim,
