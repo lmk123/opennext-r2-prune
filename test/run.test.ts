@@ -74,7 +74,7 @@ describe("collectPlan", () => {
         siteUrl: "https://example.com",
         fetchImpl: siteReplying("<html>404</html>", { headers: { "content-type": "text/html" } }),
       }),
-    ).rejects.toThrow(/HTML/);
+    ).rejects.toThrow(/HTML[\s\S]*请改用 --keep/);
     expect(calls).toHaveLength(0);
   });
 
@@ -351,6 +351,15 @@ describe("collectPlan + Cloudflare API", () => {
         fetchImpl: cf.fetchImpl,
       }),
     ).rejects.toThrow(/预览 broken/);
+    // --keep 救不了读不到的预览，不能拿它当建议
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(/Cloudflare Access[\s\S]*去掉 --worker/);
     expect(calls).toHaveLength(0);
   });
 

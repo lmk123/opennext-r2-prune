@@ -28,6 +28,10 @@ export function buildIdUrlFor(siteUrl: string): string {
   }
 }
 
+/**
+ * 报错只说清楚哪里不对，不给补救办法：同一个失败，读站点时该改用 --keep，读 Worker 版本或
+ * 预览时 --keep 却帮不上忙 —— 办法由调用方按自己的模式补上。
+ */
 export async function probeBuildId(
   url: string,
   fetchImpl: typeof fetch = fetch,
@@ -47,7 +51,7 @@ export async function probeBuildId(
 
   if (!response.ok) {
     throw new BuildIdProbeError(
-      `${url} 返回 HTTP ${response.status}。该站点可能没有把 BUILD_ID 暴露出来，请改用 --keep 显式指定要保留的 build id。`,
+      `${url} 返回 HTTP ${response.status}，可能没有把 BUILD_ID 暴露出来。`,
     );
   }
 
@@ -55,14 +59,14 @@ export async function probeBuildId(
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("text/html")) {
     throw new BuildIdProbeError(
-      `${url} 返回的是 HTML（content-type: ${contentType}），说明请求被页面路由接管了，而不是命中静态的 BUILD_ID 文件。请改用 --keep 显式指定。`,
+      `${url} 返回的是 HTML（content-type: ${contentType}），说明请求被页面路由接管了，而不是命中静态的 BUILD_ID 文件。`,
     );
   }
 
   const buildId = (await response.text()).trim();
   if (!BUILD_ID_PATTERN.test(buildId)) {
     throw new BuildIdProbeError(
-      `${url} 的响应不像一个 build id：${JSON.stringify(buildId.slice(0, 80))}。请改用 --keep 显式指定。`,
+      `${url} 的响应不像一个 build id：${JSON.stringify(buildId.slice(0, 80))}。`,
     );
   }
 

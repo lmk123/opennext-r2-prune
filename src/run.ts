@@ -56,7 +56,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const probeUrl = opts.buildIdUrl ?? (opts.siteUrl ? buildIdUrlFor(opts.siteUrl) : undefined);
   let onlineBuildId: string | null = null;
   if (probeUrl) {
-    onlineBuildId = await probeBuildId(probeUrl, fetchImpl);
+    onlineBuildId = await explainProbe(SITE_HINT, () => probeBuildId(probeUrl, fetchImpl));
     keeps.push({ buildId: onlineBuildId, reason: "online" });
   }
 
@@ -156,8 +156,10 @@ async function collectCloudflareKeeps(
         `预览 ${preview.name} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与预览 URL。`,
       );
     }
-    const buildId = await withContext(`预览 ${preview.name}`, () =>
-      probeBuildId(buildIdUrlFor(url), fetchImpl),
+    const buildId = await explainProbe(
+      WORKER_HINT,
+      () => probeBuildId(buildIdUrlFor(url), fetchImpl),
+      `预览 ${preview.name}`,
     );
     return { buildId, reason: "preview" as const, source: preview.name };
   });
@@ -181,16 +183,29 @@ async function probeVersion(
         `不会生成版本预览 URL，开了也没用 —— 这种情况请改用 --url 与 --keep。`,
     );
   }
-  return withContext(label, () => probeBuildId(buildIdUrlFor(url), fetchImpl));
+  return explainProbe(WORKER_HINT, () => probeBuildId(buildIdUrlFor(url), fetchImpl), label);
 }
 
-/** 探测失败时补上是哪个版本 / 预览，否则一长串 workers.dev 地址很难对上号 */
-async function withContext<T>(label: string, fn: () => Promise<T>): Promise<T> {
+const SITE_HINT = "请改用 --keep 显式指定要保留的 build id。";
+
+/**
+ * 读 Worker 版本或预览失败时，--keep 帮不上忙：失败的那个 build 仍然读不到，整趟照样中止。
+ * 能做的是让地址可读，或者整个退回 --url 模式。
+ */
+const WORKER_HINT =
+  "请确认该地址能公开访问（workers.dev 已开启、未被 Cloudflare Access 挡住）；" +
+  "做不到时请去掉 --worker，改用 --url 与 --keep。";
+
+/**
+ * probeBuildId 只说哪里不对，这里按模式补上怎么办；读版本 / 预览时再补上是哪一个，
+ * 否则一长串 workers.dev 地址很难对上号。
+ */
+async function explainProbe<T>(hint: string, fn: () => Promise<T>, label?: string): Promise<T> {
   try {
     return await fn();
   } catch (error) {
     if (error instanceof BuildIdProbeError) {
-      throw new BuildIdProbeError(`${label}：${error.message}`);
+      throw new BuildIdProbeError(`${label ? `${label}：` : ""}${error.message}\n${hint}`);
     }
     throw error;
   }
