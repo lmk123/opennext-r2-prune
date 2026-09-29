@@ -117,6 +117,20 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.map((r) => r.buildId)).not.toContain("online1");
   });
 
+  it("--force 硬留、但不在 bucket 里的 build，其残留规则按「已删空」回收，不算复活", () => {
+    const plan = makePlan(
+      input({
+        keep: [
+          { buildId: "online1", reason: "online" },
+          { buildId: "gone", reason: "explicit" },
+        ],
+        force: true,
+        current: withRules([ownRule("gone")]),
+      }),
+    );
+    expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
+  });
+
   it("已有规则且内容一致的 build 不重复添加，标记为仍在删", () => {
     const plan = makePlan(input({ current: withRules([ownRule("old1")]) }));
     expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("pending");

@@ -89,10 +89,47 @@ describe("CloudflareApi", () => {
     expect(calls).toHaveLength(4);
   });
 
-  it("page 参数被忽略（比如其实是游标分页）时，第二页重复即中止", async () => {
+  it("page 参数被忽略（比如其实是游标分页）时，每一遍第二页都重复，列满次数后中止", async () => {
     const { api: cf, calls } = api(() => ok([{ name: "a" }, { name: "b" }], { cursor: "next" }));
-    await expect(cf.listPreviews("w")).rejects.toMatchObject({ code: "pagination" });
-    expect(calls).toHaveLength(2);
+    await expect(cf.listPreviews("w")).rejects.toMatchObject({
+      code: "pagination",
+      message: expect.stringContaining("分页参数可能没被接受"),
+    });
+    // 每遍在第二页发现重复就停
+    expect(calls).toHaveLength(6);
+  });
+
+  it("翻页间有预览新建、导致重复时，重列一遍而不是直接中止", async () => {
+    // 第一遍：读完第 1 页后新建了 n（排在最前），b 被挤到第 2 页 —— b 出现两次
+    const lists = [
+      [["a", "b"], ["b", "c"]],
+      [["n", "a"], ["b", "c"]],
+      [["n", "a"], ["b", "c"]],
+    ];
+    let listing = 0;
+    const { api: cf } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const names = lists[Math.min(listing, lists.length - 1)]![page - 1]!;
+      if (page === 2) listing++;
+      return ok(names.map((name) => ({ name })), { page, total_pages: 2 });
+    });
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["n", "a", "b", "c"]);
+  });
+
+  it("两遍之间只是顺序变了（集合相同）时照常采用", async () => {
+    const lists = [
+      [["a", "b"], ["c"]],
+      [["b", "a"], ["c"]],
+    ];
+    let listing = 0;
+    const { api: cf, calls } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const names = lists[Math.min(listing, lists.length - 1)]![page - 1]!;
+      if (page === 2) listing++;
+      return ok(names.map((name) => ({ name })), { page, total_pages: 2 });
+    });
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["b", "a", "c"]);
+    expect(calls).toHaveLength(4);
   });
 
   it("分页参数不被认、每页都满时不会无限翻下去", async () => {

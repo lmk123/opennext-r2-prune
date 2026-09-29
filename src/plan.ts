@@ -127,7 +127,6 @@ export function makePlan(input: PlanInput): PrunePlan {
         `通常意味着 bucket、--prefix、站点域名或 --worker 有一个填错了。确认无误可加 --force 跳过这项检查。`,
     );
   }
-  const absentIds = new Set(absent.map((b) => b.buildId));
 
   const expireIds = existing.filter((id) => !keepMap.has(id));
   if (expireIds.length > 0 && expireIds.length === existing.length) {
@@ -144,11 +143,9 @@ export function makePlan(input: PlanInput): PrunePlan {
     .filter((rule) => !existingSet.has(rule.buildId) || keepMap.has(rule.buildId))
     .map((rule) => ({
       buildId: rule.buildId,
-      // 本来就不在 bucket 里的预览 / 历史 build 没什么可「复活」的，目录空了就是空了
-      reason:
-        keepMap.has(rule.buildId) && !absentIds.has(rule.buildId)
-          ? ("revived" as const)
-          : ("emptied" as const),
+      // 不在 bucket 里的 build 没什么可「复活」的，哪怕它在保留集里（预览 / 历史 build，
+      // 或 --force 硬留的），目录空了就是空了；留下的规则按过滤条件必然属于保留集
+      reason: existingSet.has(rule.buildId) ? ("revived" as const) : ("emptied" as const),
     }));
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用

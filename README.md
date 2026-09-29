@@ -46,7 +46,7 @@ bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
 
 花在 R2 上的永远只有三个请求：列目录、读规则、写规则。第一步的请求数则随「近期版本数 +
 预览数」增长：列一次 deployments、每个近期版本读一次 URL 再读一次 `BUILD_ID`、列一次预览、
-每个预览读一次 `BUILD_ID`。近期版本与预览各自并发探测。
+每个预览读一次 `BUILD_ID`。近期版本与预览两条线同时进行，各自内部并发探测。
 
 因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
 直接告诉你「规则已经是最新的，无需改动」。
@@ -167,10 +167,14 @@ API token 需要 **Workers Scripts › Read**。
   生效，非交互环境记得给 `--yes`。
 - 读 BUILD_ID 依赖 workers.dev 上的版本 URL 与预览 URL。Worker 关掉了 workers.dev /
   preview URL，或者这些 URL 被 Cloudflare Access 保护着时，探测会失败、工具会中止。
+- **已上传但还没部署的版本不受保护**（`opennextjs-cloudflare upload` / `wrangler versions upload`
+  之后、`wrangler versions deploy` 之前）。它的缓存已经写进 R2，但不在任何 deployment 或预览里，
+  这期间运行会把它判作作废。请避开这个窗口，或用 `--keep` 显式保留。
 - 只用 `--url` 模式时只保留线上当前 BUILD_ID，**若恰好在灰度窗口内运行，灰度中旧版本的缓存
   目录会被判定作废**。用 `--worker` 模式即可避免。
 - 预览的列举接口官方文档尚未写明分页形态，按 Cloudflare API 通用的 `result_info` 处理；
-  要翻多页时会再完整列一遍，两次一致才采用，防止翻页期间有预览增删导致漏项。
+  要翻多页时会再完整列一遍，两次得到的预览集合一致才采用，防止翻页期间有预览增删导致漏项或
+  重复；连续 3 遍都对不上则中止。
   首次使用建议先 `--dry-run`，核对保留列表里的预览与 Dashboard 一致。
 
 ## 开发

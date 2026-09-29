@@ -283,6 +283,41 @@ describe("collectPlan + Cloudflare API", () => {
     expect(cf.probed.filter((id) => id.startsWith("p"))).toEqual([]);
   });
 
+  it("一条线失败时中止另一条上还在退避重试的请求，不把进程拖住", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v1"]],
+      versions: { v1: "live" },
+      previews: { broken: "<fail>" },
+    });
+    let v1Probes = 0;
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      if (new URL(input).hostname.startsWith("v1-")) {
+        v1Probes++;
+        // 限流且要求等一分钟：不中止的话这里会一直挂着
+        return new Response("busy", { status: 429, headers: { "retry-after": "60" } });
+      }
+      return cf.fetchImpl(input, init);
+    }) as unknown as typeof fetch;
+    const { store } = fakeR2({ buildIds: ["live"] });
+
+    const started = Date.now();
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: {
+          api: new CloudflareApi({ accountId: "acct", apiToken: "tok", fetchImpl }),
+          worker: "w",
+        },
+        fetchImpl,
+      }),
+    ).rejects.toThrow(/预览 broken/);
+    // 给被中止的退避一点时间收尾，确认它没有再发请求
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(v1Probes).toBe(1);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
   it("concurrency 或 recentBuilds 小于 1 时照常工作，不留空洞也不卡死", async () => {
     const cf = fakeCloudflare({
       deployments: [["v2"], ["v1"]],

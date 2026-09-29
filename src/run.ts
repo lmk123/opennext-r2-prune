@@ -55,7 +55,7 @@ export interface RunState {
 export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const keeps: KeptBuild[] = [];
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const probe: Probe = (url) => probeBuildId(url, fetchImpl, opts.onRetry);
+  const probe: Probe = (url, signal) => probeBuildId(url, fetchImpl, opts.onRetry, signal);
 
   const probeUrl = opts.buildIdUrl ?? (opts.siteUrl ? buildIdUrlFor(opts.siteUrl) : undefined);
   let onlineBuildId: string | null = null;
@@ -104,20 +104,45 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
  * 预览：每个 Preview 的 URL 永远指向它最新的 deployment，读一次就是它当前的 BUILD_ID。
  *
  * 任何一个读不到都整体失败 —— 读不到就无从判断它的缓存该不该留，宁可不跑也不误删。
+ * 两条线互不依赖，并发走；一处失败就中止另一条和全部在途请求，否则整趟已经失败，
+ * 还在按 Retry-After 退避重试的请求会把进程拖住。
  */
-type Probe = (url: string) => Promise<string>;
+type Probe = (url: string, signal?: AbortSignal) => Promise<string>;
 
 async function collectCloudflareKeeps(
   source: CloudflareSource,
   probe: Probe,
   concurrency: number,
 ): Promise<{ keeps: KeptBuild[]; deploymentsScanned: number; previews: number }> {
+  const controller = new AbortController();
+  const abortOnFailure = <T>(promise: Promise<T>) =>
+    promise.catch((error: unknown) => {
+      controller.abort();
+      throw error;
+    });
+  const [recent, previews] = await Promise.all([
+    abortOnFailure(collectRecentKeeps(source, probe, concurrency, controller.signal)),
+    abortOnFailure(collectPreviewKeeps(source, probe, concurrency, controller.signal)),
+  ]);
+  return {
+    keeps: [...recent.keeps, ...previews],
+    deploymentsScanned: recent.scanned,
+    previews: previews.length,
+  };
+}
+
+async function collectRecentKeeps(
+  source: CloudflareSource,
+  probe: Probe,
+  concurrency: number,
+  signal: AbortSignal,
+): Promise<{ keeps: KeptBuild[]; scanned: number }> {
   const { api, worker } = source;
   // 小于 1 时窗口大小为 0，下面的循环永远走不动
   const wanted = Math.max(1, source.recentBuilds ?? 3);
   const keeps: KeptBuild[] = [];
 
-  const deployments = await api.listDeployments(worker);
+  const deployments = await api.listDeployments(worker, signal);
   if (deployments.length === 0) {
     throw new BuildIdProbeError(`Worker ${worker} 没有任何 deployment，请确认 --worker 填对了。`);
   }
@@ -141,8 +166,8 @@ async function collectCloudflareKeeps(
     }
     const window = deployments.slice(start, end);
     const versionIds = [...pending];
-    const buildIds = await mapWithConcurrency(versionIds, concurrency, (versionId) =>
-      probeVersion(api, worker, versionId, probe),
+    const buildIds = await mapWithConcurrency(versionIds, concurrency, signal, (versionId) =>
+      probeVersion(api, worker, versionId, probe, signal),
     );
     versionIds.forEach((versionId, i) => byVersion.set(versionId, buildIds[i]!));
 
@@ -162,9 +187,17 @@ async function collectCloudflareKeeps(
     }
     start += window.length;
   }
+  return { keeps, scanned };
+}
 
-  const previews = await api.listPreviews(worker);
-  const previewKeeps = await mapWithConcurrency(previews, concurrency, async (preview) => {
+async function collectPreviewKeeps(
+  source: CloudflareSource,
+  probe: Probe,
+  concurrency: number,
+  signal: AbortSignal,
+): Promise<KeptBuild[]> {
+  const previews = await source.api.listPreviews(source.worker, signal);
+  return mapWithConcurrency(previews, concurrency, signal, async (preview) => {
     const url = preview.urls[0];
     if (!url) {
       throw new BuildIdProbeError(
@@ -173,14 +206,11 @@ async function collectCloudflareKeeps(
     }
     const buildId = await explainProbe(
       WORKER_HINT,
-      () => probe(buildIdUrlFor(url)),
+      () => probe(buildIdUrlFor(url), signal),
       `预览 ${preview.name}`,
     );
     return { buildId, reason: "preview" as const, source: preview.name };
   });
-  keeps.push(...previewKeeps);
-
-  return { keeps, deploymentsScanned: scanned, previews: previews.length };
 }
 
 async function probeVersion(
@@ -188,9 +218,10 @@ async function probeVersion(
   worker: string,
   versionId: string,
   probe: Probe,
+  signal: AbortSignal,
 ): Promise<string> {
   const label = `版本 ${versionId.slice(0, 8)}`;
-  const url = (await api.getVersionUrls(worker, versionId))[0];
+  const url = (await api.getVersionUrls(worker, versionId, signal))[0];
   if (!url) {
     throw new BuildIdProbeError(
       `${label} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与 preview_urls。\n` +
@@ -198,7 +229,7 @@ async function probeVersion(
         `不会生成版本预览 URL，开了也没用 —— 这种情况请改用 --url 与 --keep。`,
     );
   }
-  return explainProbe(WORKER_HINT, () => probe(buildIdUrlFor(url)), label);
+  return explainProbe(WORKER_HINT, () => probe(buildIdUrlFor(url), signal), label);
 }
 
 const SITE_HINT = "请改用 --keep 显式指定要保留的 build id。";
@@ -229,15 +260,17 @@ async function explainProbe<T>(hint: string, fn: () => Promise<T>, label?: strin
 async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
+  signal: AbortSignal,
   fn: (item: T) => Promise<R>,
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
-  // 任何一项失败整体就已失败，其余 worker 不再领新任务，免得把剩下的请求白白发完
+  // 任何一项失败整体就已失败，其余 worker 不再领新任务，免得把剩下的请求白白发完；
+  // 另一条线失败（signal 中止）时同理
   let failed = false;
   // limit 小于 1 时一个 worker 都起不来，结果里会全是空洞
   const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
-    while (!failed && cursor < items.length) {
+    while (!failed && !signal.aborted && cursor < items.length) {
       const index = cursor++;
       try {
         results[index] = await fn(items[index]!);

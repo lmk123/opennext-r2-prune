@@ -57,46 +57,62 @@ export class CloudflareApi {
   }
 
   /** 最新的在前 */
-  async listDeployments(worker: string): Promise<Deployment[]> {
+  async listDeployments(worker: string, signal?: AbortSignal): Promise<Deployment[]> {
     const { result } = await this.#get<{
       deployments?: { versions?: { version_id: string }[] }[];
-    } | null>(`/workers/scripts/${encodeURIComponent(worker)}/deployments`);
+    } | null>(`/workers/scripts/${encodeURIComponent(worker)}/deployments`, undefined, signal);
     return (result?.deployments ?? []).map((d) => ({
       versionIds: (d.versions ?? []).map((v) => v.version_id),
     }));
   }
 
   /** 这个 version 可以直接访问的地址，即 `<版本前缀>-<worker>.<子域>.workers.dev` */
-  async getVersionUrls(worker: string, versionId: string): Promise<string[]> {
+  async getVersionUrls(worker: string, versionId: string, signal?: AbortSignal): Promise<string[]> {
     const { result } = await this.#get<{ urls?: string[] } | null>(
       `/workers/workers/${encodeURIComponent(worker)}/versions/${encodeURIComponent(versionId)}`,
+      undefined,
+      signal,
     );
     return result?.urls ?? [];
   }
 
   /**
    * 按页码翻页时，两页之间有预览被删，后面的预览整体前移，会有一个恰好落进已经翻过的页里
-   * 被漏掉 —— 重复检测只抓得到「多出来的」，抓不到「少了的」。所以要发多个请求才列完时，
-   * 再完整列一遍，两次一致才算数。
+   * 被漏掉；有预览新建或更新（排序靠前）时则整体后移，同一个预览在两页里各出现一次。
+   * 所以要发多个请求才列完时，再完整列一遍，两次得到的预览集合一致才算数；出现重复的那一遍
+   * 本身就不完整，不参与比对。分页参数压根没被认时每一遍都会重复，列满次数后中止。
    */
-  async listPreviews(worker: string): Promise<Preview[]> {
-    let previous = await this.#listPreviewsOnce(worker);
-    if (previous.requests === 1) return previous.previews;
-    for (let attempt = 2; attempt <= MAX_LIST_ATTEMPTS; attempt++) {
-      const next = await this.#listPreviewsOnce(worker);
-      if (sameNames(previous.previews, next.previews)) return next.previews;
-      previous = next;
+  async listPreviews(worker: string, signal?: AbortSignal): Promise<Preview[]> {
+    let previous: Preview[] | undefined;
+    let duplicate: string | undefined;
+    for (let attempt = 1; attempt <= MAX_LIST_ATTEMPTS; attempt++) {
+      const pass = await this.#listPreviewsOnce(worker, signal);
+      if (pass.duplicate !== undefined) {
+        duplicate = pass.duplicate;
+        continue;
+      }
+      // 一个请求就列完的结果是同一时刻的快照，不存在翻页间漏项
+      if (pass.requests === 1) return pass.previews;
+      if (previous && sameNameSet(previous, pass.previews)) return pass.previews;
+      previous = pass.previews;
     }
-    throw paginationError(`连续 ${MAX_LIST_ATTEMPTS} 次列举预览的结果都不一致，预览可能正在频繁增删`);
+    throw paginationError(
+      duplicate !== undefined && previous === undefined
+        ? `连续 ${MAX_LIST_ATTEMPTS} 次列举预览，预览 ${duplicate} 都在不同的页里重复出现，分页参数可能没被接受`
+        : `连续 ${MAX_LIST_ATTEMPTS} 次列举预览的结果都不一致，预览可能正在频繁增删`,
+    );
   }
 
   /**
    * 翻页的终点必须有据可依：漏掉一页预览，它们的 build 就会被挂上删除规则，而且全程 0 退出。
-   * 依次认 total_pages、total_count、服务端回报的 per_page；三者都没有时一直翻到空页为止，
-   * 同一个预览在后面的页里又出现，说明分页参数没被认（比如接口其实是游标分页），当场中止。
+   * 依次认 total_pages、total_count、服务端回报的 per_page；三者都没有时一直翻到空页为止。
+   * 同一个预览在后面的页里又出现时这一遍作废，交回 duplicate 由 listPreviews 决定重列还是中止。
    * 唯一的例外是接口压根不分页：两页都不带 result_info、内容一模一样、且第一页没装满。
    */
-  async #listPreviewsOnce(worker: string): Promise<{ previews: Preview[]; requests: number }> {
+  async #listPreviewsOnce(
+    worker: string,
+    signal?: AbortSignal,
+  ): Promise<{ previews: Preview[]; requests: number; duplicate?: string }> {
     const previews: Preview[] = [];
     const seen = new Set<string>();
     let firstPage: { names: string[]; paginated: boolean } | undefined;
@@ -107,6 +123,7 @@ export class CloudflareApi {
       const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[] | null>(
         `/workers/workers/${encodeURIComponent(worker)}/previews`,
         { page: String(page), per_page: String(PAGE_SIZE) },
+        signal,
       );
       const items = result ?? [];
 
@@ -124,9 +141,7 @@ export class CloudflareApi {
       }
 
       for (const p of items) {
-        if (seen.has(p.name)) {
-          throw paginationError(`第 ${page} 页又出现了预览 ${p.name}，分页参数可能没被接受`);
-        }
+        if (seen.has(p.name)) return { previews, requests: page, duplicate: p.name };
         seen.add(p.name);
         previews.push({ name: p.name, urls: p.urls ?? [] });
       }
@@ -142,7 +157,7 @@ export class CloudflareApi {
     }
   }
 
-  async #get<T>(path: string, query?: Record<string, string>): Promise<Envelope<T>> {
+  async #get<T>(path: string, query?: Record<string, string>, signal?: AbortSignal): Promise<Envelope<T>> {
     const url = new URL(`${API_BASE}/accounts/${encodeURIComponent(this.#opts.accountId)}${path}`);
     for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value);
 
@@ -151,8 +166,10 @@ export class CloudflareApi {
     let response: Response;
     try {
       response = await withRetry(
-        () => doFetch(url.toString(), { headers: { authorization: `Bearer ${this.#opts.apiToken}` } }),
+        () =>
+          doFetch(url.toString(), { headers: { authorization: `Bearer ${this.#opts.apiToken}` }, signal }),
         this.#opts.onRetry,
+        signal,
       );
     } catch (error) {
       // 重试耗尽的网络层失败也归成「预期内的失败」，否则 cli 会甩出一整段堆栈
@@ -185,7 +202,16 @@ function paginationError(reason: string): CloudflareApiError {
   return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部预览，已中止。`);
 }
 
-/** 按名字、按顺序比较两份预览列表 */
+/** 按名字、按顺序比较两份预览列表：判断接口是否压根不分页，要求两次响应一模一样 */
 function sameNames(a: { name: string }[], b: { name: string }[]): boolean {
   return a.length === b.length && a.every((p, i) => p.name === b[i]!.name);
+}
+
+/**
+ * 只比名字集合：两遍之间顺序变了（比如按更新时间排序）不代表漏了什么。
+ * 每一遍内部名字已经去重，长度相同且一方全在另一方里即相等。
+ */
+function sameNameSet(a: Preview[], b: Preview[]): boolean {
+  const names = new Set(a.map((p) => p.name));
+  return a.length === b.length && b.every((p) => names.has(p.name));
 }

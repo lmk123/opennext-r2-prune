@@ -10,7 +10,12 @@ const MAX_RETRY_AFTER_MS = 60_000;
 
 export type OnRetry = (attempt: number, reason: string) => void;
 
-export async function withRetry(send: () => Promise<Response>, onRetry?: OnRetry): Promise<Response> {
+/** signal 一旦中止，退避等待立刻结束并抛出，不再发起下一次尝试 */
+export async function withRetry(
+  send: () => Promise<Response>,
+  onRetry?: OnRetry,
+  signal?: AbortSignal,
+): Promise<Response> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -18,19 +23,23 @@ export async function withRetry(send: () => Promise<Response>, onRetry?: OnRetry
     try {
       response = await send();
     } catch (error) {
+      // 被中止的请求不算网络抖动，重试也只会再被中止
+      if (signal?.aborted) throw error;
       // 网络层失败同样值得重试
       lastError = error;
       if (attempt === MAX_ATTEMPTS) break;
       onRetry?.(attempt, String(error));
-      await sleep(backoffMs(attempt));
+      await sleep(backoffMs(attempt), signal);
       continue;
     }
 
     if ((response.status >= 500 || response.status === 429) && attempt < MAX_ATTEMPTS) {
       // 限流时照固定退避重试多半还是 429，服务端说了要等多久就至少等那么久
       const wait = Math.max(backoffMs(attempt), retryAfterMs(response) ?? 0);
+      // 丢弃的响应既不读完也不取消，undici 要等到 GC 才归还它占着的连接
+      await response.body?.cancel().catch(() => {});
       onRetry?.(attempt, `HTTP ${response.status}`);
-      await sleep(wait);
+      await sleep(wait, signal);
       continue;
     }
     return response;
@@ -52,6 +61,17 @@ function retryAfterMs(response: Response): number | undefined {
   return Math.min(Math.max(ms, 0), MAX_RETRY_AFTER_MS);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
