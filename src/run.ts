@@ -1,6 +1,7 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi } from "./cloudflare.ts";
 import { type KeptBuild, makePlan, type PrunePlan } from "./plan.ts";
+import type { OnRetry } from "./retry.ts";
 import type { R2Store } from "./store.ts";
 
 /**
@@ -27,6 +28,8 @@ export interface RunOptions {
   /** 规则里 Prefix 的包装形式，默认 filter */
   style?: "filter" | "bare";
   fetchImpl?: typeof fetch;
+  /** 读 BUILD_ID 重试时的回调 */
+  onRetry?: OnRetry;
   /** 并发探测预览时的并发数 */
   concurrency?: number;
 }
@@ -52,17 +55,18 @@ export interface RunState {
 export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const keeps: KeptBuild[] = [];
   const fetchImpl = opts.fetchImpl ?? fetch;
+  const probe: Probe = (url) => probeBuildId(url, fetchImpl, opts.onRetry);
 
   const probeUrl = opts.buildIdUrl ?? (opts.siteUrl ? buildIdUrlFor(opts.siteUrl) : undefined);
   let onlineBuildId: string | null = null;
   if (probeUrl) {
-    onlineBuildId = await explainProbe(SITE_HINT, () => probeBuildId(probeUrl, fetchImpl));
+    onlineBuildId = await explainProbe(SITE_HINT, () => probe(probeUrl));
     keeps.push({ buildId: onlineBuildId, reason: "online" });
   }
 
   let cloudflare: RunState["cloudflare"] = null;
   if (opts.cloudflare) {
-    const found = await collectCloudflareKeeps(opts.cloudflare, fetchImpl, opts.concurrency ?? 8);
+    const found = await collectCloudflareKeeps(opts.cloudflare, probe, opts.concurrency ?? 8);
     keeps.push(...found.keeps);
     cloudflare = { deploymentsScanned: found.deploymentsScanned, previews: found.previews };
   }
@@ -101,9 +105,11 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
  *
  * 任何一个读不到都整体失败 —— 读不到就无从判断它的缓存该不该留，宁可不跑也不误删。
  */
+type Probe = (url: string) => Promise<string>;
+
 async function collectCloudflareKeeps(
   source: CloudflareSource,
-  fetchImpl: typeof fetch,
+  probe: Probe,
   concurrency: number,
 ): Promise<{ keeps: KeptBuild[]; deploymentsScanned: number; previews: number }> {
   const { api, worker } = source;
@@ -116,20 +122,29 @@ async function collectCloudflareKeeps(
     throw new BuildIdProbeError(`Worker ${worker} 没有任何 deployment，请确认 --worker 填对了。`);
   }
 
-  // 按窗口往回翻：每个窗口里的 version 并发探测。窗口大小取「还差几个」—— 每条 deployment
-  // 至多贡献一个新 build（灰度除外），所以窗口里的都是凑数可能要用到的，不会为了凑数把
-  // 全部历史 version 都探一遍；没有只改配置的部署时一轮就够
+  // 按窗口往回翻：每个窗口里的 version 并发探测。每个没探过的 version 至多贡献一个新 build，
+  // 所以窗口按「还差几个」收进同样多个没探过的 version（灰度的 deployment 一条就占两个），
+  // 凑够名额时窗口里不会有多探的 —— 多探一个就多一个读不到而中止整趟的机会。
+  // 窗口至少收一条 deployment，否则走不动；没有只改配置的部署时一轮就够
   const byVersion = new Map<string, string>();
   const distinct = new Set<string>();
   let scanned = 0;
   const enough = (index: number) => index > 0 && distinct.size >= wanted;
   for (let start = 0; start < deployments.length && !enough(start); ) {
-    const window = deployments.slice(start, start + Math.max(1, wanted - distinct.size));
-    const pending = [...new Set(window.flatMap((d) => d.versionIds))].filter((id) => !byVersion.has(id));
-    const buildIds = await mapWithConcurrency(pending, concurrency, (versionId) =>
-      probeVersion(api, worker, versionId, fetchImpl),
+    const need = wanted - distinct.size;
+    const pending = new Set<string>();
+    let end = start;
+    for (; end < deployments.length; end++) {
+      const fresh = deployments[end]!.versionIds.filter((id) => !byVersion.has(id) && !pending.has(id));
+      if (end > start && pending.size + fresh.length > need) break;
+      for (const id of fresh) pending.add(id);
+    }
+    const window = deployments.slice(start, end);
+    const versionIds = [...pending];
+    const buildIds = await mapWithConcurrency(versionIds, concurrency, (versionId) =>
+      probeVersion(api, worker, versionId, probe),
     );
-    pending.forEach((versionId, i) => byVersion.set(versionId, buildIds[i]!));
+    versionIds.forEach((versionId, i) => byVersion.set(versionId, buildIds[i]!));
 
     for (const [offset, deployment] of window.entries()) {
       const index = start + offset;
@@ -158,7 +173,7 @@ async function collectCloudflareKeeps(
     }
     const buildId = await explainProbe(
       WORKER_HINT,
-      () => probeBuildId(buildIdUrlFor(url), fetchImpl),
+      () => probe(buildIdUrlFor(url)),
       `预览 ${preview.name}`,
     );
     return { buildId, reason: "preview" as const, source: preview.name };
@@ -172,7 +187,7 @@ async function probeVersion(
   api: CloudflareApi,
   worker: string,
   versionId: string,
-  fetchImpl: typeof fetch,
+  probe: Probe,
 ): Promise<string> {
   const label = `版本 ${versionId.slice(0, 8)}`;
   const url = (await api.getVersionUrls(worker, versionId))[0];
@@ -183,7 +198,7 @@ async function probeVersion(
         `不会生成版本预览 URL，开了也没用 —— 这种情况请改用 --url 与 --keep。`,
     );
   }
-  return explainProbe(WORKER_HINT, () => probeBuildId(buildIdUrlFor(url), fetchImpl), label);
+  return explainProbe(WORKER_HINT, () => probe(buildIdUrlFor(url)), label);
 }
 
 const SITE_HINT = "请改用 --keep 显式指定要保留的 build id。";
@@ -218,11 +233,18 @@ async function mapWithConcurrency<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
+  // 任何一项失败整体就已失败，其余 worker 不再领新任务，免得把剩下的请求白白发完
+  let failed = false;
   // limit 小于 1 时一个 worker 都起不来，结果里会全是空洞
   const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
-    while (cursor < items.length) {
+    while (!failed && cursor < items.length) {
       const index = cursor++;
-      results[index] = await fn(items[index]!);
+      try {
+        results[index] = await fn(items[index]!);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
     }
   });
   await Promise.all(workers);

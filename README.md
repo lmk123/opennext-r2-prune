@@ -169,7 +169,8 @@ API token 需要 **Workers Scripts › Read**。
   preview URL，或者这些 URL 被 Cloudflare Access 保护着时，探测会失败、工具会中止。
 - 只用 `--url` 模式时只保留线上当前 BUILD_ID，**若恰好在灰度窗口内运行，灰度中旧版本的缓存
   目录会被判定作废**。用 `--worker` 模式即可避免。
-- 预览的列举接口官方文档尚未写明分页形态，按 Cloudflare API 通用的 `result_info` 处理。
+- 预览的列举接口官方文档尚未写明分页形态，按 Cloudflare API 通用的 `result_info` 处理；
+  要翻多页时会再完整列一遍，两次一致才采用，防止翻页期间有预览增删导致漏项。
   首次使用建议先 `--dry-run`，核对保留列表里的预览与 Dashboard 一致。
 
 ## 开发

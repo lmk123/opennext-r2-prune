@@ -10,6 +10,8 @@ const API_BASE = "https://api.cloudflare.com/client/v4";
 const PAGE_SIZE = 100;
 /** 预览最多 500 个，100 一页只要 5 页；翻到这么多页说明分页参数没被认，不能无限翻下去 */
 const MAX_PAGES = 50;
+/** 多页列举结果不一致时最多列几遍 */
+const MAX_LIST_ATTEMPTS = 3;
 
 export interface CloudflareApiOptions {
   accountId: string;
@@ -44,7 +46,7 @@ interface Envelope<T> {
   success: boolean;
   result: T;
   errors?: { code: number; message: string }[];
-  result_info?: { page?: number; per_page?: number; total_pages?: number; total_count?: number };
+  result_info?: null | { page?: number; per_page?: number; total_pages?: number; total_count?: number };
 }
 
 export class CloudflareApi {
@@ -58,37 +60,70 @@ export class CloudflareApi {
   async listDeployments(worker: string): Promise<Deployment[]> {
     const { result } = await this.#get<{
       deployments?: { versions?: { version_id: string }[] }[];
-    }>(`/workers/scripts/${encodeURIComponent(worker)}/deployments`);
-    return (result.deployments ?? []).map((d) => ({
+    } | null>(`/workers/scripts/${encodeURIComponent(worker)}/deployments`);
+    return (result?.deployments ?? []).map((d) => ({
       versionIds: (d.versions ?? []).map((v) => v.version_id),
     }));
   }
 
   /** 这个 version 可以直接访问的地址，即 `<版本前缀>-<worker>.<子域>.workers.dev` */
   async getVersionUrls(worker: string, versionId: string): Promise<string[]> {
-    const { result } = await this.#get<{ urls?: string[] }>(
+    const { result } = await this.#get<{ urls?: string[] } | null>(
       `/workers/workers/${encodeURIComponent(worker)}/versions/${encodeURIComponent(versionId)}`,
     );
-    return result.urls ?? [];
+    return result?.urls ?? [];
+  }
+
+  /**
+   * 按页码翻页时，两页之间有预览被删，后面的预览整体前移，会有一个恰好落进已经翻过的页里
+   * 被漏掉 —— 重复检测只抓得到「多出来的」，抓不到「少了的」。所以要发多个请求才列完时，
+   * 再完整列一遍，两次一致才算数。
+   */
+  async listPreviews(worker: string): Promise<Preview[]> {
+    let previous = await this.#listPreviewsOnce(worker);
+    if (previous.requests === 1) return previous.previews;
+    for (let attempt = 2; attempt <= MAX_LIST_ATTEMPTS; attempt++) {
+      const next = await this.#listPreviewsOnce(worker);
+      if (sameNames(previous.previews, next.previews)) return next.previews;
+      previous = next;
+    }
+    throw paginationError(`连续 ${MAX_LIST_ATTEMPTS} 次列举预览的结果都不一致，预览可能正在频繁增删`);
   }
 
   /**
    * 翻页的终点必须有据可依：漏掉一页预览，它们的 build 就会被挂上删除规则，而且全程 0 退出。
    * 依次认 total_pages、total_count、服务端回报的 per_page；三者都没有时一直翻到空页为止，
    * 同一个预览在后面的页里又出现，说明分页参数没被认（比如接口其实是游标分页），当场中止。
+   * 唯一的例外是接口压根不分页：两页都不带 result_info、内容一模一样、且第一页没装满。
    */
-  async listPreviews(worker: string): Promise<Preview[]> {
+  async #listPreviewsOnce(worker: string): Promise<{ previews: Preview[]; requests: number }> {
     const previews: Preview[] = [];
     const seen = new Set<string>();
+    let firstPage: { names: string[]; paginated: boolean } | undefined;
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) {
         throw paginationError(`列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`);
       }
-      const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[]>(
+      const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[] | null>(
         `/workers/workers/${encodeURIComponent(worker)}/previews`,
         { page: String(page), per_page: String(PAGE_SIZE) },
       );
-      for (const p of result) {
+      const items = result ?? [];
+
+      if (page === 1) {
+        firstPage = { names: items.map((p) => p.name), paginated: info != null };
+      } else if (
+        page === 2 &&
+        !firstPage!.paginated &&
+        info == null &&
+        firstPage!.names.length < PAGE_SIZE &&
+        sameNames(firstPage!.names.map((name) => ({ name })), items)
+      ) {
+        // 第一页就是全部，整趟等同于只发了一个请求，不存在翻页间漏项的问题
+        return { previews, requests: 1 };
+      }
+
+      for (const p of items) {
         if (seen.has(p.name)) {
           throw paginationError(`第 ${page} 页又出现了预览 ${p.name}，分页参数可能没被接受`);
         }
@@ -96,13 +131,13 @@ export class CloudflareApi {
         previews.push({ name: p.name, urls: p.urls ?? [] });
       }
 
-      if (result.length === 0) return previews;
+      if (items.length === 0) return { previews, requests: page };
       if (info?.total_pages !== undefined) {
-        if (page >= info.total_pages) return previews;
+        if (page >= info.total_pages) return { previews, requests: page };
       } else if (info?.total_count !== undefined) {
-        if (previews.length >= info.total_count) return previews;
+        if (previews.length >= info.total_count) return { previews, requests: page };
       } else if (info?.per_page !== undefined) {
-        if (result.length < info.per_page) return previews;
+        if (items.length < info.per_page) return { previews, requests: page };
       }
     }
   }
@@ -148,4 +183,9 @@ export class CloudflareApi {
 
 function paginationError(reason: string): CloudflareApiError {
   return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部预览，已中止。`);
+}
+
+/** 按名字、按顺序比较两份预览列表 */
+function sameNames(a: { name: string }[], b: { name: string }[]): boolean {
+  return a.length === b.length && a.every((p, i) => p.name === b[i]!.name);
 }

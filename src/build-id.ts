@@ -6,6 +6,8 @@
  * 尤其是构建发生在 Cloudflare 云上、跑清理的机器上压根没有 .next 目录时。
  */
 
+import { type OnRetry, withRetry } from "./retry.ts";
+
 /** Next.js 的 build id 用 nanoid 生成；16.2 起改为确定性 id，字符集仍是这一套 */
 const BUILD_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -35,16 +37,23 @@ export function buildIdUrlFor(siteUrl: string): string {
 export async function probeBuildId(
   url: string,
   fetchImpl: typeof fetch = fetch,
+  onRetry?: OnRetry,
 ): Promise<string> {
   let response: Response;
   try {
-    response = await fetchImpl(url, {
-      redirect: "follow",
-      // 必须拿到此刻真正在服务的 id：中间缓存（CDN、公司代理）若返回上一个版本的
-      // BUILD_ID，本工具就会把线上正在用的那个 build 判成作废，把活着的缓存删光。
-      cache: "no-store",
-      headers: { "cache-control": "no-cache, no-store, max-age=0", pragma: "no-cache" },
-    });
+    // 读 Worker 版本与预览时一趟要探几十上百个地址，任何一个读不到都会中止整趟，
+    // 所以偶发的 5xx / 网络抖动必须重试，不能让它们决定成败
+    response = await withRetry(
+      () =>
+        fetchImpl(url, {
+          redirect: "follow",
+          // 必须拿到此刻真正在服务的 id：中间缓存（CDN、公司代理）若返回上一个版本的
+          // BUILD_ID，本工具就会把线上正在用的那个 build 判成作废，把活着的缓存删光。
+          cache: "no-store",
+          headers: { "cache-control": "no-cache, no-store, max-age=0", pragma: "no-cache" },
+        }),
+      onRetry,
+    );
   } catch (error) {
     throw new BuildIdProbeError(`请求 ${url} 失败：${String(error)}`);
   }

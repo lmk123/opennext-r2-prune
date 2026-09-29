@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "../src/build-id.ts";
 
 function reply(body: string, init: ResponseInit = {}): typeof fetch {
@@ -59,12 +59,52 @@ describe("probeBuildId", () => {
     expect(new Headers(init!.headers).get("cache-control")).toContain("no-cache");
   });
 
-  it("网络失败报错", async () => {
-    const failing = (async () => {
-      throw new Error("ECONNREFUSED");
+  it("网络失败重试耗尽后报错", async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const failing = (async () => {
+        call++;
+        throw new Error("ECONNREFUSED");
+      }) as unknown as typeof fetch;
+      const result = expect(probeBuildId("https://example.com/BUILD_ID", failing)).rejects.toThrow(
+        BuildIdProbeError,
+      );
+      await vi.runAllTimersAsync();
+      await result;
+      expect(call).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("偶发的 5xx 会重试，不让一次抖动中止整趟", async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const flaky = (async () => {
+        call++;
+        if (call === 1) return new Response("busy", { status: 503 });
+        return new Response("live", { headers: { "content-type": "text/plain" } });
+      }) as unknown as typeof fetch;
+      const result = probeBuildId("https://example.com/BUILD_ID", flaky);
+      await vi.runAllTimersAsync();
+      expect(await result).toBe("live");
+      expect(call).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("404 不重试", async () => {
+    let call = 0;
+    const missing = (async () => {
+      call++;
+      return new Response("nope", { status: 404 });
     }) as unknown as typeof fetch;
-    await expect(probeBuildId("https://example.com/BUILD_ID", failing)).rejects.toThrow(
+    await expect(probeBuildId("https://example.com/BUILD_ID", missing)).rejects.toThrow(
       BuildIdProbeError,
     );
+    expect(call).toBe(1);
   });
 });

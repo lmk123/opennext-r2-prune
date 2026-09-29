@@ -192,7 +192,8 @@ function fakeCloudflare(opts: {
     const id = url.hostname.split("-w.")[0]!;
     probed.push(id);
     const buildId = opts.versions[id] ?? opts.previews?.[id];
-    if (buildId === "<fail>") return new Response("nope", { status: 503 });
+    // 用 404 而不是 5xx：5xx 会被重试，测试得白等退避
+    if (buildId === "<fail>") return new Response("nope", { status: 404 });
     return new Response(buildId, { headers: { "content-type": "text/plain" } });
   }) as unknown as typeof fetch;
 
@@ -243,6 +244,43 @@ describe("collectPlan + Cloudflare API", () => {
     expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b3", "b2", "b1"]);
     expect(cf.probed.filter((id) => id.startsWith("v")).sort()).toEqual(["v1", "v2", "v3", "v4"]);
     expect(state.cloudflare?.deploymentsScanned).toBe(4);
+  });
+
+  it("灰度的 deployment 占两个名额，凑够后窗口里不会多探", async () => {
+    const cf = fakeCloudflare({
+      // 最新 deployment 灰度（b3、b2 各一个 version），再往回一条就凑够 3 个；
+      // v0 早于开启 preview_urls，读不到 —— 探了它就会误中止
+      deployments: [["v3", "v2"], ["v1"], ["v0"]],
+      versions: { v3: "b3", v2: "b2", v1: "b1", v0: null },
+    });
+    const { store } = fakeR2({ buildIds: ["b3", "b2", "b1", "bOld"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b3", "b2", "b1"]);
+    expect(cf.probed).not.toContain("v0");
+    expect(state.cloudflare?.deploymentsScanned).toBe(2);
+  });
+
+  it("有一项探测失败后不再发起新的探测", async () => {
+    const previews: Record<string, string> = { broken: "<fail>" };
+    for (let i = 0; i < 20; i++) previews[`p${i}`] = `b${i}`;
+    const cf = fakeCloudflare({ deployments: [["v1"]], versions: { v1: "live" }, previews });
+    const { store } = fakeR2({ buildIds: ["live"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+        concurrency: 1,
+      }),
+    ).rejects.toThrow(/预览 broken/);
+    // 并发 1 时 broken 排在第一个，之后的 20 个预览一个都不该再探
+    expect(cf.probed.filter((id) => id.startsWith("p"))).toEqual([]);
   });
 
   it("concurrency 或 recentBuilds 小于 1 时照常工作，不留空洞也不卡死", async () => {

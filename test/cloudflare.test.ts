@@ -47,7 +47,7 @@ describe("CloudflareApi", () => {
     expect(calls[0]!.pathname).toBe("/client/v4/accounts/acct/workers/workers/my-worker/versions/v1");
   });
 
-  it("预览按 total_pages 翻页", async () => {
+  it("预览按 total_pages 翻页；多页时再列一遍核对", async () => {
     const { api: cf, calls } = api((url) => {
       const page = Number(url.searchParams.get("page"));
       return ok([{ name: `p${page}`, urls: [`https://p${page}-w.sub.workers.dev`] }], {
@@ -57,7 +57,7 @@ describe("CloudflareApi", () => {
     });
     const previews = await cf.listPreviews("w");
     expect(previews.map((p) => p.name)).toEqual(["p1", "p2"]);
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(4);
   });
 
   it("没有 result_info 时一直翻到空页，不拿「没装满」当终点", async () => {
@@ -65,7 +65,8 @@ describe("CloudflareApi", () => {
       url.searchParams.get("page") === "1" ? ok([{ name: "only" }]) : ok([]),
     );
     expect(await cf.listPreviews("w")).toEqual([{ name: "only", urls: [] }]);
-    expect(calls).toHaveLength(2);
+    // 发了两个请求才列完，所以要再列一遍核对
+    expect(calls).toHaveLength(4);
   });
 
   it("服务端把每页压到 50 条时照样翻完，不漏预览", async () => {
@@ -75,7 +76,7 @@ describe("CloudflareApi", () => {
       return ok(all.slice((page - 1) * 50, page * 50), { page, per_page: 50, total_count: 120 });
     });
     expect(await cf.listPreviews("w")).toHaveLength(120);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(6);
   });
 
   it("只回报了 per_page 时，按它判断最后一页", async () => {
@@ -85,7 +86,7 @@ describe("CloudflareApi", () => {
       return ok(names.map((name) => ({ name })), { page, per_page: 2 });
     });
     expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["a", "b", "c"]);
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(4);
   });
 
   it("page 参数被忽略（比如其实是游标分页）时，第二页重复即中止", async () => {
@@ -98,6 +99,71 @@ describe("CloudflareApi", () => {
     const full = Array.from({ length: 100 }, (_, i) => ({ name: `p${i}` }));
     const { api: cf } = api(() => ok(full));
     await expect(cf.listPreviews("w")).rejects.toThrow(CloudflareApiError);
+  });
+
+  it("接口压根不分页（两页都不带 result_info、内容相同、没装满）时认第一页为全部", async () => {
+    const { api: cf, calls } = api(() => ok([{ name: "a" }, { name: "b" }]));
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["a", "b"]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("result 为 null 时当作空列表，而不是甩原生 TypeError", async () => {
+    const { api: cf } = api(() => ok(null));
+    expect(await cf.listPreviews("w")).toEqual([]);
+    expect(await cf.listDeployments("w")).toEqual([]);
+    expect(await cf.getVersionUrls("w", "v1")).toEqual([]);
+  });
+
+  it("翻页间有预览被删、导致漏项时，靠再列一遍发现并采用稳定的结果", async () => {
+    // 第一遍：读完第 1 页后 a 被删，b 前移进了第 1 页，第 2 页从 c 开始 —— b 被漏掉
+    const lists = [
+      [["a", "x"], ["c"]],
+      [["x", "b"], ["c"]],
+      [["x", "b"], ["c"]],
+    ];
+    let listing = 0;
+    const { api: cf } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const names = lists[Math.min(listing, lists.length - 1)]![page - 1]!;
+      if (page === 2) listing++;
+      return ok(names.map((name) => ({ name })), { page, total_pages: 2 });
+    });
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["x", "b", "c"]);
+  });
+
+  it("每次列举结果都不一致时中止", async () => {
+    let listing = 0;
+    const { api: cf } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      if (page === 2) listing++;
+      return ok([{ name: `l${listing}-p${page}` }], { page, total_pages: 2 });
+    });
+    await expect(cf.listPreviews("w")).rejects.toMatchObject({ code: "pagination" });
+  });
+
+  it("429 时按 Retry-After 等待再重试", async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const { api: cf } = api(() => {
+        call++;
+        if (call === 1) {
+          return new Response(JSON.stringify({ success: false, errors: [] }), {
+            status: 429,
+            headers: { "retry-after": "5" },
+          });
+        }
+        return ok({ deployments: [] });
+      });
+      const result = cf.listDeployments("w");
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(call).toBe(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await result).toEqual([]);
+      expect(call).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("success=false 时抛出带错误码的 CloudflareApiError", async () => {

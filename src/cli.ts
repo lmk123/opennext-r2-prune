@@ -113,9 +113,11 @@ async function main(argv: string[]): Promise<number> {
   if (!accessKeyId) missing.push("--access-key-id");
   if (!secretAccessKey) missing.push("--secret-access-key");
   if (worker && !apiToken) missing.push("--api-token（给了 --worker）");
-  if (apiToken && !worker) missing.push("--worker（给了 --api-token）");
+  // 只查命令行显式给的：CLOUDFLARE_API_TOKEN 在 CI 里常常是给 wrangler deploy 准备的，
+  // 只用 --url 的人环境里带着它不该被拦下
+  if (values["api-token"] && !worker) missing.push("--worker（给了 --api-token）");
   if (worker && !accountId) missing.push("--account-id（--worker 要用它调 Cloudflare API）");
-  if (!worker && !apiToken && !siteUrl && !values["build-id-url"] && keep.length === 0) {
+  if (!worker && !siteUrl && !values["build-id-url"] && keep.length === 0) {
     missing.push("--worker 与 --api-token（或 --url / --build-id-url / --keep）");
   }
   if (missing.length > 0) {
@@ -180,6 +182,7 @@ async function main(argv: string[]): Promise<number> {
     allowRootPrefix: values["allow-root-prefix"],
     expireDays,
     style,
+    onRetry,
   });
 
   const { plan } = state;
@@ -262,8 +265,13 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   console.log(`bucket: ${bucket}    前缀: ${normalizePrefix(prefix) || "（bucket 根）"}`);
   if (state.onlineBuildId) {
     console.log(`线上 BUILD_ID: ${state.onlineBuildId}  （读自 ${state.probedFrom}）`);
-  } else if (state.onlineBuildIds.length > 0) {
-    console.log(`线上 BUILD_ID: ${state.onlineBuildIds.join(", ")}  （读自最新的 deployment）`);
+  }
+  // 同时给了 --url 与 --worker 时，最新 deployment 里还可能有别的线上 build（灰度）
+  const fromDeployment = state.onlineBuildIds.filter((id) => id !== state.onlineBuildId);
+  if (fromDeployment.length > 0) {
+    console.log(
+      `${state.onlineBuildId ? "另有" : ""}线上 BUILD_ID: ${fromDeployment.join(", ")}  （读自最新的 deployment）`,
+    );
   }
   if (state.cloudflare) {
     console.log(
