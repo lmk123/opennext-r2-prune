@@ -46,7 +46,13 @@ interface Envelope<T> {
   success: boolean;
   result: T;
   errors?: { code: number; message: string }[];
-  result_info?: null | { page?: number; per_page?: number; total_pages?: number; total_count?: number };
+  /** 字段可能缺失，也可能是 null：只有真是数字时才能拿来判断翻页终点 */
+  result_info?: null | {
+    page?: number | null;
+    per_page?: number | null;
+    total_pages?: number | null;
+    total_count?: number | null;
+  };
 }
 
 export class CloudflareApi {
@@ -60,7 +66,12 @@ export class CloudflareApi {
   async listDeployments(worker: string, signal?: AbortSignal): Promise<Deployment[]> {
     const { result } = await this.#get<{
       deployments?: { versions?: { version_id: string }[] }[];
-    } | null>(`/workers/scripts/${encodeURIComponent(worker)}/deployments`, undefined, signal);
+    } | null>(
+      `/workers/scripts/${encodeURIComponent(worker)}/deployments`,
+      // 默认页很小，只改 secret / vars 的部署一多就凑不够近期 build；要最大的一页
+      { per_page: String(PAGE_SIZE) },
+      signal,
+    );
     return (result?.deployments ?? []).map((d) => ({
       versionIds: (d.versions ?? []).map((v) => v.version_id),
     }));
@@ -134,7 +145,7 @@ export class CloudflareApi {
         !firstPage!.paginated &&
         info == null &&
         firstPage!.names.length < PAGE_SIZE &&
-        sameNames(firstPage!.names.map((name) => ({ name })), items)
+        sameNames(firstPage!.names, items.map((p) => p.name))
       ) {
         // 第一页就是全部，整趟等同于只发了一个请求，不存在翻页间漏项的问题
         return { previews, requests: 1 };
@@ -147,11 +158,12 @@ export class CloudflareApi {
       }
 
       if (items.length === 0) return { previews, requests: page };
-      if (info?.total_pages !== undefined) {
+      // 只认真正的数字：null 若混进比较，`page >= null` 恒为 true，第一页就会被当成最后一页
+      if (typeof info?.total_pages === "number") {
         if (page >= info.total_pages) return { previews, requests: page };
-      } else if (info?.total_count !== undefined) {
+      } else if (typeof info?.total_count === "number") {
         if (previews.length >= info.total_count) return { previews, requests: page };
-      } else if (info?.per_page !== undefined) {
+      } else if (typeof info?.per_page === "number") {
         if (items.length < info.per_page) return { previews, requests: page };
       }
     }
@@ -166,8 +178,11 @@ export class CloudflareApi {
     let response: Response;
     try {
       response = await withRetry(
-        () =>
-          doFetch(url.toString(), { headers: { authorization: `Bearer ${this.#opts.apiToken}` }, signal }),
+        (attemptSignal) =>
+          doFetch(url.toString(), {
+            headers: { authorization: `Bearer ${this.#opts.apiToken}` },
+            signal: attemptSignal,
+          }),
         this.#opts.onRetry,
         signal,
       );
@@ -202,9 +217,9 @@ function paginationError(reason: string): CloudflareApiError {
   return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部预览，已中止。`);
 }
 
-/** 按名字、按顺序比较两份预览列表：判断接口是否压根不分页，要求两次响应一模一样 */
-function sameNames(a: { name: string }[], b: { name: string }[]): boolean {
-  return a.length === b.length && a.every((p, i) => p.name === b[i]!.name);
+/** 按顺序比较两份预览名：判断接口是否压根不分页，要求两次响应一模一样 */
+function sameNames(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((name, i) => name === b[i]);
 }
 
 /**

@@ -96,6 +96,22 @@ describe("probeBuildId", () => {
     }
   });
 
+  it("重试耗尽仍是 429 时报成暂时性失败，而不是「没有暴露 BUILD_ID」", async () => {
+    vi.useFakeTimers();
+    try {
+      const limited = (async () => new Response("slow down", { status: 429 })) as unknown as typeof fetch;
+      const result = probeBuildId("https://example.com/BUILD_ID", limited).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      const error = (await result) as BuildIdProbeError;
+      expect(error).toBeInstanceOf(BuildIdProbeError);
+      expect(error.transient).toBe(true);
+      expect(error.message).toMatch(/被限流[\s\S]*稍后重跑/);
+      expect(error.message).not.toMatch(/暴露/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("404 不重试", async () => {
     let call = 0;
     const missing = (async () => {

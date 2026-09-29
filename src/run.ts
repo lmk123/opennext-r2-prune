@@ -47,12 +47,24 @@ export interface RunState {
   /** 此刻承载线上流量的全部 build：--url 探测到的加上最新 deployment 里的（灰度时不止一个） */
   onlineBuildIds: string[];
   probedFrom: string | null;
-  /** 走了 Cloudflare API 时的概要：翻看了几条 deployment、有几个预览 */
-  cloudflare: { deploymentsScanned: number; previews: number } | null;
+  /**
+   * 走了 Cloudflare API 时的概要：翻看了几条 deployment、凑到几个不同的近期线上 build
+   * （含线上当前的；少于 --recent-builds 说明 deployment 已经翻完了）、有几个预览
+   */
+  cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
   plan: PrunePlan;
 }
 
 export async function collectPlan(opts: RunOptions): Promise<RunState> {
+  // 先看 bucket 再探测：探测可能要几十秒（上百个地址、重试退避），这期间新上传或上线的
+  // build 若出现在后列出的目录里，却不在更早探测出的保留集中，就会被挂上删除规则。
+  // 先列目录，中途冒出的 build 根本不在 existing 里，碰不到；它若恰是线上 build，
+  // 还会因为「要保留的 build 不在 bucket 里」安全地报错。
+  const [existing, current] = await Promise.all([
+    opts.store.listBuildIds(opts.prefix),
+    opts.store.getLifecycle(),
+  ]);
+
   const keeps: KeptBuild[] = [];
   const fetchImpl = opts.fetchImpl ?? fetch;
   const probe: Probe = (url, signal) => probeBuildId(url, fetchImpl, opts.onRetry, signal);
@@ -68,15 +80,16 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   if (opts.cloudflare) {
     const found = await collectCloudflareKeeps(opts.cloudflare, probe, opts.concurrency ?? 8);
     keeps.push(...found.keeps);
-    cloudflare = { deploymentsScanned: found.deploymentsScanned, previews: found.previews };
+    cloudflare = {
+      deploymentsScanned: found.deploymentsScanned,
+      recentBuilds: found.recentBuilds,
+      previews: found.previews,
+    };
   }
 
   for (const buildId of opts.keep ?? []) {
     keeps.push({ buildId, reason: "explicit" });
   }
-
-  const existing = await opts.store.listBuildIds(opts.prefix);
-  const current = await opts.store.getLifecycle();
 
   return {
     onlineBuildId,
@@ -113,7 +126,7 @@ async function collectCloudflareKeeps(
   source: CloudflareSource,
   probe: Probe,
   concurrency: number,
-): Promise<{ keeps: KeptBuild[]; deploymentsScanned: number; previews: number }> {
+): Promise<{ keeps: KeptBuild[]; deploymentsScanned: number; recentBuilds: number; previews: number }> {
   const controller = new AbortController();
   const abortOnFailure = <T>(promise: Promise<T>) =>
     promise.catch((error: unknown) => {
@@ -127,6 +140,7 @@ async function collectCloudflareKeeps(
   return {
     keeps: [...recent.keeps, ...previews],
     deploymentsScanned: recent.scanned,
+    recentBuilds: recent.distinct,
     previews: previews.length,
   };
 }
@@ -136,7 +150,7 @@ async function collectRecentKeeps(
   probe: Probe,
   concurrency: number,
   signal: AbortSignal,
-): Promise<{ keeps: KeptBuild[]; scanned: number }> {
+): Promise<{ keeps: KeptBuild[]; scanned: number; distinct: number }> {
   const { api, worker } = source;
   // 小于 1 时窗口大小为 0，下面的循环永远走不动
   const wanted = Math.max(1, source.recentBuilds ?? 3);
@@ -187,7 +201,7 @@ async function collectRecentKeeps(
     }
     start += window.length;
   }
-  return { keeps, scanned };
+  return { keeps, scanned, distinct: distinct.size };
 }
 
 async function collectPreviewKeeps(
@@ -251,7 +265,9 @@ async function explainProbe<T>(hint: string, fn: () => Promise<T>, label?: strin
     return await fn();
   } catch (error) {
     if (error instanceof BuildIdProbeError) {
-      throw new BuildIdProbeError(`${label ? `${label}：` : ""}${error.message}\n${hint}`);
+      // 暂时性失败的报错里已经说了「稍后重跑」，再建议改配置只会把人带偏
+      const suffix = error.transient ? "" : `\n${hint}`;
+      throw new BuildIdProbeError(`${label ? `${label}：` : ""}${error.message}${suffix}`, error.transient);
     }
     throw error;
   }
@@ -281,5 +297,7 @@ async function mapWithConcurrency<T, R>(
     }
   });
   await Promise.all(workers);
+  // 被中止时 worker 是悄悄退出的，results 里留着空洞，不能当成功交回去
+  signal.throwIfAborted();
   return results;
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { withRetry } from "../src/retry.ts";
 
 describe("withRetry", () => {
@@ -31,5 +31,49 @@ describe("withRetry", () => {
     controller.abort(new Error("stop"));
     await expect(pending).rejects.toThrow("stop");
     expect(call).toBe(1);
+  });
+
+  it("单次尝试迟迟不回响应头时超时并重试，不让一个地址挂住整趟", async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const pending = withRetry(
+        (signal) => {
+          call++;
+          if (call === 3) return Promise.resolve(new Response("ok"));
+          // 永不响应，直到被本次尝试的 signal 中止
+          return new Promise<Response>((_, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+          );
+        },
+        undefined,
+        undefined,
+        1_000,
+      );
+      await vi.runAllTimersAsync();
+      expect(await (await pending).text()).toBe("ok");
+      expect(call).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("每次都超时时抛出超时错误", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = withRetry(
+        (signal) =>
+          new Promise<Response>((_, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+          ),
+        undefined,
+        undefined,
+        1_000,
+      ).catch((error: unknown) => error);
+      await vi.runAllTimersAsync();
+      expect(String(await pending)).toMatch(/1 秒内没有响应/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

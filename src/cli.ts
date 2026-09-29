@@ -112,11 +112,17 @@ async function main(argv: string[]): Promise<number> {
   if (!endpoint) missing.push("--account-id 或 --endpoint");
   if (!accessKeyId) missing.push("--access-key-id");
   if (!secretAccessKey) missing.push("--secret-access-key");
-  if (worker && !apiToken) missing.push("--api-token（给了 --worker）");
+  // WORKER_NAME 是个很泛的名字，CI 里可能是别的步骤设的：报错要说清楚 --worker 模式是被谁打开的
+  const workerFrom = values.worker ? "--worker" : `环境变量 WORKER_NAME=${worker}`;
+  if (worker && !apiToken) {
+    missing.push(
+      `--api-token（${workerFrom} 开启了 --worker 模式${values.worker ? "" : "；不打算用它就清掉这个变量"}）`,
+    );
+  }
   // 只查命令行显式给的：CLOUDFLARE_API_TOKEN 在 CI 里常常是给 wrangler deploy 准备的，
   // 只用 --url 的人环境里带着它不该被拦下
   if (values["api-token"] && !worker) missing.push("--worker（给了 --api-token）");
-  if (worker && !accountId) missing.push("--account-id（--worker 要用它调 Cloudflare API）");
+  if (worker && !accountId) missing.push(`--account-id（${workerFrom} 要用它调 Cloudflare API）`);
   if (!worker && !siteUrl && !values["build-id-url"] && keep.length === 0) {
     missing.push("--worker 与 --api-token（或 --url / --build-id-url / --keep）");
   }
@@ -190,6 +196,14 @@ async function main(argv: string[]): Promise<number> {
   const note = (message: string) => (json ? console.error(message) : console.log(message));
 
   if (!json) printPlan(state, bucket!, prefix);
+  // deployment 翻完了还凑不够名额时不能悄悄少保留：回滚目标可能就在被判作废的那几个里
+  if (state.cloudflare && state.cloudflare.recentBuilds < recentBuilds) {
+    console.error(
+      `\n注意：只凑到 ${state.cloudflare.recentBuilds} 个不同的近期线上 build（--recent-builds 为 ${recentBuilds}），` +
+        `Cloudflare 返回的 ${state.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
+        `需要保留的请用 --keep 显式指定。`,
+    );
+  }
 
   let written = false;
   let cancelled = false;

@@ -62,7 +62,7 @@ export class R2Store {
   async #request(url: string, init?: RequestInit): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
     const response = await withRetry(
-      async () => doFetch(await this.#client.sign(url, init)),
+      async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
       this.#opts.onRetry,
     );
     if (response.status < 400) return response;

@@ -35,6 +35,17 @@ describe("CloudflareApi", () => {
     expect(calls[0]!.pathname).toBe(
       "/client/v4/accounts/acct/workers/scripts/my-worker/deployments",
     );
+     // 默认页太小，只改配置的部署一多就凑不够近期 build
+    expect(calls[0]!.searchParams.get("per_page")).toBe("100");
+  });
+
+  it("result_info 的字段为 null 时不当成终点，继续翻页", async () => {
+    const { api: cf } = api((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const items = page <= 2 ? [{ name: `p${page}` }] : [];
+      return ok(items, { page, per_page: null, total_pages: null, total_count: null });
+    });
+    expect((await cf.listPreviews("w")).map((p) => p.name)).toEqual(["p1", "p2"]);
   });
 
   it("读 version 的 urls", async () => {

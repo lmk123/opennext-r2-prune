@@ -65,7 +65,7 @@ describe("collectPlan", () => {
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
-  it("探测不到线上 build 时直接失败，一个 R2 请求都不发", async () => {
+  it("探测不到线上 build 时直接失败，不发任何写请求", async () => {
     const { store, calls } = fakeR2({ buildIds: ["live", "old1"] });
     await expect(
       collectPlan({
@@ -75,7 +75,7 @@ describe("collectPlan", () => {
         fetchImpl: siteReplying("<html>404</html>", { headers: { "content-type": "text/html" } }),
       }),
     ).rejects.toThrow(/HTML[\s\S]*请改用 --keep/);
-    expect(calls).toHaveLength(0);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("线上 build 不在 bucket 里时失败，且没有写请求", async () => {
@@ -224,8 +224,43 @@ describe("collectPlan + Cloudflare API", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b0"]);
     // 凑够就停，v0 不会被探测
     expect(cf.probed).not.toContain("v0");
-    expect(state.cloudflare).toEqual({ deploymentsScanned: 5, previews: 0 });
+    expect(state.cloudflare).toEqual({ deploymentsScanned: 5, recentBuilds: 3, previews: 0 });
     expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("deployment 翻完仍凑不够名额时，如实回报凑到了几个", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v3"], ["v2"], ["v1"]],
+      versions: { v3: "b2", v2: "b2", v1: "b1" },
+    });
+    const { store } = fakeR2({ buildIds: ["b2", "b1", "b0"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w", recentBuilds: 3 },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.cloudflare).toEqual({ deploymentsScanned: 3, recentBuilds: 2, previews: 0 });
+  });
+
+  it("先列 bucket 再探测：探测期间新上传的 build 不会被判作废", async () => {
+    const cf = fakeCloudflare({ deployments: [["v1"]], versions: { v1: "live" } });
+    const buildIds = ["live", "old"];
+    const { store } = fakeR2({ buildIds });
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      // 模拟探测进行到一半时 CI 刚好上传了新 build 的缓存
+      if (new URL(input).hostname.endsWith("workers.dev")) buildIds.push("fresh");
+      return cf.fetchImpl(input, init);
+    }) as unknown as typeof fetch;
+
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl,
+    });
+    expect(buildIds).toContain("fresh");
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old"]);
   });
 
   it("近期版本按窗口并发探测，只探凑数可能用到的 deployment", async () => {
@@ -409,7 +444,7 @@ describe("collectPlan + Cloudflare API", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old"]);
   });
 
-  it("任何一个预览读不到 BUILD_ID 就整体失败，一个 R2 请求都不发", async () => {
+  it("任何一个预览读不到 BUILD_ID 就整体失败，不发任何写请求", async () => {
     const cf = fakeCloudflare({
       deployments: [["v1"]],
       versions: { v1: "live" },
@@ -433,7 +468,7 @@ describe("collectPlan + Cloudflare API", () => {
         fetchImpl: cf.fetchImpl,
       }),
     ).rejects.toThrow(/Cloudflare Access[\s\S]*去掉 --worker/);
-    expect(calls).toHaveLength(0);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("历史版本读不到 BUILD_ID 同样整体失败", async () => {
@@ -450,7 +485,7 @@ describe("collectPlan + Cloudflare API", () => {
         fetchImpl: cf.fetchImpl,
       }),
     ).rejects.toThrow(BuildIdProbeError);
-    expect(calls).toHaveLength(0);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("version 没有可访问的 URL 时失败并说明原因", async () => {
