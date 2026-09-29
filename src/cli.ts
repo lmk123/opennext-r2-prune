@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { BuildIdProbeError } from "./build-id.ts";
-import { type ExpireState, PlanError, type PrunePlan } from "./plan.ts";
+import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
+import { type ExpireState, type KeptBuild, PlanError, type PrunePlan } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
 import { R2Store, S3Error } from "./store.ts";
-import { collectPlan } from "./run.ts";
+import { collectPlan, type RunState } from "./run.ts";
 import { XmlAssumptionError } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
@@ -20,11 +21,17 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --account-id <id>            Cloudflare account id       [CLOUDFLARE_ACCOUNT_ID]
   --access-key-id <id>         R2 access key id            [R2_ACCESS_KEY_ID / AWS_ACCESS_KEY_ID]
   --secret-access-key <key>    R2 secret access key        [R2_SECRET_ACCESS_KEY / AWS_SECRET_ACCESS_KEY]
+
+保留哪些 build（至少给一种）：
+  --worker <名字>               Worker 名。配合 --api-token，保留近期线上与全部预览的 build
+                                                           [WORKER_NAME]
+  --api-token <token>          Cloudflare API token，需 Workers Scripts 读权限
+                                                           [CLOUDFLARE_API_TOKEN]
   --url <站点地址>              从 <站点>/BUILD_ID 读线上 build id  [SITE_URL]
-                               传了 --keep 就不是必填
+  --keep <build-id>            额外保留的 build id，可重复传
 
 可选：
-  --keep <build-id>            额外保留的 build id，可重复传
+  --recent-builds <n>          保留最近几个不同的线上 build，默认 3（需 --worker）
   --build-id-url <地址>         覆盖 BUILD_ID 的探测地址
   --endpoint <地址>             覆盖 S3 endpoint，默认按 account id 拼
   --prefix <前缀>               缓存前缀，默认 incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
@@ -50,6 +57,9 @@ function parseCliArgs(argv: string[]) {
       "secret-access-key": { type: "string" },
       url: { type: "string" },
       keep: { type: "string", multiple: true },
+      worker: { type: "string" },
+      "api-token": { type: "string" },
+      "recent-builds": { type: "string" },
       "build-id-url": { type: "string" },
       endpoint: { type: "string" },
       prefix: { type: "string" },
@@ -93,6 +103,8 @@ async function main(argv: string[]): Promise<number> {
   const prefix = values.prefix ?? env.NEXT_INC_CACHE_R2_PREFIX ?? "incremental-cache";
   const endpoint = values.endpoint ?? (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : undefined);
   const keep = values.keep ?? [];
+  const worker = values.worker ?? env.WORKER_NAME;
+  const apiToken = values["api-token"] ?? env.CLOUDFLARE_API_TOKEN;
   const json = values.json ?? false;
 
   const missing: string[] = [];
@@ -100,8 +112,11 @@ async function main(argv: string[]): Promise<number> {
   if (!endpoint) missing.push("--account-id 或 --endpoint");
   if (!accessKeyId) missing.push("--access-key-id");
   if (!secretAccessKey) missing.push("--secret-access-key");
-  if (!siteUrl && !values["build-id-url"] && keep.length === 0) {
-    missing.push("--url（或 --build-id-url / --keep）");
+  if (worker && !apiToken) missing.push("--api-token（给了 --worker）");
+  if (apiToken && !worker) missing.push("--worker（给了 --api-token）");
+  if (worker && !accountId) missing.push("--account-id（--worker 要用它调 Cloudflare API）");
+  if (!worker && !apiToken && !siteUrl && !values["build-id-url"] && keep.length === 0) {
+    missing.push("--worker 与 --api-token（或 --url / --build-id-url / --keep）");
   }
   if (missing.length > 0) {
     console.error(`缺少必填项：${missing.join("、")}\n\n${USAGE}`);
@@ -114,11 +129,21 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
+  const recentBuilds = Number(values["recent-builds"] ?? 3);
+  if (!Number.isInteger(recentBuilds) || recentBuilds < 1) {
+    console.error("--recent-builds 必须是不小于 1 的整数");
+    return 1;
+  }
+
   const style = values["lifecycle-style"] ?? "filter";
   if (style !== "filter" && style !== "bare") {
     console.error("--lifecycle-style 只能是 filter 或 bare");
     return 1;
   }
+
+  const onRetry = values.verbose
+    ? (attempt: number, reason: string) => console.error(`  第 ${attempt} 次重试：${reason}`)
+    : undefined;
 
   const store = new R2Store({
     endpoint: endpoint!,
@@ -127,9 +152,7 @@ async function main(argv: string[]): Promise<number> {
     secretAccessKey: secretAccessKey!,
     // Web Crypto 没有 MD5，而 S3 规范要求 PutBucketLifecycleConfiguration 带上它
     md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
-    onRetry: values.verbose
-      ? (attempt, reason) => console.error(`  第 ${attempt} 次重试：${reason}`)
-      : undefined,
+    onRetry,
   });
 
   const state = await collectPlan({
@@ -137,6 +160,14 @@ async function main(argv: string[]): Promise<number> {
     prefix,
     siteUrl,
     buildIdUrl: values["build-id-url"],
+    cloudflare:
+      worker && apiToken
+        ? {
+            api: new CloudflareApi({ accountId: accountId!, apiToken, onRetry }),
+            worker,
+            recentBuilds,
+          }
+        : undefined,
     keep,
     force: values.force,
     allowRootPrefix: values["allow-root-prefix"],
@@ -148,7 +179,7 @@ async function main(argv: string[]): Promise<number> {
   // --json 时 stdout 只放最后那一份 JSON，人类可读的内容一律改走 stderr
   const note = (message: string) => (json ? console.error(message) : console.log(message));
 
-  if (!json) printPlan(state.onlineBuildId, state.probedFrom, bucket!, prefix, plan);
+  if (!json) printPlan(state, bucket!, prefix);
 
   let written = false;
   let cancelled = false;
@@ -208,20 +239,40 @@ const EXPIRE_NOTE: Record<ExpireState, string> = {
   pending: "规则已存在，R2 仍在删",
 };
 
-function printPlan(
-  onlineBuildId: string | null,
-  probedFrom: string | null,
-  bucket: string,
-  prefix: string,
-  plan: PrunePlan,
-): void {
+const KEEP_NOTE: Record<KeptBuild["reason"], string> = {
+  online: "线上正在使用",
+  recent: "近期线上",
+  preview: "预览",
+  explicit: "--keep 指定",
+};
+
+function keepNote(build: KeptBuild): string {
+  return build.source ? `${KEEP_NOTE[build.reason]}（${build.source}）` : KEEP_NOTE[build.reason];
+}
+
+function printPlan(state: RunState, bucket: string, prefix: string): void {
+  const { plan } = state;
   console.log(`bucket: ${bucket}    前缀: ${normalizePrefix(prefix) || "（bucket 根）"}`);
-  if (onlineBuildId) console.log(`线上 BUILD_ID: ${onlineBuildId}  （读自 ${probedFrom}）`);
+  if (state.onlineBuildId) {
+    console.log(`线上 BUILD_ID: ${state.onlineBuildId}  （读自 ${state.probedFrom}）`);
+  }
+  if (state.cloudflare) {
+    console.log(
+      `Cloudflare：翻看了最近 ${state.cloudflare.deploymentsScanned} 次部署，` +
+        `共 ${state.cloudflare.previews} 个预览`,
+    );
+  }
 
   console.log(`\n保留 ${plan.keep.length} 个 build：`);
   for (const build of plan.keep) {
-    const why = build.reason === "online" ? "线上正在使用" : "--keep 指定";
-    console.log(`  保留  ${build.buildId}  ${why}`);
+    console.log(`  保留  ${build.buildId}  ${keepNote(build)}`);
+  }
+
+  if (plan.absent.length > 0) {
+    console.log(`\n以下要保留的 build 不在 bucket 里，无需处理：`);
+    for (const build of plan.absent) {
+      console.log(`  跳过  ${build.buildId}  ${keepNote(build)}`);
+    }
   }
 
   if (plan.expire.length > 0) {
@@ -255,6 +306,7 @@ function toJson(onlineBuildId: string | null, prefix: string, plan: PrunePlan) {
     onlineBuildId,
     changed: plan.changed,
     keep: plan.keep,
+    absent: plan.absent,
     expire: plan.expire,
     reclaim: plan.reclaim,
   };
@@ -273,6 +325,7 @@ async function confirm(): Promise<boolean> {
 
 function describe(error: unknown): string {
   if (error instanceof S3Error) return `${error.code}: ${error.message}`;
+  if (error instanceof CloudflareApiError) return `Cloudflare API ${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -284,6 +337,7 @@ try {
     error instanceof PlanError ||
     error instanceof BuildIdProbeError ||
     error instanceof XmlAssumptionError ||
+    error instanceof CloudflareApiError ||
     error instanceof S3Error
   ) {
     console.error(describe(error));

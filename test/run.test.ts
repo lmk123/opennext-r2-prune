@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { BuildIdProbeError } from "../src/build-id.ts";
+import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
 import { R2Store } from "../src/store.ts";
@@ -146,5 +148,211 @@ describe("collectPlan", () => {
     expect(state.plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(state.plan.nextDoc.own).toHaveLength(0);
     expect(state.plan.changed).toBe(true);
+  });
+});
+
+/**
+ * 一个假的 Cloudflare：API 与 workers.dev 上的 /BUILD_ID 共用一个 fetch。
+ * versions 的值为 null 表示这个 version 没有可访问的 URL，"<fail>" 表示读 BUILD_ID 失败。
+ */
+function fakeCloudflare(opts: {
+  deployments: string[][];
+  versions: Record<string, string | null>;
+  previews?: Record<string, string>;
+}) {
+  const probed: string[] = [];
+  const fetchImpl = (async (input: string) => {
+    const url = new URL(input);
+    const json = (result: unknown) => new Response(JSON.stringify({ success: true, result }));
+
+    if (url.hostname === "api.cloudflare.com") {
+      if (url.pathname.endsWith("/deployments")) {
+        return json({
+          deployments: opts.deployments.map((ids) => ({
+            versions: ids.map((version_id) => ({ version_id, percentage: 100 / ids.length })),
+          })),
+        });
+      }
+      if (url.pathname.endsWith("/previews")) {
+        return json(
+          Object.keys(opts.previews ?? {}).map((name) => ({
+            name,
+            urls: [`https://${name}-w.sub.workers.dev`],
+          })),
+        );
+      }
+      const versionId = url.pathname.split("/").pop()!;
+      const buildId = opts.versions[versionId];
+      return json({ id: versionId, urls: buildId === null ? [] : [`https://${versionId}-w.sub.workers.dev`] });
+    }
+
+    // <id>-w.sub.workers.dev/BUILD_ID
+    const id = url.hostname.split("-w.")[0]!;
+    probed.push(id);
+    const buildId = opts.versions[id] ?? opts.previews?.[id];
+    if (buildId === "<fail>") return new Response("nope", { status: 503 });
+    return new Response(buildId, { headers: { "content-type": "text/plain" } });
+  }) as unknown as typeof fetch;
+
+  return { probed, fetchImpl, api: new CloudflareApi({ accountId: "acct", apiToken: "tok", fetchImpl }) };
+}
+
+describe("collectPlan + Cloudflare API", () => {
+  it("往回翻 deployment 凑够 3 个不同的 build，只改 secret 的部署不占名额", async () => {
+    const cf = fakeCloudflare({
+      // v5、v4 只是改了 secret，BUILD_ID 与 v3 相同
+      deployments: [["v5"], ["v4"], ["v3"], ["v2"], ["v1"], ["v0"]],
+      versions: { v5: "b3", v4: "b3", v3: "b3", v2: "b2", v1: "b1", v0: "b0" },
+    });
+    const { store, calls } = fakeR2({ buildIds: ["b3", "b2", "b1", "b0"] });
+
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+
+    expect(state.plan.keep.map((b) => [b.buildId, b.reason])).toEqual([
+      ["b3", "online"],
+      ["b2", "recent"],
+      ["b1", "recent"],
+    ]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b0"]);
+    // 凑够就停，v0 不会被探测
+    expect(cf.probed).not.toContain("v0");
+    expect(state.cloudflare).toEqual({ deploymentsScanned: 5, previews: 0 });
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("--recent-builds 可调", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v2"], ["v1"]],
+      versions: { v2: "b2", v1: "b1" },
+    });
+    const { store } = fakeR2({ buildIds: ["b2", "b1"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w", recentBuilds: 1 },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b2"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b1"]);
+  });
+
+  it("灰度中的两个 version 都算线上", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["vnew", "vold"], ["vold"]],
+      versions: { vnew: "bNew", vold: "bOld" },
+    });
+    const { store } = fakeR2({ buildIds: ["bNew", "bOld", "ancient"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep.map((b) => [b.buildId, b.reason])).toEqual([
+      ["bNew", "online"],
+      ["bOld", "online"],
+    ]);
+    // 同一个 version 只探一次
+    expect(cf.probed.filter((id) => id === "vold")).toHaveLength(1);
+  });
+
+  it("保留全部预览的 build；预览的 build 不在 bucket 里不算错", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v1"]],
+      versions: { v1: "live" },
+      previews: { "feat-a": "bA", "feat-b": "bB", "feat-c": "live" },
+    });
+    const { store } = fakeR2({ buildIds: ["live", "bA", "old"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w" },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep).toEqual([
+      { buildId: "live", reason: "online", source: "version v1" },
+      { buildId: "bA", reason: "preview", source: "feat-a" },
+    ]);
+    expect(state.plan.absent).toEqual([{ buildId: "bB", reason: "preview", source: "feat-b" }]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old"]);
+  });
+
+  it("任何一个预览读不到 BUILD_ID 就整体失败，一个 R2 请求都不发", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v1"]],
+      versions: { v1: "live" },
+      previews: { "feat-a": "bA", broken: "<fail>" },
+    });
+    const { store, calls } = fakeR2({ buildIds: ["live", "bA", "bX"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(/预览 broken/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("历史版本读不到 BUILD_ID 同样整体失败", async () => {
+    const cf = fakeCloudflare({
+      deployments: [["v2"], ["v1"]],
+      versions: { v2: "live", v1: "<fail>" },
+    });
+    const { store, calls } = fakeR2({ buildIds: ["live", "old"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(BuildIdProbeError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("version 没有可访问的 URL 时失败并说明原因", async () => {
+    const cf = fakeCloudflare({ deployments: [["v1"]], versions: { v1: null } });
+    const { store } = fakeR2({ buildIds: ["live"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(/没有可访问的 URL/);
+  });
+
+  it("线上 build 不在 bucket 里仍然报错", async () => {
+    const cf = fakeCloudflare({ deployments: [["v1"]], versions: { v1: "live" } });
+    const { store } = fakeR2({ buildIds: ["old"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(PlanError);
+  });
+
+  it("Worker 没有任何 deployment 时拒绝继续", async () => {
+    const cf = fakeCloudflare({ deployments: [], versions: {} });
+    const { store } = fakeR2({ buildIds: ["b1"] });
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl: cf.fetchImpl,
+      }),
+    ).rejects.toThrow(/没有任何 deployment/);
   });
 });
