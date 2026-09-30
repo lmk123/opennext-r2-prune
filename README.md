@@ -3,7 +3,8 @@
 清理 `@opennextjs/cloudflare` 部署在 Cloudflare R2 上的过期增量缓存。
 
 每次发布，OpenNext 都会以新的 `BUILD_ID` 为名在 R2 里建一个缓存目录，且从不清理旧的。
-本工具找出线上已经不再使用的 build 目录，把它们交给 R2 删掉。
+本工具找出已经没人用的 build 目录 —— 不是最近几次上线的、也不属于任何预览 —— 把它们交给
+R2 删掉。
 
 ## 它为什么快
 
@@ -14,8 +15,8 @@ DELETE。
 
 本工具换了条路：**给每个作废的 build 目录挂一条 R2 object lifecycle 规则**，把删除
 下沉给 R2 服务端。整个过程一个缓存对象都不列举，目录里有 1 万还是 100 万个文件，代价完全
-一样。而且请求数是**恒定的**：列一次目录、读一次现有规则、写一次新规则 —— bucket 里积了
-3 个还是 300 个 build，发出去的请求一样多。
+一样。而且发给 R2 的请求数是**恒定的**：列一次目录、读一次现有规则、写一次新规则 ——
+bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
 
 这不是「给缓存设个自动过期时间」—— 线上 `BUILD_ID` 能活多久无法预知，那种用法不成立。
 这里 lifecycle 纯粹是执行手段：**该删哪些 build 由工具明确判定**，规则只负责替我们把
@@ -26,15 +27,17 @@ DELETE。
 整个过程是一条直线，本地不留任何状态或缓存文件 —— 每次运行都把情况重新看一遍，重新算出
 完整的答案。
 
-1. **问线上现在用的是哪个 build。** 读 `https://<你的域名>/BUILD_ID`，并绕开一切中间缓存。
-   读不到、或读回来的东西不像一个 build id（比如是一整页 HTML），就当场退出，不会硬着头皮
-   往下跑。
-
-2. **看 bucket 里现在有哪些 build 目录。** 只问 R2 要「一级目录都有哪些」，通常一个请求就
+1. **看 bucket 里现在有哪些 build 目录。** 只问 R2 要「一级目录都有哪些」，通常一个请求就
    返回了。目录里堆了多少缓存文件，这一步完全不关心 —— 这正是它快的原因。
 
-3. **读一遍 bucket 上现有的 lifecycle 规则。** 分成两堆：本工具自己加的（规则 ID 有固定
-   前缀），和你自己配的。后者原样收着，最后原样放回去。
+2. **读一遍 bucket 上现有的 lifecycle 规则。** 分成两堆：本工具自己加的（规则 ID 有固定
+   前缀），和你自己配的。后者原样收着，最后原样放回去。这一步与上一步同时进行。
+
+3. **问哪些 build 还有人在用。** 通过 Cloudflare API 找出最近几次上线的版本和全部预览，
+   逐个读它们的 `/BUILD_ID`（详见下文），并绕开一切中间缓存。任何一个读不到、或读回来的
+   东西不像一个 build id（比如是一整页 HTML），就当场退出，不会硬着头皮往下跑。
+   这一步放在列目录之后：探测要花些时间，期间新上传或上线的 build 不会出现在先前列出的
+   目录里，也就不会被误判作废。
 
 4. **算出这次该干什么。** 保留集之外的现存 build 全部作废，每个配一条删除规则；已经删空的
    目录，把规则回收掉；又活过来的 build（比如回滚），把规则摘掉。这一步不发任何请求，所有
@@ -43,8 +46,9 @@ DELETE。
 5. **把计划打给你看，确认后写回去。** 写入是整份 lifecycle 配置的全量覆盖：你自己的规则
    原样搬回，本工具的规则按上一步的结论重新生成。剩下的交给 R2，它通常在 24 小时内删完。
 
-数一下就知道整趟只有四个请求：读线上 `BUILD_ID`、列目录、读规则、写规则。第一个还是打给你
-自己的站点，真正花在 R2 上的只有三个。
+花在 R2 上的永远只有三个请求：列目录、读规则、写规则。第三步的请求数则随「近期版本数 +
+预览数」增长：列 deployments（通常一页就够）、每个近期版本读一次 URL 再读一次 `BUILD_ID`、
+列一次预览、每个预览读一次 `BUILD_ID`。读站点、近期版本与预览几条线同时进行，各自内部并发探测。
 
 因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
 直接告诉你「规则已经是最新的，无需改动」。
@@ -53,7 +57,8 @@ DELETE。
 
 ```bash
 node dist/cli.js \
-  --url https://your-site.com \
+  --worker <WORKER_NAME> \
+  --api-token <CLOUDFLARE_API_TOKEN> \
   --account-id <CLOUDFLARE_ACCOUNT_ID> \
   --bucket <R2_BUCKET> \
   --access-key-id <R2_ACCESS_KEY_ID> \
@@ -66,15 +71,41 @@ node dist/cli.js \
 
 所有参数都可以用环境变量代替，见 `--help`。
 
-### 它怎么知道该保留哪个 build
+### 它怎么知道该保留哪些 build
 
-读 `https://<你的域名>/BUILD_ID`。`@opennextjs/cloudflare` 不需要任何配置就把
-`.next/BUILD_ID` 作为静态资源暴露在这个路径上，所以这是最贴近事实的来源 —— 比读本地构建
-产物可靠，尤其是构建发生在 Cloudflare 云上、跑清理的机器上压根没有 `.next` 目录时。
+`@opennextjs/cloudflare` 不需要任何配置就把 `.next/BUILD_ID` 作为静态资源暴露在
+`/BUILD_ID` 上，而且每个 Worker 版本、每个预览都带着自己那份静态资源。所以最贴近事实的来源
+是「找到它的地址，读它的 `/BUILD_ID`」—— 比读本地构建产物可靠，尤其是构建发生在
+Cloudflare 云上、跑清理的机器上压根没有 `.next` 目录时。Cloudflare API 本身拿不到
+BUILD_ID，它只负责告诉我们该去读哪些地址。
 
-**保留集 = 线上探测到的 BUILD_ID ∪ `--keep` 显式传入的**，其余现存 build 全部作废。
+**保留集 = 最近 3 个不同的线上 BUILD_ID ∪ 所有预览当前的 BUILD_ID ∪ `--keep` 显式传入的**，
+其余现存 build 全部作废。
 
-探测失败会直接退出，绝不会降级成「删除全部」。
+- **近期线上**：从最新的 deployment 往回翻，逐个读其中版本的 URL
+  （`<版本前缀>-<worker>.<子域>.workers.dev`）上的 `/BUILD_ID`，凑够 3 个**互不相同**的
+  BUILD_ID 就停。只改 secret / vars 也会产生新的版本和 deployment，但 BUILD_ID 不变，这类
+  不占名额。个数用 `--recent-builds` 调。最新那次 deployment 若处于灰度，里面的两个版本都算
+  线上。deployment 按需逐页往回翻，全部翻完仍凑不够时会明确提示，
+  更早的 build 需要用 `--keep` 保留。
+- **预览**：列出 Worker 的全部 [Previews](https://developers.cloudflare.com/workers/previews/)
+  （Workers Builds 给非生产分支跑的 `npx wrangler preview` 创建的就是它），读每个预览 URL
+  上的 `/BUILD_ID`。预览 URL 永远指向该预览最新的一次部署。
+
+近期线上或预览的 build 不在 bucket 里是正常的（旧 build 早已删完，或预览绑了别的 bucket），
+计划里会单独列出、不报错；最新线上版本或 `--keep` 的不在 bucket 里则照常报错 —— 哪怕同一个
+build 同时也是近期版本或预览。
+
+读版本的 `/BUILD_ID` 依赖版本预览 URL，Worker 需开启 workers.dev 与 `preview_urls`。
+**实现了 Durable Object 的 Worker（例如用了 OpenNext 的 DO 队列或 DO tag cache）不会生成版本
+预览 URL**，`--worker` 对它不可用，请改用下面的 `--url` 加 `--keep`。
+
+API token 需要 **Account › Workers Scripts › Read** 权限。
+
+没有 API token 时，也可以只用 `--url https://your-site.com` 读站点当前的 `/BUILD_ID`，
+那样只能保留此刻线上的一个 build，回滚目标和预览的缓存都会被判作废。
+
+任何一个探测失败都会直接退出，绝不会降级成「删除全部」。
 
 ### 定时任务
 
@@ -95,14 +126,16 @@ jobs:
       - run: npm ci && npm run build
       - run: node dist/cli.js --yes
         env:
-          SITE_URL: https://your-site.com
+          WORKER_NAME: your-worker
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 ```
 
-R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配置）。
+R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配置）；Cloudflare
+API token 需要 **Workers Scripts › Read**。
 
 ## 安全设计
 
@@ -110,13 +143,13 @@ R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配
 
 - 作用域限死在 `<prefix>/<buildId>/` 之下，规则前缀带结尾斜杠（否则某个 buildId 恰是
   另一个的前缀时会误删）。
-- 探测不到线上 BUILD_ID 就退出。
+- 近期线上版本或任何一个预览的 BUILD_ID 探测不到就退出。
 - 保留集为空、或保留集与 bucket 里现存的 build 没有交集，都拒绝继续。
 - 要保留的 build 不在 bucket 里时报错退出 —— 通常意味着 bucket、`--prefix` 或域名填错了。
   确认无误可用 `--force` 跳过。
 - **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:<buildId>`，你在 bucket 上配的
   其它 lifecycle 规则会原样保留。
-- 探测 `/BUILD_ID` 时带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
+- 探测每个 `/BUILD_ID` 时都带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
   把线上正在服务的 build 判成作废 —— 这是它能造成的最坏后果，所以必须绕开缓存。
 - **前缀为空默认拒绝运行**。那意味着把 bucket 根下的每个一级目录都当成 build 缓存，`assets/`、
   `backups/` 这类非缓存目录会一并被挂上删除规则 —— 这是本工具唯一能删到非缓存数据的路径。
@@ -135,9 +168,17 @@ R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配
   重新写回去，那条规则只是不再出现在新配置里（你自己配的规则原样搬回，不受影响）。上面
   「自动回收已经删完的规则」也是同一个机制。所以摘除同样要真正写入 —— 带 `--dry-run` 不会
   生效，非交互环境记得给 `--yes`。
-- 只保留线上当前 BUILD_ID，所以**若恰好在 Rolling Releases 灰度窗口内运行，灰度中旧版本的
-  缓存目录会被判定作废**。后果是那部分页面回源重新渲染并重新填充缓存，不影响正确性。要避开
-  就用 `--keep <旧ID>` 显式保留，或等灰度完成再跑。
+- 读 BUILD_ID 依赖 workers.dev 上的版本 URL 与预览 URL。Worker 关掉了 workers.dev /
+  preview URL，或者这些 URL 被 Cloudflare Access 保护着时，探测会失败、工具会中止。
+- **已上传但还没部署的版本不受保护**（`opennextjs-cloudflare upload` / `wrangler versions upload`
+  之后、`wrangler versions deploy` 之前）。它的缓存已经写进 R2，但不在任何 deployment 或预览里，
+  这期间运行会把它判作作废。请避开这个窗口，或用 `--keep` 显式保留。
+- 只用 `--url` 模式时只保留线上当前 BUILD_ID，**若恰好在灰度窗口内运行，灰度中旧版本的缓存
+  目录会被判定作废**。用 `--worker` 模式即可避免。
+- 预览的列举接口官方文档尚未写明分页形态，按 Cloudflare API 通用的 `result_info` 处理；
+  要翻多页时会再完整列一遍，两次得到的预览集合一致才采用，防止翻页期间有预览增删导致漏项或
+  重复；连续 3 遍都对不上则中止。
+  首次使用建议先 `--dry-run`，核对保留列表里的预览与 Dashboard 一致。
 
 ## 开发
 

@@ -9,7 +9,19 @@ import type { LifecycleDoc, OwnRule } from "./xml.ts";
 /** R2 的 lifecycle 规则总数上限 */
 export const MAX_RULES = 1000;
 
-export type KeepReason = "online" | "explicit";
+/**
+ * online = 此刻承载线上流量；recent = 近期上过线；preview = 某个 Preview 当前的 build；
+ * explicit = --keep 传入。同一个 build 有多个来源时按这个顺序取第一个展示。
+ */
+export type KeepReason = "online" | "recent" | "preview" | "explicit";
+
+const KEEP_PRIORITY: KeepReason[] = ["online", "recent", "preview", "explicit"];
+
+/**
+ * 这两类来源不在 bucket 里是正常的：旧 build 早已删完，预览可能绑了别的 bucket 或还没写缓存。
+ * online / explicit 不在则多半是参数填错，仍要报错。
+ */
+const MAY_BE_ABSENT: ReadonlySet<KeepReason> = new Set(["recent", "preview"]);
 export type ReclaimReason = "emptied" | "revived";
 /** new = 本次新增；updated = 已有规则但内容与期望不符，要改写；pending = 已是期望的样子，R2 还在删 */
 export type ExpireState = "new" | "updated" | "pending";
@@ -17,6 +29,8 @@ export type ExpireState = "new" | "updated" | "pending";
 export interface KeptBuild {
   buildId: string;
   reason: KeepReason;
+  /** 来源细节：预览名、version id 前缀等 */
+  source?: string;
 }
 
 export interface ExpiringBuild {
@@ -31,6 +45,8 @@ export interface ReclaimedRule {
 
 export interface PrunePlan {
   keep: KeptBuild[];
+  /** 要保留、但 bucket 里本来就没有的 build（只可能是 recent / preview），仅供展示 */
+  absent: KeptBuild[];
   expire: ExpiringBuild[];
   reclaim: ReclaimedRule[];
   nextDoc: LifecycleDoc;
@@ -49,7 +65,7 @@ export interface PlanInput {
   /** bucket 里当前还有对象的 build 目录 */
   existing: string[];
   /** 要保留的 build 及其原因 */
-  keep: { buildId: string; reason: KeepReason }[];
+  keep: KeptBuild[];
   current: LifecycleDoc;
   prefix: string;
   /** 规则的过期天数 */
@@ -77,21 +93,38 @@ export function makePlan(input: PlanInput): PrunePlan {
     );
   }
 
-  // 同一个 buildId 可能既被探测到又被 --keep 传入，线上探测的原因优先展示
-  const keepMap = new Map<string, KeepReason>();
-  for (const { buildId, reason } of input.keep) {
-    if (reason === "online" || !keepMap.has(buildId)) keepMap.set(buildId, reason);
+  // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示；
+  // 但「必须在 bucket 里」要看全部来源：--keep 了一个恰好也是历史版本的 id，填错时照样得报出来
+  const keepMap = new Map<string, KeptBuild>();
+  const mustExist = new Set<string>();
+  for (const build of input.keep) {
+    const seen = keepMap.get(build.buildId);
+    if (!seen || KEEP_PRIORITY.indexOf(build.reason) < KEEP_PRIORITY.indexOf(seen.reason)) {
+      keepMap.set(build.buildId, build);
+    }
+    if (!MAY_BE_ABSENT.has(build.reason)) mustExist.add(build.buildId);
   }
 
   if (keepMap.size === 0) {
     throw new PlanError("保留集为空，拒绝继续 —— 那会把所有 build 缓存都标记为删除。");
   }
 
-  const missing = [...keepMap.keys()].filter((id) => !existingSet.has(id));
+  const keep: KeptBuild[] = [];
+  const absent: KeptBuild[] = [];
+  const missing: string[] = [];
+  for (const build of keepMap.values()) {
+    if (existingSet.has(build.buildId)) keep.push(build);
+    else if (!mustExist.has(build.buildId)) absent.push(build);
+    else {
+      // 加了 --force 仍留在 keep 里：它是用户坚持要保留的，只是眼下不在 bucket 里
+      keep.push(build);
+      missing.push(build.buildId);
+    }
+  }
   if (missing.length > 0 && !input.force) {
     throw new PlanError(
       `要保留的 build 在 bucket 里不存在：${missing.join(", ")}。\n` +
-        `通常意味着 bucket、--prefix 或站点域名有一个填错了。确认无误可加 --force 跳过这项检查。`,
+        `通常意味着 bucket、--prefix、站点域名或 --worker 有一个填错了。确认无误可加 --force 跳过这项检查。`,
     );
   }
 
@@ -110,7 +143,9 @@ export function makePlan(input: PlanInput): PrunePlan {
     .filter((rule) => !existingSet.has(rule.buildId) || keepMap.has(rule.buildId))
     .map((rule) => ({
       buildId: rule.buildId,
-      reason: keepMap.has(rule.buildId) ? ("revived" as const) : ("emptied" as const),
+      // 不在 bucket 里的 build 没什么可「复活」的，哪怕它在保留集里（预览 / 历史 build，
+      // 或 --force 硬留的），目录空了就是空了；留下的规则按过滤条件必然属于保留集
+      reason: existingSet.has(rule.buildId) ? ("revived" as const) : ("emptied" as const),
     }));
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
@@ -133,7 +168,8 @@ export function makePlan(input: PlanInput): PrunePlan {
   }
 
   return {
-    keep: [...keepMap].map(([buildId, reason]) => ({ buildId, reason })),
+    keep,
+    absent,
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,
       state: expireState(currentById.get(rule.buildId), rule),

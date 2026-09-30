@@ -117,6 +117,20 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.map((r) => r.buildId)).not.toContain("online1");
   });
 
+  it("--force 硬留、但不在 bucket 里的 build，其残留规则按「已删空」回收，不算复活", () => {
+    const plan = makePlan(
+      input({
+        keep: [
+          { buildId: "online1", reason: "online" },
+          { buildId: "gone", reason: "explicit" },
+        ],
+        force: true,
+        current: withRules([ownRule("gone")]),
+      }),
+    );
+    expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
+  });
+
   it("已有规则且内容一致的 build 不重复添加，标记为仍在删", () => {
     const plan = makePlan(input({ current: withRules([ownRule("old1")]) }));
     expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("pending");
@@ -207,5 +221,77 @@ describe("规则合并与回收", () => {
     // 这是本工具唯一能删到非缓存数据的路径 —— assets/、backups/ 会一并挂上删除规则
     expect(() => makePlan(input({ prefix: "" }))).toThrow(PlanError);
     expect(() => makePlan(input({ prefix: "/" }))).toThrow(/--allow-root-prefix/);
+  });
+});
+
+describe("多来源保留集", () => {
+  it("同一个 build 有多个来源时按 online > recent > preview > explicit 展示", () => {
+    const plan = makePlan(
+      input({
+        existing: ["online1", "b1", "old"],
+        keep: [
+          { buildId: "b1", reason: "explicit" },
+          { buildId: "b1", reason: "preview", source: "feat" },
+          { buildId: "b1", reason: "recent", source: "version v1" },
+          { buildId: "online1", reason: "preview", source: "feat-x" },
+          { buildId: "online1", reason: "online" },
+        ],
+      }),
+    );
+    expect(plan.keep).toEqual([
+      { buildId: "b1", reason: "recent", source: "version v1" },
+      { buildId: "online1", reason: "online" },
+    ]);
+  });
+
+  it("recent / preview 不在 bucket 里只记入 absent，不报错", () => {
+    const plan = makePlan(
+      input({
+        keep: [
+          { buildId: "online1", reason: "online" },
+          { buildId: "gone", reason: "recent" },
+          { buildId: "elsewhere", reason: "preview", source: "feat" },
+        ],
+      }),
+    );
+    expect(plan.keep.map((b) => b.buildId)).toEqual(["online1"]);
+    expect(plan.absent.map((b) => b.buildId)).toEqual(["gone", "elsewhere"]);
+    expect(plan.expire.map((b) => b.buildId)).toEqual(["old1", "old2"]);
+  });
+
+  it("不在 bucket 里的预览 build 残留规则按「目录已空」回收，不当成复活", () => {
+    const plan = makePlan(
+      input({
+        keep: [
+          { buildId: "online1", reason: "online" },
+          { buildId: "gone", reason: "preview" },
+        ],
+        current: { own: [ownRule("gone")], foreign: [] },
+      }),
+    );
+    expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
+  });
+
+  it("online 不在 bucket 里依然报错", () => {
+    expect(() =>
+      makePlan(input({ keep: [{ buildId: "bogus", reason: "online" }] })),
+    ).toThrow(/不存在/);
+  });
+
+  it("--keep 的 build 同时是近期版本时，不在 bucket 里仍要报错", () => {
+    const keep = [
+      { buildId: "online1", reason: "online" as const },
+      { buildId: "typo", reason: "recent" as const, source: "version v1" },
+      { buildId: "typo", reason: "explicit" as const },
+    ];
+    expect(() => makePlan(input({ keep }))).toThrow(/typo/);
+
+    // --force 时它留在 keep 里（展示原因仍按优先级取 recent），不会被挪进 absent
+    const plan = makePlan(input({ keep, force: true }));
+    expect(plan.keep.map((b) => [b.buildId, b.reason])).toEqual([
+      ["online1", "online"],
+      ["typo", "recent"],
+    ]);
+    expect(plan.absent).toEqual([]);
   });
 });
