@@ -47,8 +47,8 @@ bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
    原样搬回，本工具的规则按上一步的结论重新生成。剩下的交给 R2，它通常在 24 小时内删完。
 
 花在 R2 上的永远只有三个请求：列目录、读规则、写规则。第三步的请求数则随「近期版本数 +
-预览数」增长：列一次 deployments、每个近期版本读一次 URL 再读一次 `BUILD_ID`、列一次预览、
-每个预览读一次 `BUILD_ID`。近期版本与预览两条线同时进行，各自内部并发探测。
+预览数」增长：列 deployments（通常一页就够）、每个近期版本读一次 URL 再读一次 `BUILD_ID`、
+列一次预览、每个预览读一次 `BUILD_ID`。读站点、近期版本与预览几条线同时进行，各自内部并发探测。
 
 因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
 直接告诉你「规则已经是最新的，无需改动」。
@@ -86,7 +86,7 @@ BUILD_ID，它只负责告诉我们该去读哪些地址。
   （`<版本前缀>-<worker>.<子域>.workers.dev`）上的 `/BUILD_ID`，凑够 3 个**互不相同**的
   BUILD_ID 就停。只改 secret / vars 也会产生新的版本和 deployment，但 BUILD_ID 不变，这类
   不占名额。个数用 `--recent-builds` 调。最新那次 deployment 若处于灰度，里面的两个版本都算
-  线上。Cloudflare 只返回最近 100 次部署，翻完仍凑不够时会明确提示，
+  线上。deployment 按需逐页往回翻，全部翻完仍凑不够时会明确提示，
   更早的 build 需要用 `--keep` 保留。
 - **预览**：列出 Worker 的全部 [Previews](https://developers.cloudflare.com/workers/previews/)
   （Workers Builds 给非生产分支跑的 `npx wrangler preview` 创建的就是它），读每个预览 URL

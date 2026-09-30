@@ -4,11 +4,11 @@
  * build-id.ts。和 store.ts 一样不碰任何 Node 专属 API。
  */
 
-import { type OnRetry, withRetry } from "./retry.ts";
+import { isTransientStatus, MAX_ATTEMPTS, type OnRetry, withRetry } from "./retry.ts";
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
 const PAGE_SIZE = 100;
-/** 预览最多 500 个，100 一页只要 5 页；翻到这么多页说明分页参数没被认，不能无限翻下去 */
+/** 预览最多 500 个，100 一页只要 5 页；翻到这么多页说明分页参数没被认，不能无限翻下去（deployment 同用） */
 const MAX_PAGES = 50;
 /** 多页列举结果不一致时最多列几遍 */
 const MAX_LIST_ATTEMPTS = 3;
@@ -33,6 +33,7 @@ export class CloudflareApiError extends Error {
 }
 
 export interface Deployment {
+  id?: string;
   /** 这次部署承载流量的全部 version；灰度期间是两个 */
   versionIds: string[];
 }
@@ -62,19 +63,42 @@ export class CloudflareApi {
     this.#opts = opts;
   }
 
-  /** 最新的在前 */
-  async listDeployments(worker: string, signal?: AbortSignal): Promise<Deployment[]> {
-    const { result } = await this.#get<{
-      deployments?: { versions?: { version_id: string }[] }[];
-    } | null>(
-      `/workers/scripts/${encodeURIComponent(worker)}/deployments`,
-      // 默认页很小，只改 secret / vars 的部署一多就凑不够近期 build；要最大的一页
-      { per_page: String(PAGE_SIZE) },
-      signal,
-    );
-    return (result?.deployments ?? []).map((d) => ({
-      versionIds: (d.versions ?? []).map((v) => v.version_id),
-    }));
+  /**
+   * 最新的在前，一次交出一页，调用方要更多时才翻下一页 —— 凑够近期 build 通常一页就够。
+   * 漏掉后面的页，近期 build 就会凑不够、回滚目标被判作废，所以终点和预览一样要有据可依。
+   * 翻页期间有新部署时后面的页会重复出现翻过的 deployment，按 id 跳过；一整页都是翻过的，
+   * 说明分页参数没被认，再翻也只会原地打转，中止。
+   */
+  async *listDeployments(worker: string, signal?: AbortSignal): AsyncGenerator<Deployment[]> {
+    const seen = new Set<string>();
+    let fetched = 0;
+    for (let page = 1; ; page++) {
+      if (page > MAX_PAGES) {
+        throw paginationError(
+          `列举 deployment 翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`,
+          "deployment",
+        );
+      }
+      const { result, result_info: info } = await this.#get<{
+        deployments?: { id?: string; versions?: { version_id: string }[] }[];
+      } | null>(
+        `/workers/scripts/${encodeURIComponent(worker)}/deployments`,
+        // 默认页很小，只改 secret / vars 的部署一多就要多翻好几页；要最大的一页
+        { page: String(page), per_page: String(PAGE_SIZE) },
+        signal,
+      );
+      const items = result?.deployments ?? [];
+      fetched += items.length;
+      const fresh = items.filter((d) => d.id === undefined || !seen.has(d.id));
+      if (items.length > 0 && fresh.length === 0) {
+        throw paginationError(`第 ${page} 页的 deployment 全是翻过的，分页参数可能没被接受`, "deployment");
+      }
+      for (const d of fresh) if (d.id !== undefined) seen.add(d.id);
+      if (fresh.length > 0) {
+        yield fresh.map((d) => ({ id: d.id, versionIds: (d.versions ?? []).map((v) => v.version_id) }));
+      }
+      if (isLastPage(info, page, fetched, items.length)) return;
+    }
   }
 
   /** 这个 version 可以直接访问的地址，即 `<版本前缀>-<worker>.<子域>.workers.dev` */
@@ -111,12 +135,13 @@ export class CloudflareApi {
       duplicate !== undefined && previous === undefined
         ? `连续 ${MAX_LIST_ATTEMPTS} 次列举预览，预览 ${duplicate} 都在不同的页里重复出现，分页参数可能没被接受`
         : `连续 ${MAX_LIST_ATTEMPTS} 次列举预览的结果都不一致，预览可能正在频繁增删`,
+      "预览",
     );
   }
 
   /**
    * 翻页的终点必须有据可依：漏掉一页预览，它们的 build 就会被挂上删除规则，而且全程 0 退出。
-   * 依次认 total_pages、total_count、服务端回报的 per_page；三者都没有时一直翻到空页为止。
+   * 终点的判断见 isLastPage。
    * 同一个预览在后面的页里又出现时这一遍作废，交回 duplicate 由 listPreviews 决定重列还是中止。
    * 唯一的例外是接口压根不分页：两页都不带 result_info、内容一模一样、且第一页没装满。
    */
@@ -129,7 +154,7 @@ export class CloudflareApi {
     let firstPage: { names: string[]; paginated: boolean } | undefined;
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) {
-        throw paginationError(`列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`);
+        throw paginationError(`列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`, "预览");
       }
       const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[] | null>(
         `/workers/workers/${encodeURIComponent(worker)}/previews`,
@@ -157,15 +182,7 @@ export class CloudflareApi {
         previews.push({ name: p.name, urls: p.urls ?? [] });
       }
 
-      if (items.length === 0) return { previews, requests: page };
-      // 只认真正的数字：null 若混进比较，`page >= null` 恒为 true，第一页就会被当成最后一页
-      if (typeof info?.total_pages === "number") {
-        if (page >= info.total_pages) return { previews, requests: page };
-      } else if (typeof info?.total_count === "number") {
-        if (previews.length >= info.total_count) return { previews, requests: page };
-      } else if (typeof info?.per_page === "number") {
-        if (items.length < info.per_page) return { previews, requests: page };
-      }
+      if (isLastPage(info, page, previews.length, items.length)) return { previews, requests: page };
     }
   }
 
@@ -190,6 +207,10 @@ export class CloudflareApi {
       // 重试耗尽的网络层失败也归成「预期内的失败」，否则 cli 会甩出一整段堆栈
       throw new CloudflareApiError(0, "network", `GET ${url.pathname} 请求失败：${String(error)}`);
     }
+    // 重试耗尽仍是 429 / 5xx 时，别让人以为是 token 或参数填错了
+    const transient = isTransientStatus(response.status)
+      ? `（连续 ${MAX_ATTEMPTS} 次${response.status === 429 ? "被限流" : "服务端故障"}，稍后重跑即可）`
+      : "";
 
     let body: Envelope<T>;
     try {
@@ -198,7 +219,7 @@ export class CloudflareApi {
       throw new CloudflareApiError(
         response.status,
         String(response.status),
-        `GET ${url.pathname} 返回的不是 JSON（HTTP ${response.status}）`,
+        `GET ${url.pathname} 返回的不是 JSON（HTTP ${response.status}）${transient}`,
       );
     }
     if (!response.ok || !body.success) {
@@ -206,15 +227,33 @@ export class CloudflareApi {
       throw new CloudflareApiError(
         response.status,
         String(first?.code ?? response.status),
-        `GET ${url.pathname} 失败：${first?.message ?? `HTTP ${response.status}`}`,
+        `GET ${url.pathname} 失败：${first?.message ?? `HTTP ${response.status}`}${transient}`,
       );
     }
     return body;
   }
 }
 
-function paginationError(reason: string): CloudflareApiError {
-  return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部预览，已中止。`);
+function paginationError(reason: string, what: "预览" | "deployment"): CloudflareApiError {
+  return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部${what}，已中止。`);
+}
+
+/**
+ * 依次认 total_pages、total_count（与已取到的条数比）、服务端回报的 per_page；三者都没有时
+ * 一直翻到空页为止。只认真正的数字：null 若混进比较，`page >= null` 恒为 true，第一页就会
+ * 被当成最后一页。
+ */
+function isLastPage(
+  info: Envelope<unknown>["result_info"],
+  page: number,
+  fetched: number,
+  onPage: number,
+): boolean {
+  if (onPage === 0) return true;
+  if (typeof info?.total_pages === "number") return page >= info.total_pages;
+  if (typeof info?.total_count === "number") return fetched >= info.total_count;
+  if (typeof info?.per_page === "number") return onPage < info.per_page;
+  return false;
 }
 
 /** 按顺序比较两份预览名：判断接口是否压根不分页，要求两次响应一模一样 */

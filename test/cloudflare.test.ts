@@ -16,11 +16,18 @@ function api(handler: (url: URL, init?: RequestInit) => Response) {
   return { calls, api: new CloudflareApi({ accountId: "acct", apiToken: "tok", fetchImpl }) };
 }
 
+async function allDeployments(cf: CloudflareApi, worker: string) {
+  const all = [];
+  for await (const page of cf.listDeployments(worker)) all.push(...page);
+  return all;
+}
+
 describe("CloudflareApi", () => {
   it("带 Bearer token 列 deployments，保留每条的全部 version", async () => {
     let auth: string | null = null;
-    const { api: cf, calls } = api((_, init) => {
+    const { api: cf, calls } = api((url, init) => {
       auth = new Headers(init?.headers).get("authorization");
+      if (url.searchParams.get("page") !== "1") return ok({ deployments: [] });
       return ok({
         deployments: [
           { versions: [{ version_id: "v2", percentage: 90 }, { version_id: "v1", percentage: 10 }] },
@@ -29,14 +36,39 @@ describe("CloudflareApi", () => {
       });
     });
 
-    const deployments = await cf.listDeployments("my-worker");
-    expect(deployments).toEqual([{ versionIds: ["v2", "v1"] }, { versionIds: ["v1"] }]);
+    const deployments = await allDeployments(cf, "my-worker");
+    expect(deployments.map((d) => d.versionIds)).toEqual([["v2", "v1"], ["v1"]]);
     expect(auth).toBe("Bearer tok");
     expect(calls[0]!.pathname).toBe(
       "/client/v4/accounts/acct/workers/scripts/my-worker/deployments",
     );
      // 默认页太小，只改配置的部署一多就凑不够近期 build
     expect(calls[0]!.searchParams.get("per_page")).toBe("100");
+  });
+
+  it("deployment 按 total_pages 逐页交出，跳过翻页期间因新部署而重复出现的", async () => {
+    const pages: Record<string, { id: string }[]> = {
+      "1": [{ id: "d4" }, { id: "d3" }],
+      // 翻页间有新部署，d3 被挤到了第二页
+      "2": [{ id: "d3" }, { id: "d2" }],
+      "3": [{ id: "d1" }],
+    };
+    const { api: cf, calls } = api((url) => {
+      const page = url.searchParams.get("page")!;
+      return ok({ deployments: pages[page] }, { page: Number(page), per_page: 2, total_pages: 3 });
+    });
+    const seen: string[][] = [];
+    for await (const page of cf.listDeployments("w")) seen.push(page.map((d) => d.id!));
+    expect(seen).toEqual([["d4", "d3"], ["d2"], ["d1"]]);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("deployment 一整页都是翻过的时中止，不原地打转", async () => {
+    const { api: cf } = api(() => ok({ deployments: [{ id: "d1" }] }));
+    await expect(allDeployments(cf, "w")).rejects.toMatchObject({
+      code: "pagination",
+      message: expect.stringContaining("无法确认已经看到全部deployment"),
+    });
   });
 
   it("result_info 的字段为 null 时不当成终点，继续翻页", async () => {
@@ -158,7 +190,7 @@ describe("CloudflareApi", () => {
   it("result 为 null 时当作空列表，而不是甩原生 TypeError", async () => {
     const { api: cf } = api(() => ok(null));
     expect(await cf.listPreviews("w")).toEqual([]);
-    expect(await cf.listDeployments("w")).toEqual([]);
+    expect(await allDeployments(cf, "w")).toEqual([]);
     expect(await cf.getVersionUrls("w", "v1")).toEqual([]);
   });
 
@@ -203,7 +235,7 @@ describe("CloudflareApi", () => {
         }
         return ok({ deployments: [] });
       });
-      const result = cf.listDeployments("w");
+      const result = allDeployments(cf, "w");
       await vi.advanceTimersByTimeAsync(4000);
       expect(call).toBe(1);
       await vi.advanceTimersByTimeAsync(1000);
@@ -222,7 +254,7 @@ describe("CloudflareApi", () => {
           { status: 404 },
         ),
     );
-    await expect(cf.listDeployments("w")).rejects.toMatchObject({
+    await expect(allDeployments(cf, "w")).rejects.toMatchObject({
       name: "CloudflareApiError",
       status: 404,
       code: "10007",
@@ -235,7 +267,7 @@ describe("CloudflareApi", () => {
       const { api: cf, calls } = api(() => {
         throw new TypeError("fetch failed");
       });
-      const result = expect(cf.listDeployments("w")).rejects.toMatchObject({
+      const result = expect(allDeployments(cf, "w")).rejects.toMatchObject({
         name: "CloudflareApiError",
         code: "network",
       });
@@ -247,8 +279,26 @@ describe("CloudflareApi", () => {
     }
   });
 
+  it("重试耗尽仍是 5xx 时提示稍后重跑，不让人去改配置", async () => {
+    vi.useFakeTimers();
+    try {
+      const { api: cf } = api(
+        () =>
+          new Response(
+            JSON.stringify({ success: false, errors: [{ code: 10013, message: "boom" }] }),
+            { status: 503 },
+          ),
+      );
+      const result = expect(allDeployments(cf, "w")).rejects.toThrow(/连续 3 次服务端故障，稍后重跑即可/);
+      await vi.runAllTimersAsync();
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("响应不是 JSON 时给出可读的错误", async () => {
     const { api: cf } = api(() => new Response("<html>oops</html>", { status: 403 }));
-    await expect(cf.listDeployments("w")).rejects.toThrow(/不是 JSON/);
+    await expect(allDeployments(cf, "w")).rejects.toThrow(/不是 JSON/);
   });
 });

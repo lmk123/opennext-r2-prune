@@ -3,7 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { BuildIdProbeError } from "./build-id.ts";
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
-import { type ExpireState, type KeptBuild, PlanError } from "./plan.ts";
+import { type ExpireState, type KeptBuild, PlanError, type PrunePlan } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
 import { R2Store, S3Error } from "./store.ts";
 import { collectPlan, type RunState } from "./run.ts";
@@ -200,7 +200,7 @@ async function main(argv: string[]): Promise<number> {
   if (state.cloudflare && state.cloudflare.recentBuilds < recentBuilds) {
     console.error(
       `\n注意：只凑到 ${state.cloudflare.recentBuilds} 个不同的近期线上 build（--recent-builds 为 ${recentBuilds}），` +
-        `Cloudflare 返回的 ${state.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
+        `全部 ${state.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
         `需要保留的请用 --keep 显式指定。`,
     );
   }
@@ -281,7 +281,7 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
     console.log(`线上 BUILD_ID: ${state.onlineBuildId}  （读自 ${state.probedFrom}）`);
   }
   // 同时给了 --url 与 --worker 时，最新 deployment 里还可能有别的线上 build（灰度）
-  const fromDeployment = state.onlineBuildIds.filter((id) => id !== state.onlineBuildId);
+  const fromDeployment = onlineBuildIds(plan).filter((id) => id !== state.onlineBuildId);
   if (fromDeployment.length > 0) {
     console.log(
       `${state.onlineBuildId ? "另有" : ""}线上 BUILD_ID: ${fromDeployment.join(", ")}  （读自最新的 deployment）`,
@@ -331,13 +331,22 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   }
 }
 
+/**
+ * 此刻承载线上流量的全部 build：--url 探测到的加上最新 deployment 里的。online 优先级最高、
+ * 又必须在 bucket 里（--force 硬留的也在 keep 里），所以保留集里 reason 为 online 的就是全部。
+ */
+function onlineBuildIds(plan: PrunePlan): string[] {
+  return plan.keep.filter((b) => b.reason === "online").map((b) => b.buildId);
+}
+
 function toJson(state: RunState, prefix: string) {
-  const { plan, onlineBuildIds } = state;
+  const { plan } = state;
+  const online = onlineBuildIds(plan);
   return {
     prefix,
     // 只走 --worker 时也要有值；灰度中线上不止一个 build，单个字段说不清，看 onlineBuildIds
-    onlineBuildId: state.onlineBuildId ?? (onlineBuildIds.length === 1 ? onlineBuildIds[0] : null),
-    onlineBuildIds,
+    onlineBuildId: state.onlineBuildId ?? (online.length === 1 ? online[0] : null),
+    onlineBuildIds: online,
     cloudflare: state.cloudflare,
     changed: plan.changed,
     // keep 仍是完整的保留集；其中不在 bucket 里的另见 absent

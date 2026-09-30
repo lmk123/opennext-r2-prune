@@ -66,7 +66,6 @@ export async function probeBuildId(
   }
 
   if (isTransientStatus(response.status)) {
-    await response.body?.cancel().catch(() => {});
     throw new BuildIdProbeError(
       `${url} 连续 ${MAX_ATTEMPTS} 次返回 HTTP ${response.status}` +
         `（${response.status === 429 ? "被限流" : "服务端故障"}），稍后重跑即可。`,

@@ -157,18 +157,26 @@ describe("collectPlan", () => {
  */
 function fakeCloudflare(opts: {
   deployments: string[][];
+  /** deployment 每页几条；不给就一页装下全部 */
+  deploymentsPerPage?: number;
   versions: Record<string, string | null>;
   previews?: Record<string, string>;
 }) {
   const probed: string[] = [];
+  const deploymentPages: number[] = [];
   const fetchImpl = (async (input: string) => {
     const url = new URL(input);
     const json = (result: unknown) => new Response(JSON.stringify({ success: true, result }));
 
     if (url.hostname === "api.cloudflare.com") {
       if (url.pathname.endsWith("/deployments")) {
+        // 没有 result_info，客户端会一直翻到空页
+        const page = Number(url.searchParams.get("page"));
+        deploymentPages.push(page);
+        const size = opts.deploymentsPerPage ?? opts.deployments.length;
         return json({
-          deployments: opts.deployments.map((ids) => ({
+          deployments: opts.deployments.slice((page - 1) * size, page * size).map((ids, i) => ({
+            id: `d${(page - 1) * size + i}`,
             versions: ids.map((version_id) => ({ version_id, percentage: 100 / ids.length })),
           })),
         });
@@ -197,7 +205,7 @@ function fakeCloudflare(opts: {
     return new Response(buildId, { headers: { "content-type": "text/plain" } });
   }) as unknown as typeof fetch;
 
-  return { probed, fetchImpl, api: new CloudflareApi({ accountId: "acct", apiToken: "tok", fetchImpl }) };
+  return { probed, deploymentPages, fetchImpl, api: new CloudflareApi({ accountId: "acct", apiToken: "tok", fetchImpl }) };
 }
 
 describe("collectPlan + Cloudflare API", () => {
@@ -371,7 +379,63 @@ describe("collectPlan + Cloudflare API", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b1"]);
   });
 
-  it("只走 Cloudflare 时 onlineBuildIds 给出最新 deployment 的 build", async () => {
+  it("第一页凑不够时按需往后翻页，凑够就不再翻", async () => {
+    const cf = fakeCloudflare({
+      // 前两页全是只改了 secret 的部署
+      deployments: [["v5"], ["v4"], ["v3"], ["v2"], ["v1"], ["v0"]],
+      deploymentsPerPage: 2,
+      versions: { v5: "b2", v4: "b2", v3: "b2", v2: "b2", v1: "b1", v0: "b0" },
+    });
+    const { store } = fakeR2({ buildIds: ["b2", "b1", "b0"] });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      cloudflare: { api: cf.api, worker: "w", recentBuilds: 2 },
+      fetchImpl: cf.fetchImpl,
+    });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["b2", "b1"]);
+    expect(state.cloudflare?.recentBuilds).toBe(2);
+    expect(cf.deploymentPages).toEqual([1, 2, 3]);
+  });
+
+  it("站点探测失败时中止在途的 Cloudflare 探测", async () => {
+    const cf = fakeCloudflare({ deployments: [["v1"]], versions: { v1: "live" } });
+    const { store } = fakeR2({ buildIds: ["live"] });
+    let cfAborted = false;
+    let cfProbing!: () => void;
+    const cfStarted = new Promise<void>((resolve) => (cfProbing = resolve));
+    const fetchImpl = (async (input: string, init?: RequestInit) => {
+      const url = new URL(input);
+      if (url.hostname === "site.example") {
+        // 等 Cloudflare 那条线的探测发出去再失败
+        await cfStarted;
+        return new Response("nope", { status: 404 });
+      }
+      if (url.hostname.endsWith("workers.dev")) {
+        cfProbing();
+        // 读版本 BUILD_ID 一直挂着，直到被中止
+        return new Promise<Response>((_, reject) =>
+          init?.signal?.addEventListener("abort", () => {
+            cfAborted = true;
+            reject(init.signal!.reason);
+          }),
+        );
+      }
+      return cf.fetchImpl(input, init);
+    }) as unknown as typeof fetch;
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        siteUrl: "https://site.example",
+        cloudflare: { api: cf.api, worker: "w" },
+        fetchImpl,
+      }),
+    ).rejects.toThrow(/HTTP 404/);
+    expect(cfAborted).toBe(true);
+  });
+
+  it("只走 Cloudflare 时 online 的保留项就是最新 deployment 的 build", async () => {
     const cf = fakeCloudflare({
       deployments: [["vnew", "vold"], ["vold"]],
       versions: { vnew: "bNew", vold: "bOld" },
@@ -384,7 +448,8 @@ describe("collectPlan + Cloudflare API", () => {
       fetchImpl: cf.fetchImpl,
     });
     expect(state.onlineBuildId).toBeNull();
-    expect(state.onlineBuildIds).toEqual(["bNew", "bOld"]);
+    const online = state.plan.keep.filter((b) => b.reason === "online");
+    expect(online.map((b) => b.buildId)).toEqual(["bNew", "bOld"]);
   });
 
   it("--recent-builds 可调", async () => {

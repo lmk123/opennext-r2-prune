@@ -58,6 +58,32 @@ describe("withRetry", () => {
     }
   });
 
+  it("响应头到了但 body 迟迟不来时同样超时并重试", async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const pending = withRetry(
+        async (signal) => {
+          call++;
+          if (call === 2) return new Response("ok");
+          // 只发响应头，body 一直不来，直到被本次尝试的 signal 中止
+          const body = new ReadableStream({
+            start: (c) => signal.addEventListener("abort", () => c.error(signal.reason), { once: true }),
+          });
+          return new Response(body);
+        },
+        undefined,
+        undefined,
+        1_000,
+      );
+      await vi.runAllTimersAsync();
+      expect(await (await pending).text()).toBe("ok");
+      expect(call).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("每次都超时时抛出超时错误", async () => {
     vi.useFakeTimers();
     try {
@@ -71,7 +97,7 @@ describe("withRetry", () => {
         1_000,
       ).catch((error: unknown) => error);
       await vi.runAllTimersAsync();
-      expect(String(await pending)).toMatch(/1 秒内没有响应/);
+      expect(String(await pending)).toMatch(/1 秒内没有收完响应/);
     } finally {
       vi.useRealTimers();
     }
