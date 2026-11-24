@@ -65,10 +65,8 @@ export interface RunState {
 }
 
 export async function collectPlan(opts: RunOptions): Promise<RunState> {
-  // 先看 bucket 再探测：探测可能要几十秒（上百个地址、重试退避），这期间新上传或上线的
-  // build 若出现在后列出的目录里，却不在更早探测出的保留集中，就会被挂上删除规则。
-  // 先列目录，中途冒出的 build 根本不在 existing 里，碰不到；它若恰是线上 build，
-  // 还会因为「要保留的 build 不在 bucket 里」安全地报错。
+  // 先看 bucket 再探测：探测可能要几十秒，这期间新上传或上线的 build 若出现在后列出的目录里，
+  // 却不在更早探测出的保留集中，就会被挂上删除规则。
   // 用 allSettled 等两边都落地：列目录失败时整趟也要中止，但读到的危险规则必须先报出来
   const [listed, read] = await Promise.allSettled([
     opts.store.listBuildIds(opts.prefix),
