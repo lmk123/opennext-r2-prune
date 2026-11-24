@@ -146,6 +146,75 @@ lifecycle 是 bucket 级配置，R2 的 Object 级 token **不论只读还是读
 bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--dry-run` 时 **Admin Read only** 就够了，
 它不能写入任何东西，适合首次核对计划。
 
+### 作为库调用
+
+同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
+`AbortSignal`），Node 20+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
+
+本包没有发布到 npm，请从 GitHub 安装，安装时 `prepare` 脚本会构建出 `dist`：
+
+```bash
+npm install github:lmk123/opennext-r2-prune
+```
+
+pnpm 默认不跑 git 依赖的构建脚本，会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。这时要按报错里给出的完整写法
+（含 commit），把本包加进 `pnpm-workspace.yaml` 的 `allowBuilds`，只写包名不管用。
+
+```ts
+import { createHash } from "node:crypto";
+import { prune } from "opennext-r2-prune";
+
+const result = await prune({
+  bucket: "my-cache",
+  accountId: process.env.CLOUDFLARE_ACCOUNT_ID!,
+  accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+  worker: "my-worker",
+  apiToken: process.env.CLOUDFLARE_API_TOKEN!,
+  // dryRun: true,
+  // 不给 confirm 就直接写入
+  confirm: (plan) => plan.expire.length < 50,
+  // 可选：带上 Content-MD5（实测 R2 不校验它，Worker 里没有 MD5 可以不传）
+  md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
+  // 务必报出来：探测失败而中止时，这是得知这些危险规则的唯一途径
+  onWholeBucketRules: (ids) => console.warn("对整个 bucket 生效的规则：", ids),
+});
+console.log(result.expire, result.written, result.verified);
+```
+
+选项与命令行开关一一对应，改成驼峰：`--build-id-url` → `buildIdUrl`、`--recent-builds` →
+`recentBuilds`、`--allow-root-prefix` → `allowRootPrefix`、`--dry-run` → `dryRun`，`--url` 对应
+`siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。参数校验的报错用
+上面的选项名；探测与安全校验阶段的报错沿用命令行的开关名（比如「请改用 --keep」），按这张对应表换算。
+
+需要先看计划、再决定写不写时，用两段式的 `planPrune`：
+
+```ts
+import { planPrune } from "opennext-r2-prune";
+
+const planned = await planPrune(options); // 只发读请求，探测与安全校验在这一步做完
+if (planned.changed && (await askSomeone(planned.expire))) {
+  const outcome = await planned.apply(); // 写入并回读核对；只能调用一次
+}
+```
+
+计划只在算出的那一刻成立，`planPrune` 与 `apply()` 之间别隔太久。`apply()` 写入前会重读 lifecycle 配置，
+算出计划之后被改过（别人改了规则、另一趟运行写过）就抛 `PlanError`，不写入任何东西。它**不会**重新探测线上 build：
+这期间有部署或回滚的话，被判作废的 build 可能又上线了，请重新调用 `planPrune`。
+
+失败一律以异常抛出，不会写到一半悄悄返回：
+
+- 参数不对抛 `PruneOptionsError`，一个请求都不发。
+- 探测、列举或安全校验失败（包括 `apply()` 写入前发现配置被改过）抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
+  `XmlAssumptionError` 之一，此时没有任何写请求。重试耗尽仍连不上 R2 也是 `S3Error`（`status` 为 0）。
+- 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
+  `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败，
+  或写入阶段意外出错、无从确认）务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
+- 重复调用同一个 `apply()` 是用法错误，抛普通 `Error`，不发任何请求；要再写入请重新调用 `planPrune`。
+
+返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
+`cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
+
 ## 安全设计
 
 删除不可逆，所以这几条是硬性的：
@@ -165,6 +234,8 @@ bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--
   bucket 确实只用来存 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
 - 列出来的 build 目录名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
   降级成警告 —— 那些值会被用来拼删除规则。
+- **写入前重读配置**。确认环节可能隔了很久，写入前再读一次 lifecycle，与算计划时读到的不一致（有人改了规则、
+  另一趟运行写过）就中止、不写入，以免整份覆盖抹掉别人的改动。
 - **写入后回读核对**。PUT 返回成功不代表规则按原样生效：实测 R2 会静默丢掉裸 `<Prefix>`，把只针对
   一个 build 目录的删除规则变成作用于整个 bucket 的。所以每次写完都把配置读回来，逐条比对本工具
   规则的前缀、过期天数、状态（同一个 buildId 读回多条也算不符），以及外部规则的条数。刚写完可能

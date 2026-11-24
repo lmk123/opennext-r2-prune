@@ -1,6 +1,14 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
-import { type KeptBuild, makePlan, type PrunePlan, type VerifyProblems, verifyWritten, wholeBucketRules } from "./plan.ts";
+import {
+  type KeptBuild,
+  makePlan,
+  PlanError,
+  type PrunePlan,
+  type VerifyProblems,
+  verifyWritten,
+  wholeBucketRules,
+} from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "./xml.ts";
@@ -321,7 +329,7 @@ export interface WriteResult {
   /**
    * PUT 本身报了错，但请求可能已在服务端生效（超时、重试耗尽的 5xx……），所以仍回读核对：与期望
    * 一致就当作已写入（problems 为空）；读回来仍是写入前的配置、且没有对整个 bucket 生效的自有规则，
-   * 或者写入被服务端明确拒绝、又读不回来，就把这个错误直接抛给调用方，不会出现在返回值里；
+   * 或者写入被服务端明确拒绝、又读不回来，就包成 WriteNotAppliedError 抛给调用方，不会出现在返回值里；
    * 其余情况（读不回来、读到的既不是新配置也不是旧配置、旧配置里本就有整 bucket 规则）一律撤销。
    */
   writeError?: unknown;
@@ -381,6 +389,33 @@ function message(error: unknown): string {
 }
 
 /**
+ * 写入请求报错，且能确认没有生效：bucket 仍是写入前的样子。cause 是写入请求的原始错误。
+ * writeAndVerify 只用它表示「没写进去」，调用方据此报 written: false；其余异常一律不能当作没写入。
+ */
+export class WriteNotAppliedError extends Error {
+  constructor(cause: unknown) {
+    super(message(cause), { cause });
+    this.name = "WriteNotAppliedError";
+  }
+}
+
+/**
+ * 写入前再读一次配置，必须与算计划时读到的完全一致，否则中止、不发写请求。计划和写入之间隔着确认
+ * （库的调用方可能等上很久）：期间有人改了外部规则，整份覆盖会把改动抹掉；另一趟运行写过规则，
+ * 计划、写入报错时的「没生效」判断、撤销都会以过期的现状为准。两次都是原样读回、同样解析，所以
+ * 外部规则逐字比对，不像写后核对那样只比条数。
+ */
+export async function assertLifecycleUnchanged(store: R2Store, before: LifecycleDoc): Promise<void> {
+  const now = await store.getLifecycle();
+  if (JSON.stringify(now) === JSON.stringify(before)) return;
+  throw new PlanError(
+    `写入前重读 lifecycle 配置，发现它在算出计划之后被改过（本工具规则 ${before.own.length} → ${now.own.length} 条，` +
+      `外部规则 ${before.foreign.length} → ${now.foreign.length} 条，条数相同时是内容变了），已中止，没有写入任何改动。` +
+      `请重新算计划再写入：库调用方重新调用 planPrune()，命令行直接重跑。`,
+  );
+}
+
+/**
  * 写入是否被明确拒绝、不会生效：请求根本没发出去（渲染配置时就失败），或者服务端回了 4xx
  * （429 限流除外，它会被重试）。这时不必等「读到新配置」，回读一次只为看看旧配置里有没有危险规则。
  */
@@ -428,10 +463,10 @@ export async function writeAndVerify(
   let unchanged = false;
   if (failed) {
     if ("error" in check) {
-      if (rejected) throw writeError;
+      if (rejected) throw new WriteNotAppliedError(writeError);
     } else if (verifyWritten(before, check.actual).own.length === 0) {
       unchanged = true;
-      if (wholeBucketRules(check.actual).length === 0) throw writeError;
+      if (wholeBucketRules(check.actual).length === 0) throw new WriteNotAppliedError(writeError);
     }
   }
 

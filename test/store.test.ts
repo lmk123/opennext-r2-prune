@@ -228,4 +228,36 @@ describe("重试", () => {
     await expect(store.listBuildIds("incremental-cache")).rejects.toThrow("密钥无效");
     expect(call).toBe(1);
   });
+
+  it("网络层失败重试耗尽后报成 S3Error（status 0），不甩原生 TypeError", async () => {
+    let call = 0;
+    const fetchImpl = (async () => {
+      call++;
+      throw new TypeError("fetch failed", { cause: new Error("getaddrinfo ENOTFOUND acct123.example") });
+    }) as unknown as typeof fetch;
+
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = await store.listBuildIds("incremental-cache").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(S3Error);
+    expect(error).toMatchObject({ status: 0, code: "network", operation: "list" });
+    // undici 的真正原因在 cause 里，报错要带上，原始错误也要挂在 cause 上
+    expect((error as S3Error).message).toMatch(/列出 build 目录失败（没有拿到响应[\s\S]*ENOTFOUND[\s\S]*endpoint 可达/);
+    expect((error as S3Error).cause).toBeInstanceOf(TypeError);
+    expect(call).toBe(3);
+  });
+
+  it("退回的 DELETE 网络失败时，报错里既有 PUT 被拒的原因，也有网络失败的补救办法", async () => {
+    let call = 0;
+    const fetchImpl = (async () => {
+      if (call++ === 0) return new Response("<Error><Code>MalformedXML</Code></Error>", { status: 400 });
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    expect(error).toMatchObject({ operation: "deleteLifecycle", status: 0, code: "network" });
+    expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
+    expect(error.message).toContain("请确认网络与 endpoint 可达");
+    expect(error.cause).toBeInstanceOf(TypeError);
+  });
 });

@@ -53,22 +53,40 @@ const PERMISSION_HINT: Record<S3Operation, string> = {
 export class S3Error extends Error {
   // 显式声明字段而不用构造函数参数属性：那是 Node 的类型擦除模式跑不了的语法，
   // 而 package.json 的 start 脚本正是靠它直接跑源码
+  /** HTTP 状态码；重试耗尽仍没拿到响应（网络层失败）时为 0 */
   readonly status: number;
   readonly code: string;
   readonly operation: S3Operation;
   /** R2 返回的原始错误信息，不含本工具补充的步骤与权限说明 */
   readonly detail: string;
+  /** 补在原因后面的前情或补救办法；重新包装这个错误时要带上，否则补救办法会丢 */
+  readonly context: string | undefined;
 
-  /** context：补在原因后面的前情，比如「先试的 PUT 为什么被拒」 */
-  constructor(operation: S3Operation, status: number, code: string, detail: string, context?: string) {
+  /**
+   * context：补在原因后面的前情，比如「先试的 PUT 为什么被拒」。
+   * cause：网络层失败时的原始错误，undici 的真正原因（ENOTFOUND 之类）还在它的 cause 里。
+   */
+  constructor(
+    operation: S3Operation,
+    status: number,
+    code: string,
+    detail: string,
+    context?: string,
+    cause?: unknown,
+  ) {
     const reason = detail && detail !== code ? `${code}：${detail}` : code;
     const hint = status === 403 ? `\n${PERMISSION_HINT[operation]}` : "";
-    super(`${OPERATION_LABEL[operation]}失败（HTTP ${status}，${reason}）${context ? `。${context}` : ""}${hint}`);
+    const where = status === 0 ? "没有拿到响应" : `HTTP ${status}`;
+    super(
+      `${OPERATION_LABEL[operation]}失败（${where}，${reason}）${context ? `。${context}` : ""}${hint}`,
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "S3Error";
     this.operation = operation;
     this.status = status;
     this.code = code;
     this.detail = detail;
+    this.context = context;
   }
 }
 
@@ -90,10 +108,17 @@ export class R2Store {
 
   async #request(operation: S3Operation, url: string, init?: RequestInit): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
-    const response = await withRetry(
-      async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
-      this.#opts.onRetry,
-    );
+    let response: Response;
+    try {
+      response = await withRetry(
+        async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
+        this.#opts.onRetry,
+      );
+    } catch (error) {
+      // 重试耗尽的网络层失败也归成 S3Error（status 为 0），和 cloudflare.ts 一致：库的调用方按文档列出的
+      // 错误类型分类，cli 也不会甩堆栈。status 0 不在 4xx 里，写入时仍按「可能已生效」回读核对
+      throw new S3Error(operation, 0, "network", networkReason(error), "请确认网络与 endpoint 可达，稍后重跑", error);
+    }
     if (response.status < 400) return response;
 
     const body = await response.text();
@@ -175,16 +200,27 @@ export class R2Store {
         // DELETE 的报错会盖住 PUT 被拒的原因，两步都失败时要一并说清
         if (!(deleteError instanceof S3Error)) throw deleteError;
         const putReason = error.detail && error.detail !== error.code ? `${error.code}：${error.detail}` : error.code;
+        const before = `此前 PUT 空配置被拒（HTTP ${error.status}，${putReason}），才改用 DELETE 清空`;
         throw new S3Error(
           "deleteLifecycle",
           deleteError.status,
           deleteError.code,
           deleteError.detail,
-          `此前 PUT 空配置被拒（HTTP ${error.status}，${putReason}），才改用 DELETE 清空`,
+          // DELETE 自己的补救办法（比如网络失败时的「确认 endpoint 可达」）接在前情后面，不能丢
+          deleteError.context ? `${before}。${deleteError.context}` : before,
+          deleteError.cause,
         );
       }
     }
   }
+}
+
+/** undici 只报「fetch failed」，DNS、连接被拒、证书之类的真正原因在 cause 里，要一并写进报错 */
+function networkReason(error: unknown): string {
+  const text = String(error);
+  if (!(error instanceof Error) || error.cause === undefined) return text;
+  const cause = error.cause instanceof Error ? error.cause.message : String(error.cause);
+  return `${text}（${cause}）`;
 }
 
 function extractCode(xml: string): string | undefined {

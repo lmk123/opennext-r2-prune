@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
-import { collectPlan, writeAndVerify } from "../src/run.ts";
+import { collectPlan, writeAndVerify, WriteNotAppliedError } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
@@ -775,7 +775,7 @@ describe("writeAndVerify", () => {
 
   it("写入请求报错且读回来仍是旧配置时，照常报写入失败，不撤销", async () => {
     const { puts, store, getCount } = statefulR2({ firstPutError: "rejected" });
-    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(S3Error);
+    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(WriteNotAppliedError);
     expect(puts).toHaveLength(0);
     // 4xx 是明确拒绝，读一次看看旧配置就够，不必等它「变成新配置」
     expect(getCount()).toBe(1);
@@ -814,7 +814,7 @@ describe("writeAndVerify", () => {
       puts: [new S3Error("putLifecycle", 403, "AccessDenied", "Access Denied")],
       gets: [new Error("读取超时")],
     });
-    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(S3Error);
+    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(WriteNotAppliedError);
     expect(putDocs).toHaveLength(1);
   });
 

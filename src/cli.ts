@@ -1,13 +1,22 @@
+#!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
-import { BuildIdProbeError } from "./build-id.ts";
-import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
-import { type ExpireState, type KeptBuild, PlanError, type PrunePlan } from "./plan.ts";
+import {
+  BuildIdProbeError,
+  CloudflareApiError,
+  describeError,
+  type ExpireState,
+  type KeptBuild,
+  PlanError,
+  type PrunePlanSummary,
+  planPrune,
+  PruneOptionsError,
+  PruneWriteError,
+  S3Error,
+  XmlAssumptionError,
+} from "./index.ts";
 import { normalizePrefix } from "./prefix.ts";
-import { R2Store, S3Error } from "./store.ts";
-import { collectPlan, type RunState, writeAndVerify } from "./run.ts";
-import { XmlAssumptionError } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
 
@@ -152,33 +161,26 @@ async function main(argv: string[]): Promise<number> {
     ? (attempt: number, reason: string) => console.error(`  第 ${attempt} 次重试：${reason}`)
     : undefined;
 
-  const store = new R2Store({
-    endpoint: endpoint!,
+  const planned = await planPrune({
     bucket: bucket!,
+    accountId,
+    endpoint: endpoint!,
     accessKeyId: accessKeyId!,
     secretAccessKey: secretAccessKey!,
-    // Web Crypto 没有 MD5，而 S3 规范要求 PutBucketLifecycleConfiguration 带上它
-    md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
-    onRetry,
-  });
-
-  const state = await collectPlan({
-    store,
-    prefix,
+    worker,
+    // 环境变量里的 CLOUDFLARE_API_TOKEN 可能是给 wrangler 准备的，没开 --worker 时不能传下去：
+    // 库的校验见到 apiToken 就要求 worker，会把只用 --url 的人拦下
+    apiToken: worker ? apiToken : undefined,
+    recentBuilds: worker ? recentBuilds : undefined,
     siteUrl,
     buildIdUrl: values["build-id-url"],
-    cloudflare:
-      worker && apiToken
-        ? {
-            api: new CloudflareApi({ accountId: accountId!, apiToken, onRetry }),
-            worker,
-            recentBuilds,
-          }
-        : undefined,
     keep,
+    prefix,
+    expireDays,
     force: values.force,
     allowRootPrefix: values["allow-root-prefix"],
-    expireDays,
+    // Web Crypto 没有 MD5，而 S3 规范要求 PutBucketLifecycleConfiguration 带上它
+    md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
     onRetry,
     // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
     onWholeBucketRules: (buildIds) =>
@@ -191,16 +193,15 @@ async function main(argv: string[]): Promise<number> {
       ),
   });
 
-  const { plan } = state;
   // --json 时 stdout 只放最后那一份 JSON，人类可读的内容一律改走 stderr
   const note = (message: string) => (json ? console.error(message) : console.log(message));
 
-  if (!json) printPlan(state, bucket!, prefix);
+  if (!json) printPlan(planned);
   // deployment 翻完了还凑不够名额时不能悄悄少保留：回滚目标可能就在被判作废的那几个里
-  if (state.cloudflare && state.cloudflare.recentBuilds < recentBuilds) {
+  if (planned.cloudflare && planned.cloudflare.recentBuilds < recentBuilds) {
     console.error(
-      `\n注意：只凑到 ${state.cloudflare.recentBuilds} 个不同的近期线上 build（--recent-builds 为 ${recentBuilds}），` +
-        `全部 ${state.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
+      `\n注意：只凑到 ${planned.cloudflare.recentBuilds} 个不同的近期线上 build（--recent-builds 为 ${recentBuilds}），` +
+        `全部 ${planned.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
         `需要保留的请用 --keep 显式指定。`,
     );
   }
@@ -220,7 +221,7 @@ async function main(argv: string[]): Promise<number> {
   let failure: string | undefined;
   let code = 0;
 
-  if (!plan.changed) {
+  if (!planned.changed) {
     note("\n规则已经是最新的，无需改动。");
   } else if (values["dry-run"]) {
     note("\n--dry-run：未写入任何改动。");
@@ -232,48 +233,28 @@ async function main(argv: string[]): Promise<number> {
     note("已取消。");
   } else {
     try {
-      const result = await writeAndVerify(store, plan.nextDoc, state.lifecycle);
-      warnings = result.warnings;
-      if (result.readBackError === undefined && result.problems.length === 0) {
-        written = true;
-        verified = true;
-        for (const warning of warnings) {
-          console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
-        }
-        if (result.writeError !== undefined) {
-          console.error(`\n注意：写入请求报错（${describe(result.writeError)}），但回读确认规则已按原样生效。`);
-        }
-        const added = plan.expire.filter((b) => b.state === "new").length;
-        const updated = plan.expire.filter((b) => b.state === "updated").length;
-        note(
-          `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 个 build 的规则。` +
-            `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
-        );
-      } else {
-        // 撤销成功、或能确认写入根本没生效时为 false；其余撤销失败的情况下新规则可能还在，按「已写入」报
-        written = result.written;
-        verified = false;
-        rolledBack = result.rolledBack;
-        for (const warning of warnings) {
-          console.error(`\n注意：${warning}，请检查你自己的 lifecycle 规则是否完好。`);
-        }
-        const reason =
-          result.readBackError !== undefined
-            ? [...result.problems, `写入后读不回配置，无从核对：${describe(result.readBackError)}`]
-            : result.problems;
-        failure = `写入后回读核对失败：${reason.join("；")}`;
-        const rollback = result.rolledBack
-          ? "已撤掉本工具的全部规则并回读确认（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
-          : `撤掉本工具的规则时失败了：${describe(result.rollbackError)}\n` +
-            `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 检查，并手动删除所有 opennext-r2-prune:* 规则，` +
-            `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
-        console.error(`\n写入后回读核对失败：\n  ${reason.join("\n  ")}\n${rollback}`);
-        code = 2;
+      const outcome = await planned.apply();
+      ({ written, verified, warnings } = outcome);
+      for (const warning of warnings) {
+        console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
       }
+      if (outcome.writeError !== null) {
+        console.error(`\n注意：写入请求报错（${outcome.writeError}），但回读确认规则已按原样生效。`);
+      }
+      const added = planned.expire.filter((b) => b.state === "new").length;
+      const updated = planned.expire.filter((b) => b.state === "updated").length;
+      note(
+        `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${planned.reclaim.length} 个 build 的规则。` +
+          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
+      );
     } catch (error) {
-      failure = describe(error);
-      // S3Error 自己就写明了「写入 lifecycle 规则失败」，不再重复一遍
-      console.error(`\n${error instanceof S3Error ? failure : `写入 lifecycle 规则失败：${failure}`}`);
+      if (!(error instanceof PruneWriteError)) throw error;
+      ({ written, verified, rolledBack, warnings } = error);
+      for (const warning of warnings) {
+        console.error(`\n注意：${warning}，请检查你自己的 lifecycle 规则是否完好。`);
+      }
+      failure = error.detail;
+      console.error(`\n${error.message}`);
       code = 2;
     }
   }
@@ -283,7 +264,7 @@ async function main(argv: string[]): Promise<number> {
     console.log(
       JSON.stringify(
         {
-          ...toJson(state, prefix),
+          ...toJson(planned),
           expireDays,
           written,
           verified,
@@ -317,23 +298,22 @@ function keepNote(build: KeptBuild): string {
   return build.source ? `${KEEP_NOTE[build.reason]}（${build.source}）` : KEEP_NOTE[build.reason];
 }
 
-function printPlan(state: RunState, bucket: string, prefix: string): void {
-  const { plan } = state;
-  console.log(`bucket: ${bucket}    前缀: ${normalizePrefix(prefix) || "（bucket 根）"}`);
-  if (state.onlineBuildId) {
-    console.log(`线上 BUILD_ID: ${state.onlineBuildId}  （读自 ${state.probedFrom}）`);
+function printPlan(plan: PrunePlanSummary): void {
+  console.log(`bucket: ${plan.bucket}    前缀: ${normalizePrefix(plan.prefix) || "（bucket 根）"}`);
+  if (plan.onlineBuildId) {
+    console.log(`线上 BUILD_ID: ${plan.onlineBuildId}  （读自 ${plan.probedFrom}）`);
   }
   // 同时给了 --url 与 --worker 时，最新 deployment 里还可能有别的线上 build（灰度）
-  const fromDeployment = onlineBuildIds(plan).filter((id) => id !== state.onlineBuildId);
+  const fromDeployment = plan.onlineBuildIds.filter((id) => id !== plan.onlineBuildId);
   if (fromDeployment.length > 0) {
     console.log(
-      `${state.onlineBuildId ? "另有" : ""}线上 BUILD_ID: ${fromDeployment.join(", ")}  （读自最新的 deployment）`,
+      `${plan.onlineBuildId ? "另有" : ""}线上 BUILD_ID: ${fromDeployment.join(", ")}  （读自最新的 deployment）`,
     );
   }
-  if (state.cloudflare) {
+  if (plan.cloudflare) {
     console.log(
-      `Cloudflare：翻看了最近 ${state.cloudflare.deploymentsScanned} 次部署，` +
-        `共 ${state.cloudflare.previews} 个预览`,
+      `Cloudflare：翻看了最近 ${plan.cloudflare.deploymentsScanned} 次部署，` +
+        `共 ${plan.cloudflare.previews} 个预览`,
     );
   }
 
@@ -374,25 +354,16 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   }
 }
 
-/**
- * 此刻承载线上流量的全部 build：--url 探测到的加上最新 deployment 里的。online 优先级最高、
- * 又必须在 bucket 里（--force 硬留的也在 keep 里），所以保留集里 reason 为 online 的就是全部。
- */
-function onlineBuildIds(plan: PrunePlan): string[] {
-  return plan.keep.filter((b) => b.reason === "online").map((b) => b.buildId);
-}
-
-function toJson(state: RunState, prefix: string) {
-  const { plan } = state;
-  const online = onlineBuildIds(plan);
+function toJson(plan: PrunePlanSummary) {
+  const online = plan.onlineBuildIds;
   return {
-    prefix,
+    prefix: plan.prefix,
     // 只走 --worker 时也要有值；灰度中线上不止一个 build，单个字段说不清，看 onlineBuildIds
-    onlineBuildId: state.onlineBuildId ?? (online.length === 1 ? online[0] : null),
+    onlineBuildId: plan.onlineBuildId ?? (online.length === 1 ? online[0] : null),
     onlineBuildIds: online,
-    cloudflare: state.cloudflare,
+    cloudflare: plan.cloudflare,
     // 运行前就已对整个 bucket 生效的自有规则（前缀为空），非空时需要人工确认它们已被改写
-    wholeBucketRules: state.wholeBucketRules,
+    wholeBucketRules: plan.wholeBucketRules,
     changed: plan.changed,
     // keep 仍是完整的保留集；其中不在 bucket 里的另见 absent
     keep: [...plan.keep, ...plan.absent],
@@ -413,12 +384,6 @@ async function confirm(): Promise<boolean> {
   }
 }
 
-function describe(error: unknown): string {
-  if (error instanceof S3Error) return error.message;
-  if (error instanceof CloudflareApiError) return `Cloudflare API ${error.code}: ${error.message}`;
-  return error instanceof Error ? error.message : String(error);
-}
-
 try {
   process.exitCode = await main(process.argv.slice(2));
 } catch (error) {
@@ -428,9 +393,10 @@ try {
     error instanceof BuildIdProbeError ||
     error instanceof XmlAssumptionError ||
     error instanceof CloudflareApiError ||
-    error instanceof S3Error
+    error instanceof S3Error ||
+    error instanceof PruneOptionsError
   ) {
-    console.error(describe(error));
+    console.error(describeError(error));
     process.exitCode = 1;
   } else {
     throw error;
