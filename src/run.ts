@@ -2,8 +2,8 @@ import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
 import { type KeptBuild, makePlan, type PrunePlan, type VerifyProblems, verifyWritten, wholeBucketRules } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
-import type { R2Store } from "./store.ts";
-import type { LifecycleDoc } from "./xml.ts";
+import { type R2Store, S3Error } from "./store.ts";
+import { type LifecycleDoc, XmlAssumptionError } from "./xml.ts";
 
 /**
  * 把「探测 → 列举 → 判定」串起来。与 cli.ts 分开是为了这一层不依赖任何 Node API：
@@ -59,6 +59,8 @@ export interface RunState {
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
   /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的自有规则的 buildId */
   wholeBucketRules: string[];
+  /** 写入前读到的 lifecycle 配置。写入报错时要拿它判断请求到底生效没有 */
+  lifecycle: LifecycleDoc;
   plan: PrunePlan;
 }
 
@@ -115,6 +117,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         ? { deploymentsScanned: recent.scanned, recentBuilds: recent.distinct, previews: previews.length }
         : null,
     wholeBucketRules: dangerous,
+    lifecycle: current,
     plan: makePlan({
       existing,
       keep: keeps,
@@ -308,19 +311,20 @@ async function mapWithConcurrency<T, R>(
 }
 
 export interface WriteResult {
-  /** 本工具规则回读后与期望不符的地方，空数组表示本工具的规则已按原样生效（或无从核对） */
+  /** 本工具规则回读后与期望不符的地方（写入报错时第一条是报错原因），空数组表示已按原样生效 */
   problems: string[];
   /**
    * 外部规则条数不符这类不影响本工具规则安全的问题，只提示、不触发撤销。撤销后回读发现的
    * 外部规则不符同样记在这里（以「撤销后」开头），它可能意味着用户的规则丢了。
    */
   warnings: string[];
-  /** 写入成功、但回读失败时的原因。此时无从核对，按「不符」处理并撤销 */
+  /** 回读失败时的原因。此时无从核对，按「不符」处理并撤销 */
   readBackError?: unknown;
   /**
-   * PUT 本身报了错（超时、重试耗尽的 5xx……），但请求可能已在服务端生效，所以仍回读核对：
-   * 与期望一致就当作已写入（problems 为空）；读到对整个 bucket 生效的自有规则就撤销。
-   * 其余情况（多半是没写进去）直接把这个错误抛给调用方，不会出现在返回值里。
+   * PUT 本身报了错，但请求可能已在服务端生效（超时、重试耗尽的 5xx……），所以仍回读核对：与期望
+   * 一致就当作已写入（problems 为空）；读回来仍是写入前的配置、且没有对整个 bucket 生效的自有规则，
+   * 或者写入被服务端明确拒绝、又读不回来，就把这个错误直接抛给调用方，不会出现在返回值里；
+   * 其余情况（读不回来、读到的既不是新配置也不是旧配置、旧配置里本就有整 bucket 规则）一律撤销。
    */
   writeError?: unknown;
   /**
@@ -330,6 +334,11 @@ export interface WriteResult {
   rolledBack: boolean | null;
   /** 撤销失败或无法确认的原因 */
   rollbackError?: unknown;
+  /**
+   * 本次的新规则是否（可能）留在了 bucket 上：核对一致为 true；撤销并确认后为 false；撤销失败时，
+   * 能确认写入根本没生效（写入报错、读回来仍是写入前的配置）为 false，否则按「可能还在」报 true。
+   */
+  written: boolean;
 }
 
 export interface VerifyOptions {
@@ -374,13 +383,25 @@ function message(error: unknown): string {
 }
 
 /**
+ * 写入是否被明确拒绝、不会生效：请求根本没发出去（渲染配置时就失败），或者服务端回了 4xx
+ * （429 限流除外，它会被重试）。这时不必等「读到新配置」，回读一次只为看看旧配置里有没有危险规则。
+ */
+function isRejected(error: unknown): boolean {
+  if (error instanceof XmlAssumptionError) return true;
+  return error instanceof S3Error && error.status >= 400 && error.status < 500 && error.status !== 429;
+}
+
+/**
  * 写入规则，再读回来逐条核对。本工具的规则对不上、或根本读不回来时，立即重写一份只含外部规则的
  * 配置把本工具的规则全部撤掉 —— 一条前缀被服务端丢掉的删除规则会作用于整个 bucket，不能让它
  * 留在那里等人发现。撤销同样要读回来确认，否则「已撤销」只是一句没有根据的保证。
+ *
+ * before 是写入前读到的配置：写入报错时，回读结果与它一致才能说明请求没有生效。
  */
 export async function writeAndVerify(
   store: R2Store,
   doc: LifecycleDoc,
+  before: LifecycleDoc,
   opts: VerifyOptions = {},
 ): Promise<WriteResult> {
   let writeError: unknown;
@@ -389,29 +410,39 @@ export async function writeAndVerify(
   } catch (error) {
     writeError = error;
   }
-  const check = await readBack(store, doc, opts);
+  const failed = writeError !== undefined;
+  const rejected = failed && isRejected(writeError);
+  const check = await readBack(store, doc, rejected ? { ...opts, readBackAttempts: 1 } : opts);
 
-  if (writeError !== undefined) {
-    // 写入报错不等于没写进去（比如响应在路上丢了）。回读与期望一致就是已生效；读到对整个 bucket
-    // 生效的自有规则（不论是这次写坏的还是原本就有的）必须撤；其余多半是旧配置原封未动，照常报写入失败
-    if ("error" in check) throw writeError;
-    if (check.problems.own.length === 0) {
-      return { problems: [], warnings: check.problems.foreign, rolledBack: null, writeError };
-    }
-    if (wholeBucketRules(check.actual).length === 0) throw writeError;
-  } else if ("problems" in check && check.problems.own.length === 0) {
-    return { problems: [], warnings: check.problems.foreign, rolledBack: null };
+  if ("problems" in check && check.problems.own.length === 0) {
+    return {
+      problems: [],
+      warnings: check.problems.foreign,
+      rolledBack: null,
+      written: true,
+      ...(failed ? { writeError } : {}),
+    };
   }
 
-  const writeNote = writeError === undefined ? [] : [`写入请求报错：${message(writeError)}`];
+  // 写入报错时先判断它到底生效没有。读回来仍是写入前的配置，就是没写进去：旧配置里没有危险规则
+  // 就照常报写入失败；有就照样撤销。读回来既不是新的也不是旧的（比如生效了但被服务端改写），
+  // 或者读不回来、无从判断，都必须按核对不符撤销 —— 不能因为 PUT 报了错就当作什么都没发生。
+  let unchanged = false;
+  if (failed) {
+    if ("error" in check) {
+      if (rejected) throw writeError;
+    } else if (verifyWritten(before, check.actual).own.length === 0) {
+      unchanged = true;
+      if (wholeBucketRules(check.actual).length === 0) throw writeError;
+    }
+  }
+
+  const writeNote = failed ? [`写入请求报错：${message(writeError)}`] : [];
   const base =
     "error" in check
-      ? { problems: [], warnings: [], readBackError: check.error }
-      : {
-          problems: [...writeNote, ...check.problems.own],
-          warnings: check.problems.foreign,
-          ...(writeError === undefined ? {} : { writeError }),
-        };
+      ? { problems: writeNote, warnings: [], readBackError: check.error }
+      : { problems: [...writeNote, ...check.problems.own], warnings: check.problems.foreign };
+  const failure = { ...base, ...(failed ? { writeError } : {}), written: !unchanged };
 
   // 外部规则用写入前读到、本次原样搬运的那份，而不是回读到的：被服务端改掉 ID 的自有规则会被
   // 认成外部规则，照着回读结果写回去就等于把它留下了；回读残缺时还会把用户的规则一并弄丢。
@@ -419,12 +450,12 @@ export async function writeAndVerify(
   try {
     await store.putLifecycle(rollbackDoc);
   } catch (rollbackError) {
-    return { ...base, rolledBack: false, rollbackError };
+    return { ...failure, rolledBack: false, rollbackError };
   }
   const after = await readBack(store, rollbackDoc, opts);
   if ("error" in after) {
     return {
-      ...base,
+      ...failure,
       rolledBack: false,
       rollbackError: new Error(`撤销已写入，但回读确认失败：${message(after.error)}`),
     };
@@ -433,11 +464,11 @@ export async function writeAndVerify(
   const warnings = [...base.warnings, ...after.problems.foreign.map((warning) => `撤销后${warning}`)];
   if (after.problems.own.length > 0) {
     return {
-      ...base,
+      ...failure,
       warnings,
       rolledBack: false,
       rollbackError: new Error(`撤销后读回来仍有本工具的规则：${after.problems.own.join("；")}`),
     };
   }
-  return { ...base, warnings, rolledBack: true };
+  return { ...failure, warnings, rolledBack: true, written: false };
 }

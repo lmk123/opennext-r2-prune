@@ -116,6 +116,8 @@ describe("parseLifecycle", () => {
         prefix: "",
         expireDays: 1,
         enabled: true,
+        // 原值留着只为报警告时说清读到了什么
+        barePrefix: "incremental-cache/b2/",
       },
     ]);
   });

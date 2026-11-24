@@ -4,7 +4,7 @@ import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
-import { XmlAssumptionError } from "../src/xml.ts";
+import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
 
 /**
  * 端到端串一遍，重点盯住一件事：任何一条安全校验没过时，
@@ -640,15 +640,36 @@ const DOC = {
   own: [{ buildId: "old1", prefix: "incremental-cache/old1/", expireDays: 1, enabled: true }],
   foreign: [FOREIGN],
 };
+/** statefulR2 里初始的配置：只有一条外部规则 */
+const BEFORE: LifecycleDoc = { own: [], foreign: [FOREIGN] };
 const NO_WAIT = { sleep: async () => {} };
+
+/** 按脚本依次返回结果的假 store，用来覆盖 HTTP 层不好模拟的情况（超时后照样生效、读超时等） */
+function scriptedStore(script: { puts: Array<Error | null>; gets: Array<LifecycleDoc | Error> }) {
+  const putDocs: LifecycleDoc[] = [];
+  let gets = 0;
+  const store = {
+    async putLifecycle(doc: LifecycleDoc) {
+      const error = script.puts[putDocs.length];
+      putDocs.push(doc);
+      if (error) throw error;
+    },
+    async getLifecycle() {
+      const next = script.gets[Math.min(gets++, script.gets.length - 1)]!;
+      if (next instanceof Error) throw next;
+      return structuredClone(next);
+    },
+  } as unknown as R2Store;
+  return { store, putDocs, getCount: () => gets };
+}
 const dropOwnPrefix = (xml: string) =>
   xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, "");
 
 describe("writeAndVerify", () => {
   it("回读一致时只写一次", async () => {
     const { puts, store } = statefulR2();
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
-    expect(result).toEqual({ problems: [], warnings: [], rolledBack: null });
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
+    expect(result).toEqual({ problems: [], warnings: [], rolledBack: null, written: true });
     expect(puts).toHaveLength(1);
   });
 
@@ -656,7 +677,7 @@ describe("writeAndVerify", () => {
     const before = "<LifecycleConfiguration><Rule>" + FOREIGN + "</Rule></LifecycleConfiguration>";
     const sleeps: number[] = [];
     const { puts, store } = statefulR2({ mangle: (xml, i) => (i === 0 ? before : xml) });
-    const result = await writeAndVerify(store, DOC, {
+    const result = await writeAndVerify(store, DOC, BEFORE, {
       sleep: async (ms) => void sleeps.push(ms),
       readBackDelayMs: 10,
     });
@@ -668,7 +689,7 @@ describe("writeAndVerify", () => {
   it("服务端丢掉前缀时报出问题，撤掉本工具的全部规则、保留外部规则，并回读确认撤销", async () => {
     // 模拟实测到的 R2 行为：规则里的前缀被丢掉，删除规则变成作用于整个 bucket
     const { puts, store, getCount } = statefulR2({ mangle: dropOwnPrefix });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(true);
     expect(result.problems.join()).toContain("作用于整个 bucket");
     expect(puts).toHaveLength(2);
@@ -682,7 +703,7 @@ describe("writeAndVerify", () => {
     const { puts, store } = statefulR2({
       mangle: (xml) => dropOwnPrefix(xml).replace("<ID>opennext-r2-prune:old1</ID>", "<ID>renamed</ID>"),
     });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.problems).toContain("规则 old1 读回来不见了");
     expect(result.rolledBack).toBe(true);
     expect(puts[1]).not.toContain("renamed");
@@ -691,7 +712,7 @@ describe("writeAndVerify", () => {
 
   it("撤销也失败时如实报告", async () => {
     const { store } = statefulR2({ mangle: dropOwnPrefix, failSecondPut: true });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(false);
     expect(result.rollbackError).toBeDefined();
   });
@@ -702,25 +723,26 @@ describe("writeAndVerify", () => {
       mangle: (xml, i) =>
         i < 3 ? dropOwnPrefix(xml) : "<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
     });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(false);
     expect(String(result.rollbackError)).toContain("撤销后读回来仍有本工具的规则");
   });
 
   it("写入成功但回读失败时无从核对，照样撤销", async () => {
     const { puts, store } = statefulR2({ failGetAfterPut: 0 });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.readBackError).toBeDefined();
     expect(puts).toHaveLength(2);
     expect(puts[1]).not.toContain("opennext-r2-prune:");
-    // 撤销之后也读不回来，无法确认
+    // 撤销之后也读不回来，无法确认；写入本身是成功的，新规则可能还在
     expect(result.rolledBack).toBe(false);
+    expect(result.written).toBe(true);
     expect(String(result.rollbackError)).toContain("回读确认失败");
   });
 
   it("只有外部规则条数不符时只给提示，不撤销本工具的规则", async () => {
     const { puts, store } = statefulR2({ mangle: (xml) => xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "") });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBeNull();
     expect(result.problems).toEqual([]);
     expect(result.warnings).toEqual(["外部规则写入 1 条，读回来 0 条"]);
@@ -729,7 +751,7 @@ describe("writeAndVerify", () => {
 
   it("本工具的规则已核对一致时，不因外部规则不符而重读", async () => {
     const { store, getCount } = statefulR2({ mangle: (xml) => xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "") });
-    await writeAndVerify(store, DOC, NO_WAIT);
+    await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(getCount()).toBe(1);
   });
 
@@ -737,14 +759,14 @@ describe("writeAndVerify", () => {
     const { store } = statefulR2({
       mangle: (xml, i) => (i < 3 ? dropOwnPrefix(xml) : xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "")),
     });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(true);
     expect(result.warnings).toContain("撤销后外部规则写入 1 条，读回来 0 条");
   });
 
   it("写入请求报错但其实已生效时，回读一致就当作已写入", async () => {
     const { puts, store } = statefulR2({ firstPutError: "applied" });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.problems).toEqual([]);
     expect(result.rolledBack).toBeNull();
     expect(result.writeError).toBeInstanceOf(S3Error);
@@ -752,14 +774,66 @@ describe("writeAndVerify", () => {
   });
 
   it("写入请求报错且读回来仍是旧配置时，照常报写入失败，不撤销", async () => {
-    const { puts, store } = statefulR2({ firstPutError: "rejected" });
-    await expect(writeAndVerify(store, DOC, NO_WAIT)).rejects.toThrow(S3Error);
+    const { puts, store, getCount } = statefulR2({ firstPutError: "rejected" });
+    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(S3Error);
     expect(puts).toHaveLength(0);
+    // 4xx 是明确拒绝，读一次看看旧配置就够，不必等它「变成新配置」
+    expect(getCount()).toBe(1);
+  });
+
+  it("写入超时、读回来既不是新配置也不是旧配置时（生效了但被改写），照样撤销", async () => {
+    const mutated: LifecycleDoc = { own: [{ ...DOC.own[0]!, expireDays: 30 }], foreign: [FOREIGN] };
+    const { store, putDocs, getCount } = scriptedStore({
+      puts: [new Error("网络超时"), null],
+      gets: [mutated, mutated, mutated, BEFORE],
+    });
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
+    expect(result.problems[0]).toContain("写入请求报错：网络超时");
+    expect(result.problems.join()).toContain("过期天数");
+    expect(result.rolledBack).toBe(true);
+    expect(result.written).toBe(false);
+    expect(putDocs[1]).toEqual({ own: [], foreign: [FOREIGN] });
+    // 不是明确拒绝，照常按「刚写完可能读到旧配置」重读满 3 次，撤销后再读 1 次
+    expect(getCount()).toBe(4);
+  });
+
+  it("写入超时且读不回来时无从判断，照样撤销，报错里同时写明两个原因", async () => {
+    const { store, putDocs } = scriptedStore({
+      puts: [new Error("网络超时"), null],
+      gets: [new Error("读取超时"), BEFORE],
+    });
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
+    expect(result.problems).toEqual(["写入请求报错：网络超时"]);
+    expect(String(result.readBackError)).toContain("读取超时");
+    expect(result.rolledBack).toBe(true);
+    expect(putDocs).toHaveLength(2);
+  });
+
+  it("写入被明确拒绝且读不回来时，照常报写入失败，不撤销", async () => {
+    const { store, putDocs } = scriptedStore({
+      puts: [new S3Error("putLifecycle", 403, "AccessDenied", "Access Denied")],
+      gets: [new Error("读取超时")],
+    });
+    await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(S3Error);
+    expect(putDocs).toHaveLength(1);
+  });
+
+  it("写入被拒、旧配置里本有整 bucket 规则、撤销也失败时，不把旧规则算成本次写入", async () => {
+    const dangerous: LifecycleDoc = {
+      own: [{ buildId: "old1", prefix: "", expireDays: 1, enabled: true }],
+      foreign: [FOREIGN],
+    };
+    const denied = () => new S3Error("putLifecycle", 403, "AccessDenied", "Access Denied");
+    const { store, getCount } = scriptedStore({ puts: [denied(), denied()], gets: [dangerous] });
+    const result = await writeAndVerify(store, DOC, dangerous, NO_WAIT);
+    expect(result.rolledBack).toBe(false);
+    expect(result.written).toBe(false);
+    expect(getCount()).toBe(1);
   });
 
   it("写入请求报错、读回来却有对整个 bucket 生效的规则时，照样撤销", async () => {
     const { puts, store } = statefulR2({ firstPutError: "applied", mangle: dropOwnPrefix });
-    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.problems[0]).toContain("写入请求报错");
     expect(result.problems.join()).toContain("作用于整个 bucket");
     expect(result.rolledBack).toBe(true);

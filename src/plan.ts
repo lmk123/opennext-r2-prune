@@ -144,13 +144,14 @@ export function makePlan(input: PlanInput): PrunePlan {
 
   // 已经空掉的目录说明 R2 删完了，规则可以回收；重新上线的 build 必须立刻摘掉规则，
   // 否则它新写入的缓存会被这条残留规则继续删（Next.js 16.2+ 的确定性 build id 会撞上）
-  const reclaim: ReclaimedRule[] = current.own
-    .filter((rule) => !existingSet.has(rule.buildId) || keepMap.has(rule.buildId))
-    .map((rule) => ({
-      buildId: rule.buildId,
+  // 按 buildId 去重：同一个 build 有多条规则时，回收的是这个 build，它的规则写回时会一并消失
+  const reclaim: ReclaimedRule[] = [...new Set(current.own.map((rule) => rule.buildId))]
+    .filter((buildId) => !existingSet.has(buildId) || keepMap.has(buildId))
+    .map((buildId) => ({
+      buildId,
       // 不在 bucket 里的 build 没什么可「复活」的，哪怕它在保留集里（预览 / 历史 build，
       // 或 --force 硬留的），目录空了就是空了；留下的规则按过滤条件必然属于保留集
-      reason: existingSet.has(rule.buildId) ? ("revived" as const) : ("emptied" as const),
+      reason: existingSet.has(buildId) ? ("revived" as const) : ("emptied" as const),
     }));
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
@@ -240,7 +241,12 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
     if (rules.length > 1) own.push(`规则 ${want.buildId} 读回来有 ${rules.length} 条`);
     for (const got of rules) {
       if (got.prefix !== want.prefix) {
-        const shown = got.prefix === "" ? "空（作用于整个 bucket！）" : got.prefix;
+        const shown =
+          got.prefix !== ""
+            ? got.prefix
+            : got.barePrefix
+              ? `空，只有 R2 不认的裸 <Prefix>${got.barePrefix}（按作用于整个 bucket 对待！）`
+              : "空（作用于整个 bucket！）";
         own.push(`规则 ${want.buildId} 的前缀读回来是 ${shown}，应为 ${want.prefix}`);
       }
       if (got.expireDays !== want.expireDays) {
@@ -262,7 +268,10 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
   return { own, foreign };
 }
 
-/** 启用中、前缀为空的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是这样）。 */
+/**
+ * 启用中、没有 <Filter><Prefix> 的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是
+ * 这样）。读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
+ */
 export function wholeBucketRules(doc: LifecycleDoc): string[] {
   return doc.own.filter((rule) => rule.enabled && rule.prefix === "").map((rule) => rule.buildId);
 }

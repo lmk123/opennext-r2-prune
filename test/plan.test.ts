@@ -105,6 +105,19 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual(["old1", "old2"]);
   });
 
+  it("同一个 build 有多条规则时，回收只列一次", () => {
+    const plan = makePlan(
+      input({
+        current: withRules([ownRule("gone"), ownRule("gone", { prefix: "" }), ownRule("online1"), ownRule("online1")]),
+      }),
+    );
+    expect(plan.reclaim).toEqual([
+      { buildId: "gone", reason: "emptied" },
+      { buildId: "online1", reason: "revived" },
+    ]);
+    expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual(["old1", "old2"]);
+  });
+
   it("重新上线的 build，其残留规则被立即摘除", () => {
     const plan = makePlan(
       input({
@@ -326,6 +339,17 @@ describe("verifyWritten", () => {
 
   it("只有外部规则条数不符时，本工具的规则没有问题", () => {
     expect(verifyWritten(doc, { ...structuredClone(doc), foreign: [] }).own).toEqual([]);
+  });
+});
+
+describe("verifyWritten 报出裸 Prefix", () => {
+  it("读回来只有裸 <Prefix> 时如实写出原值，并仍按整个 bucket 对待", () => {
+    const doc = { own: [ownRule("old1")], foreign: [] };
+    const actual = { own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })], foreign: [] };
+    expect(verifyWritten(doc, actual).own).toEqual([
+      "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
+    ]);
+    expect(wholeBucketRules(actual)).toEqual(["old1"]);
   });
 });
 

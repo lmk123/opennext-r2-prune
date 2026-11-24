@@ -84,6 +84,11 @@ export interface OwnRule {
   expireDays: number;
   /** <Status> 是否为 Enabled */
   enabled: boolean;
+  /**
+   * 没有 <Filter><Prefix>、却有直接挂在 <Rule> 下的裸 <Prefix> 时记下它的原值。R2 不认这种写法，
+   * 规则仍按前缀为空（作用于整个 bucket）对待；留下原值只为报警告时如实说明读到了什么。
+   */
+  barePrefix?: string;
 }
 
 export interface LifecycleDoc {
@@ -116,13 +121,16 @@ export function parseLifecycle(xml: string): LifecycleDoc {
     // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
     // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
     const filter = text(block, "Filter");
-    const prefix = (filter === undefined ? undefined : text(filter, "Prefix")) ?? "";
+    const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
+    // Filter 里没有 Prefix 时，块里能找到的 <Prefix> 只可能直接挂在 <Rule> 下
+    const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
     const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
     own.push({
       buildId,
-      prefix: assertLiteral(prefix, "规则中的 Prefix"),
+      prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
       expireDays: Number.isInteger(days) && days > 0 ? days : 0,
       enabled: text(block, "Status")?.trim() === "Enabled",
+      ...(barePrefix ? { barePrefix: assertLiteral(barePrefix, "规则中的裸 Prefix") } : {}),
     });
   }
 

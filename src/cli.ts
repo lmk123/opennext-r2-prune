@@ -183,7 +183,8 @@ async function main(argv: string[]): Promise<number> {
     // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
     onWholeBucketRules: (buildIds) =>
       console.error(
-        `\n⚠️ 警告：bucket 上有 ${buildIds.length} 条本工具的规则没有前缀，正对整个 bucket 生效：` +
+        `\n⚠️ 警告：bucket 上有 ${buildIds.length} 条本工具的规则没有 <Filter><Prefix> 前缀` +
+          `（缺失，或只有 R2 不认的裸 <Prefix>），会对整个 bucket 生效：` +
           `${buildIds.map((id) => `opennext-r2-prune:${id}`).join(", ")}。\n` +
           `R2 会按它删掉 bucket 里的全部对象。本次运行写入成功即会把它改写；若本次中止或只是 --dry-run，` +
           `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 核对并手动删除这些规则。`,
@@ -204,7 +205,10 @@ async function main(argv: string[]): Promise<number> {
     );
   }
 
-  /** 本次的新规则是否留在了 bucket 上：核对不过但已撤销确认时为 false，撤销失败时为 true（可能还在） */
+  /**
+   * 本次的新规则是否留在了 bucket 上：核对不过但已撤销确认时为 false；撤销失败时为 true（可能还在），
+   * 除非能确认写入本身就没生效
+   */
   let written = false;
   /** 写入后回读核对是否一致：没有写入时为 null；读不回来、无从核对也算 false */
   let verified: boolean | null = null;
@@ -228,7 +232,7 @@ async function main(argv: string[]): Promise<number> {
     note("已取消。");
   } else {
     try {
-      const result = await writeAndVerify(store, plan.nextDoc);
+      const result = await writeAndVerify(store, plan.nextDoc, state.lifecycle);
       warnings = result.warnings;
       if (result.readBackError === undefined && result.problems.length === 0) {
         written = true;
@@ -242,12 +246,12 @@ async function main(argv: string[]): Promise<number> {
         const added = plan.expire.filter((b) => b.state === "new").length;
         const updated = plan.expire.filter((b) => b.state === "updated").length;
         note(
-          `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 条。` +
+          `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 个 build 的规则。` +
             `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
         );
       } else {
-        // 撤销成功时本次的规则已不在 bucket 上；撤销失败时它们可能还在，按「已写入」报
-        written = result.rolledBack !== true;
+        // 撤销成功、或能确认写入根本没生效时为 false；其余撤销失败的情况下新规则可能还在，按「已写入」报
+        written = result.written;
         verified = false;
         rolledBack = result.rolledBack;
         for (const warning of warnings) {
@@ -255,7 +259,7 @@ async function main(argv: string[]): Promise<number> {
         }
         const reason =
           result.readBackError !== undefined
-            ? [`写入后读不回配置，无从核对：${describe(result.readBackError)}`]
+            ? [...result.problems, `写入后读不回配置，无从核对：${describe(result.readBackError)}`]
             : result.problems;
         failure = `写入后回读核对失败：${reason.join("；")}`;
         const rollback = result.rolledBack
@@ -356,7 +360,7 @@ function printPlan(state: RunState, bucket: string, prefix: string): void {
   const emptied = plan.reclaim.filter((r) => r.reason === "emptied");
 
   if (emptied.length > 0) {
-    console.log(`\n回收 ${emptied.length} 条已完成的规则：`);
+    console.log(`\n回收 ${emptied.length} 个 build 的已完成规则：`);
     for (const rule of emptied) console.log(`  回收  ${rule.buildId}  目录已空`);
   }
 
