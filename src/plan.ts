@@ -23,7 +23,7 @@ const KEEP_PRIORITY: KeepReason[] = ["online", "recent", "preview", "explicit"];
  */
 const MAY_BE_ABSENT: ReadonlySet<KeepReason> = new Set(["recent", "preview"]);
 export type ReclaimReason = "emptied" | "revived";
-/** new = 本次新增；updated = 已有规则但内容与期望不符，要改写；pending = 已是期望的样子，R2 还在删 */
+/** new = 本次新增；updated = 已有规则但内容与期望不符（或有重复），要改写；pending = 已是期望的样子，R2 还在删 */
 export type ExpireState = "new" | "updated" | "pending";
 
 export interface KeptBuild {
@@ -133,7 +133,14 @@ export function makePlan(input: PlanInput): PrunePlan {
     );
   }
 
-  const currentById = new Map(current.own.map((rule) => [rule.buildId, rule]));
+  // 同一个 buildId 有多条规则（比如一条正确、一条前缀被丢掉）时，Map 只能留下其中一条，
+  // 拿它判状态会把要改写的显示成「已存在」，所以单独记下，一律算 updated
+  const currentById = new Map<string, OwnRule>();
+  const duplicated = new Set<string>();
+  for (const rule of current.own) {
+    if (currentById.has(rule.buildId)) duplicated.add(rule.buildId);
+    currentById.set(rule.buildId, rule);
+  }
 
   // 已经空掉的目录说明 R2 删完了，规则可以回收；重新上线的 build 必须立刻摘掉规则，
   // 否则它新写入的缓存会被这条残留规则继续删（Next.js 16.2+ 的确定性 build id 会撞上）
@@ -169,7 +176,7 @@ export function makePlan(input: PlanInput): PrunePlan {
     absent,
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,
-      state: expireState(currentById.get(rule.buildId), rule),
+      state: duplicated.has(rule.buildId) ? "updated" : expireState(currentById.get(rule.buildId), rule),
     })),
     reclaim,
     nextDoc: { own: nextOwn, foreign: current.foreign },

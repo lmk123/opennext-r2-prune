@@ -3,7 +3,7 @@ import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
-import { R2Store } from "../src/store.ts";
+import { R2Store, S3Error } from "../src/store.ts";
 import { XmlAssumptionError } from "../src/xml.ts";
 
 /**
@@ -603,13 +603,23 @@ function statefulR2(
     /** 第几次 PUT（从 0 起）起，之后的 GET 全部失败 */
     failGetAfterPut?: number;
     failSecondPut?: boolean;
+    /** 第一次 PUT 报错；applied = 报错前其实已经写进去了（比如响应在路上丢了） */
+    firstPutError?: "applied" | "rejected";
   } = {},
 ) {
   const puts: string[] = [];
   let gets = 0;
+  let putCalls = 0;
   let stored = "<LifecycleConfiguration><Rule><ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
   const fetchImpl = (async (request: Request) => {
     if (request.method === "PUT") {
+      if (opts.firstPutError && putCalls++ === 0) {
+        if (opts.firstPutError === "applied") {
+          puts.push(await request.text());
+          stored = puts[puts.length - 1]!;
+        }
+        return new Response("<Error><Code>RequestTimeout</Code></Error>", { status: 400 });
+      }
       if (opts.failSecondPut && puts.length === 1) {
         return new Response("<Error><Code>InternalError</Code></Error>", { status: 400 });
       }
@@ -716,6 +726,46 @@ describe("writeAndVerify", () => {
     expect(result.warnings).toEqual(["外部规则写入 1 条，读回来 0 条"]);
     expect(puts).toHaveLength(1);
   });
+
+  it("本工具的规则已核对一致时，不因外部规则不符而重读", async () => {
+    const { store, getCount } = statefulR2({ mangle: (xml) => xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "") });
+    await writeAndVerify(store, DOC, NO_WAIT);
+    expect(getCount()).toBe(1);
+  });
+
+  it("撤销后读回来外部规则不符也要报出，不能只看本工具的规则", async () => {
+    const { store } = statefulR2({
+      mangle: (xml, i) => (i < 3 ? dropOwnPrefix(xml) : xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "")),
+    });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result.rolledBack).toBe(true);
+    expect(result.warnings).toContain("撤销后外部规则写入 1 条，读回来 0 条");
+  });
+
+  it("写入请求报错但其实已生效时，回读一致就当作已写入", async () => {
+    const { puts, store } = statefulR2({ firstPutError: "applied" });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result.problems).toEqual([]);
+    expect(result.rolledBack).toBeNull();
+    expect(result.writeError).toBeInstanceOf(S3Error);
+    expect(puts).toHaveLength(1);
+  });
+
+  it("写入请求报错且读回来仍是旧配置时，照常报写入失败，不撤销", async () => {
+    const { puts, store } = statefulR2({ firstPutError: "rejected" });
+    await expect(writeAndVerify(store, DOC, NO_WAIT)).rejects.toThrow(S3Error);
+    expect(puts).toHaveLength(0);
+  });
+
+  it("写入请求报错、读回来却有对整个 bucket 生效的规则时，照样撤销", async () => {
+    const { puts, store } = statefulR2({ firstPutError: "applied", mangle: dropOwnPrefix });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result.problems[0]).toContain("写入请求报错");
+    expect(result.problems.join()).toContain("作用于整个 bucket");
+    expect(result.rolledBack).toBe(true);
+    expect(puts).toHaveLength(2);
+    expect(puts[1]).not.toContain("opennext-r2-prune:");
+  });
 });
 
 describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
@@ -733,5 +783,23 @@ describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
     ).rejects.toThrow(PlanError);
     expect(seen).toEqual([["old1"]]);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("列目录失败时也先报出危险规则，再中止", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
+    const fetchImpl = (async (request: Request) =>
+      new URL(request.url).searchParams.has("lifecycle")
+        ? new Response(lifecycle)
+        : new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 })) as unknown as typeof fetch;
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({
+        store: new R2Store({ ...CREDS, fetchImpl }),
+        prefix: "incremental-cache",
+        keep: ["live"],
+        onWholeBucketRules: (ids) => void seen.push(ids),
+      }),
+    ).rejects.toThrow(S3Error);
+    expect(seen).toEqual([["old1"]]);
   });
 });

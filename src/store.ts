@@ -59,10 +59,11 @@ export class S3Error extends Error {
   /** R2 返回的原始错误信息，不含本工具补充的步骤与权限说明 */
   readonly detail: string;
 
-  constructor(operation: S3Operation, status: number, code: string, detail: string) {
+  /** context：补在原因后面的前情，比如「先试的 PUT 为什么被拒」 */
+  constructor(operation: S3Operation, status: number, code: string, detail: string, context?: string) {
     const reason = detail && detail !== code ? `${code}：${detail}` : code;
     const hint = status === 403 ? `\n${PERMISSION_HINT[operation]}` : "";
-    super(`${OPERATION_LABEL[operation]}失败（HTTP ${status}，${reason}）${hint}`);
+    super(`${OPERATION_LABEL[operation]}失败（HTTP ${status}，${reason}）${context ? `。${context}` : ""}${hint}`);
     this.name = "S3Error";
     this.operation = operation;
     this.status = status;
@@ -168,7 +169,20 @@ export class R2Store {
     } catch (error) {
       const empty = doc.own.length === 0 && doc.foreign.length === 0;
       if (!empty || !(error instanceof S3Error) || error.status !== 400) throw error;
-      await this.#request("deleteLifecycle", `${this.#base}?lifecycle`, { method: "DELETE" });
+      try {
+        await this.#request("deleteLifecycle", `${this.#base}?lifecycle`, { method: "DELETE" });
+      } catch (deleteError) {
+        // DELETE 的报错会盖住 PUT 被拒的原因，两步都失败时要一并说清
+        if (!(deleteError instanceof S3Error)) throw deleteError;
+        const putReason = error.detail && error.detail !== error.code ? `${error.code}：${error.detail}` : error.code;
+        throw new S3Error(
+          "deleteLifecycle",
+          deleteError.status,
+          deleteError.code,
+          deleteError.detail,
+          `此前 PUT 空配置被拒（HTTP ${error.status}，${putReason}），才改用 DELETE 清空`,
+        );
+      }
     }
   }
 }

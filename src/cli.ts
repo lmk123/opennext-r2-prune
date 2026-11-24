@@ -44,7 +44,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --verbose                    打印重试等额外信息
   --help, -h                   显示本帮助
 
-退出码：0 成功 / 1 参数或校验失败 / 2 写入规则失败`;
+退出码：0 成功 / 1 参数或校验失败 / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
 
 function parseCliArgs(argv: string[]) {
   return parseArgs({
@@ -204,6 +204,7 @@ async function main(argv: string[]): Promise<number> {
     );
   }
 
+  /** 本次的新规则是否留在了 bucket 上：核对不过但已撤销确认时为 false，撤销失败时为 true（可能还在） */
   let written = false;
   /** 写入后回读核对是否一致：没有写入时为 null；读不回来、无从核对也算 false */
   let verified: boolean | null = null;
@@ -228,13 +229,16 @@ async function main(argv: string[]): Promise<number> {
   } else {
     try {
       const result = await writeAndVerify(store, plan.nextDoc);
-      written = true;
       warnings = result.warnings;
-      for (const warning of warnings) {
-        console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
-      }
       if (result.readBackError === undefined && result.problems.length === 0) {
+        written = true;
         verified = true;
+        for (const warning of warnings) {
+          console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
+        }
+        if (result.writeError !== undefined) {
+          console.error(`\n注意：写入请求报错（${describe(result.writeError)}），但回读确认规则已按原样生效。`);
+        }
         const added = plan.expire.filter((b) => b.state === "new").length;
         const updated = plan.expire.filter((b) => b.state === "updated").length;
         note(
@@ -242,8 +246,13 @@ async function main(argv: string[]): Promise<number> {
             `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
         );
       } else {
+        // 撤销成功时本次的规则已不在 bucket 上；撤销失败时它们可能还在，按「已写入」报
+        written = result.rolledBack !== true;
         verified = false;
         rolledBack = result.rolledBack;
+        for (const warning of warnings) {
+          console.error(`\n注意：${warning}，请检查你自己的 lifecycle 规则是否完好。`);
+        }
         const reason =
           result.readBackError !== undefined
             ? [`写入后读不回配置，无从核对：${describe(result.readBackError)}`]
@@ -289,7 +298,7 @@ async function main(argv: string[]): Promise<number> {
 
 const EXPIRE_NOTE: Record<ExpireState, string> = {
   new: "新增规则",
-  updated: "改写规则（原规则与当前前缀 / 过期设置不符）",
+  updated: "改写规则（原规则与当前前缀 / 过期设置不符，或有重复）",
   pending: "规则已存在，R2 仍在删",
 };
 

@@ -150,6 +150,19 @@ describe("lifecycle", () => {
     expect(new URL(calls[1]!.url).searchParams.has("lifecycle")).toBe(true);
   });
 
+  it("退回的 DELETE 也失败时，报错里同时说明 PUT 被拒的原因", async () => {
+    const { fetchImpl } = stub([
+      ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 }),
+      ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    expect(error).toMatchObject({ operation: "deleteLifecycle", status: 403, code: "AccessDenied" });
+    expect(error.message).toContain("清空 lifecycle 规则失败（HTTP 403，AccessDenied）");
+    expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
+    expect(error.message).toContain("Admin Read & Write");
+  });
+
   it("配置不为空时 PUT 被拒就直接报错，不会退回 DELETE", async () => {
     const { calls, fetchImpl } = stub([ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 })]);
     const store = new R2Store({ ...CREDS, fetchImpl });

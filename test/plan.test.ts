@@ -166,6 +166,16 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.find((r) => r.buildId === "old1")!.prefix).toBe("incremental-cache/old1/");
   });
 
+  it("同一个 build 有重复规则时算改写，不会因 Map 留下的恰是正确那条而显示成仍在删", () => {
+    const plan = makePlan(
+      input({ current: withRules([ownRule("old1", { prefix: "" }), ownRule("old1"), ownRule("old2")]) }),
+    );
+    expect(plan.changed).toBe(true);
+    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("updated");
+    expect(plan.expire.find((b) => b.buildId === "old2")!.state).toBe("pending");
+    expect(plan.nextDoc.own.filter((r) => r.buildId === "old1")).toHaveLength(1);
+  });
+
   it("已有规则的前缀对不上当前 --prefix 时，改写而不是沿用", () => {
     const plan = makePlan(
       input({ current: withRules([ownRule("old1", { prefix: "old-cache/old1/" })]) }),
