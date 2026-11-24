@@ -74,7 +74,7 @@ export function parseListObjects(xml: string): ListObjectsResult {
  * 一条由本工具管理的规则。用户自有规则不会被解析成这个形状。
  *
  * 字段是完整的：判定层要拿它与「期望的样子」逐字段比对，才能发现选项变了
- * （比如换了 --expire-days 或 --lifecycle-style）需要重写。
+ * （比如换了 --prefix 或 --expire-days）需要重写。
  */
 export interface OwnRule {
   buildId: string;
@@ -82,10 +82,13 @@ export interface OwnRule {
   prefix: string;
   /** 过期天数。0 表示从现有配置里没解析出合法的 <Expiration><Days>，必然与期望值不等 */
   expireDays: number;
-  /** Prefix 的包装形式：包在 <Filter> 里还是直接挂在 <Rule> 下 */
-  style: "filter" | "bare";
   /** <Status> 是否为 Enabled */
   enabled: boolean;
+  /**
+   * 没有 <Filter><Prefix>、却有直接挂在 <Rule> 下的裸 <Prefix> 时记下它的原值。R2 不认这种写法，
+   * 规则仍按前缀为空（作用于整个 bucket）对待；留下原值只为报警告时如实说明读到了什么。
+   */
+  barePrefix?: string;
 }
 
 export interface LifecycleDoc {
@@ -115,17 +118,19 @@ export function parseLifecycle(xml: string): LifecycleDoc {
       continue;
     }
     const buildId = assertLiteral(id.slice(RULE_ID_PREFIX.length), "规则 ID 中的 buildId");
-    // Prefix 既可能直接挂在 Rule 下（老式），也可能包在 Filter 里（v2）
+    // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
+    // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
     const filter = text(block, "Filter");
     const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
-    const prefix = filterPrefix ?? text(block, "Prefix") ?? "";
+    // Filter 里没有 Prefix 时，块里能找到的 <Prefix> 只可能直接挂在 <Rule> 下
+    const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
     const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
     own.push({
       buildId,
-      prefix: assertLiteral(prefix, "规则中的 Prefix"),
+      prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
       expireDays: Number.isInteger(days) && days > 0 ? days : 0,
-      style: filterPrefix === undefined ? "bare" : "filter",
       enabled: text(block, "Status")?.trim() === "Enabled",
+      ...(barePrefix ? { barePrefix: assertLiteral(barePrefix, "规则中的裸 Prefix") } : {}),
     });
   }
 
@@ -145,15 +150,12 @@ export function renderLifecycle(doc: LifecycleDoc): string {
         `待写入规则 ${rule.buildId} 的过期天数不合法：${rule.expireDays}，S3 要求至少 1 天。`,
       );
     }
-    const prefixXml =
-      rule.style === "filter"
-        ? `<Filter><Prefix>${rule.prefix}</Prefix></Filter>`
-        : `<Prefix>${rule.prefix}</Prefix>`;
     return (
       `<Rule>` +
       `<ID>${ruleId(rule.buildId)}</ID>` +
       `<Status>${rule.enabled ? "Enabled" : "Disabled"}</Status>` +
-      prefixXml +
+      // 必须包在 <Filter> 里：R2 不认裸 <Prefix>，会悄悄把它丢掉，规则就变成删除整个 bucket
+      `<Filter><Prefix>${rule.prefix}</Prefix></Filter>` +
       `<Expiration><Days>${rule.expireDays}</Days></Expiration>` +
       `</Rule>`
     );

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix } from "../src/plan.ts";
+import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix, verifyWritten, wholeBucketRules } from "../src/plan.ts";
 import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
@@ -9,7 +9,6 @@ function input(overrides: Partial<PlanInput> = {}): PlanInput {
     current: { own: [], foreign: [] },
     prefix: "incremental-cache",
     expireDays: 1,
-    style: "filter",
     ...overrides,
   };
 }
@@ -20,7 +19,6 @@ function ownRule(buildId: string, overrides: Partial<OwnRule> = {}): OwnRule {
     buildId,
     prefix: `incremental-cache/${buildId}/`,
     expireDays: 1,
-    style: "filter",
     enabled: true,
     ...overrides,
   };
@@ -107,6 +105,19 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual(["old1", "old2"]);
   });
 
+  it("同一个 build 有多条规则时，回收只列一次", () => {
+    const plan = makePlan(
+      input({
+        current: withRules([ownRule("gone"), ownRule("gone", { prefix: "" }), ownRule("online1"), ownRule("online1")]),
+      }),
+    );
+    expect(plan.reclaim).toEqual([
+      { buildId: "gone", reason: "emptied" },
+      { buildId: "online1", reason: "revived" },
+    ]);
+    expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual(["old1", "old2"]);
+  });
+
   it("重新上线的 build，其残留规则被立即摘除", () => {
     const plan = makePlan(
       input({
@@ -160,27 +171,22 @@ describe("规则合并与回收", () => {
     expect(plan.nextDoc.own.every((r) => r.expireDays === 7)).toBe(true);
   });
 
-  it("已有规则是 bare、本次要 filter，要改写", () => {
+  it("已有规则的前缀被服务端丢掉（读回为空）时改写", () => {
+    // 实测 R2 会静默丢掉裸 <Prefix>，读回来的规则没有前缀、实际作用于整个 bucket
+    const plan = makePlan(input({ current: withRules([ownRule("old1", { prefix: "" })]) }));
+    expect(plan.changed).toBe(true);
+    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("updated");
+    expect(plan.nextDoc.own.find((r) => r.buildId === "old1")!.prefix).toBe("incremental-cache/old1/");
+  });
+
+  it("同一个 build 有重复规则时算改写，不会因 Map 留下的恰是正确那条而显示成仍在删", () => {
     const plan = makePlan(
-      input({ current: withRules([ownRule("old1", { style: "bare" })]), style: "filter" }),
+      input({ current: withRules([ownRule("old1", { prefix: "" }), ownRule("old1"), ownRule("old2")]) }),
     );
     expect(plan.changed).toBe(true);
     expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("updated");
-    expect(plan.nextDoc.own.every((r) => r.style === "filter")).toBe(true);
-  });
-
-  it("已有规则回读成 filter、本次要 bare 时不反复改写", () => {
-    // S3 的 GET 会把裸 <Prefix> 规范化成 <Filter><Prefix>，回读结果区分不出服务端
-    // 规范化与「上次就写的 filter」。若在这个方向上较真，--lifecycle-style bare
-    // 的每次运行都会重发一次 PUT，changed 永远为 true，收敛不了。
-    const current = withRules([ownRule("old1"), ownRule("old2")]);
-    const plan = makePlan(input({ current, style: "bare" }));
-    expect(plan.changed).toBe(false);
-    expect(plan.expire.find((b) => b.buildId === "old1")!.state).toBe("pending");
-    // 真要写的时候（别的字段变了）仍然按本次的式样写
-    const withOtherChange = makePlan(input({ current, style: "bare", expireDays: 7 }));
-    expect(withOtherChange.changed).toBe(true);
-    expect(withOtherChange.nextDoc.own.every((r) => r.style === "bare")).toBe(true);
+    expect(plan.expire.find((b) => b.buildId === "old2")!.state).toBe("pending");
+    expect(plan.nextDoc.own.filter((r) => r.buildId === "old1")).toHaveLength(1);
   });
 
   it("已有规则的前缀对不上当前 --prefix 时，改写而不是沿用", () => {
@@ -293,5 +299,66 @@ describe("多来源保留集", () => {
       ["typo", "recent"],
     ]);
     expect(plan.absent).toEqual([]);
+  });
+});
+
+describe("verifyWritten", () => {
+  const doc = { own: [ownRule("old1"), ownRule("old2")], foreign: ["<ID>mine</ID>"] };
+
+  it("读回来一致时没有问题", () => {
+    expect(verifyWritten(doc, structuredClone(doc))).toEqual({ own: [], foreign: [] });
+  });
+
+  it("前缀被丢掉、天数或状态不符、规则缺失或多出，都记为本工具规则的问题；外部规则条数单独列出", () => {
+    const actual = {
+      own: [ownRule("old1", { prefix: "", expireDays: 2, enabled: false }), ownRule("extra")],
+      foreign: [],
+    };
+    expect(verifyWritten(doc, actual)).toEqual({
+      own: [
+        "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
+        "规则 old1 的过期天数读回来是 2，应为 1",
+        "规则 old1 的状态读回来是 停用，应为 启用",
+        "规则 old2 读回来不见了",
+        "读回来多出一条本工具的规则 extra",
+      ],
+      foreign: ["外部规则写入 1 条，读回来 0 条"],
+    });
+  });
+
+  it("同一个 buildId 读回来多条时逐条核对，危险的那条不会被正确的那条盖住", () => {
+    const actual = {
+      own: [ownRule("old1", { prefix: "" }), ownRule("old1"), ownRule("old2")],
+      foreign: ["<ID>mine</ID>"],
+    };
+    expect(verifyWritten(doc, actual).own).toEqual([
+      "规则 old1 读回来有 2 条",
+      "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
+    ]);
+  });
+
+  it("只有外部规则条数不符时，本工具的规则没有问题", () => {
+    expect(verifyWritten(doc, { ...structuredClone(doc), foreign: [] }).own).toEqual([]);
+  });
+});
+
+describe("verifyWritten 报出裸 Prefix", () => {
+  it("读回来只有裸 <Prefix> 时如实写出原值，并仍按整个 bucket 对待", () => {
+    const doc = { own: [ownRule("old1")], foreign: [] };
+    const actual = { own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })], foreign: [] };
+    expect(verifyWritten(doc, actual).own).toEqual([
+      "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
+    ]);
+    expect(wholeBucketRules(actual)).toEqual(["old1"]);
+  });
+});
+
+describe("wholeBucketRules", () => {
+  it("只挑出启用中、前缀为空的自有规则", () => {
+    const doc = {
+      own: [ownRule("ok"), ownRule("bad", { prefix: "" }), ownRule("off", { prefix: "", enabled: false })],
+      foreign: [],
+    };
+    expect(wholeBucketRules(doc)).toEqual(["bad"]);
   });
 });

@@ -29,17 +29,46 @@ export interface StoreOptions {
   onRetry?: OnRetry;
 }
 
+/** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
+export type S3Operation = "list" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
+
+const OPERATION_LABEL: Record<S3Operation, string> = {
+  list: "列出 build 目录",
+  getLifecycle: "读取 lifecycle 规则",
+  putLifecycle: "写入 lifecycle 规则",
+  deleteLifecycle: "清空 lifecycle 规则",
+};
+
+// R2 的 token 权限分 Object 级（可限定 bucket）与 Admin 级（整个账号）。lifecycle 是 bucket 级配置，
+// 实测 Object 级 token 不论只读还是读写，GET / PUT ?lifecycle 都返回 403 AccessDenied，只有 Admin 级能用。
+const PERMISSION_HINT: Record<S3Operation, string> = {
+  list: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
+  getLifecycle:
+    "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
+    "只跑 --dry-run 需要 Admin Read only，写入规则需要 Admin Read & Write。",
+  putLifecycle: "写入 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都写不了。",
+  deleteLifecycle: "清空 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都做不了。",
+};
+
 export class S3Error extends Error {
   // 显式声明字段而不用构造函数参数属性：那是 Node 的类型擦除模式跑不了的语法，
   // 而 package.json 的 start 脚本正是靠它直接跑源码
   readonly status: number;
   readonly code: string;
+  readonly operation: S3Operation;
+  /** R2 返回的原始错误信息，不含本工具补充的步骤与权限说明 */
+  readonly detail: string;
 
-  constructor(status: number, code: string, message: string) {
-    super(message);
+  /** context：补在原因后面的前情，比如「先试的 PUT 为什么被拒」 */
+  constructor(operation: S3Operation, status: number, code: string, detail: string, context?: string) {
+    const reason = detail && detail !== code ? `${code}：${detail}` : code;
+    const hint = status === 403 ? `\n${PERMISSION_HINT[operation]}` : "";
+    super(`${OPERATION_LABEL[operation]}失败（HTTP ${status}，${reason}）${context ? `。${context}` : ""}${hint}`);
     this.name = "S3Error";
+    this.operation = operation;
     this.status = status;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -59,7 +88,7 @@ export class R2Store {
     this.#base = `${opts.endpoint.replace(/\/+$/, "")}/${opts.bucket}`;
   }
 
-  async #request(url: string, init?: RequestInit): Promise<Response> {
+  async #request(operation: S3Operation, url: string, init?: RequestInit): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
     const response = await withRetry(
       async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
@@ -69,6 +98,7 @@ export class R2Store {
 
     const body = await response.text();
     throw new S3Error(
+      operation,
       response.status,
       extractCode(body) ?? String(response.status),
       parseErrorMessage(body),
@@ -91,7 +121,7 @@ export class R2Store {
       url.searchParams.set("delimiter", "/");
       if (token) url.searchParams.set("continuation-token", token);
 
-      const result = parseListObjects(await (await this.#request(url.toString())).text());
+      const result = parseListObjects(await (await this.#request("list", url.toString())).text());
       for (const commonPrefix of result.commonPrefixes) {
         const buildId = commonPrefix.slice(normalized.length).replace(/\/$/, "");
         if (buildId) found.push(buildId);
@@ -112,7 +142,7 @@ export class R2Store {
 
   async getLifecycle(): Promise<LifecycleDoc> {
     try {
-      const response = await this.#request(`${this.#base}?lifecycle`);
+      const response = await this.#request("getLifecycle", `${this.#base}?lifecycle`);
       return parseLifecycle(await response.text());
     } catch (error) {
       // 从未配过规则的 bucket 会返回 404 NoSuchLifecycleConfiguration，那是空配置不是错误
@@ -123,13 +153,37 @@ export class R2Store {
     }
   }
 
+  /**
+   * 整份覆盖 lifecycle 配置。一条规则都不剩时走清空：S3 规范不允许不含 <Rule> 的配置，
+   * 而 R2 文档既没写它对空配置的态度，也没把 DeleteBucketLifecycle 列为已支持。所以先按 PUT
+   * 试，被当成格式错误（400）拒掉再退回 DELETE。到底生效没有，由调用方的回读核对确认。
+   */
   async putLifecycle(doc: LifecycleDoc): Promise<void> {
     const body = renderLifecycle(doc);
     const headers: Record<string, string> = { "Content-Type": "application/xml" };
     const md5 = this.#opts.md5Base64?.(body);
     if (md5) headers["Content-MD5"] = md5;
 
-    await this.#request(`${this.#base}?lifecycle`, { method: "PUT", body, headers });
+    try {
+      await this.#request("putLifecycle", `${this.#base}?lifecycle`, { method: "PUT", body, headers });
+    } catch (error) {
+      const empty = doc.own.length === 0 && doc.foreign.length === 0;
+      if (!empty || !(error instanceof S3Error) || error.status !== 400) throw error;
+      try {
+        await this.#request("deleteLifecycle", `${this.#base}?lifecycle`, { method: "DELETE" });
+      } catch (deleteError) {
+        // DELETE 的报错会盖住 PUT 被拒的原因，两步都失败时要一并说清
+        if (!(deleteError instanceof S3Error)) throw deleteError;
+        const putReason = error.detail && error.detail !== error.code ? `${error.code}：${error.detail}` : error.code;
+        throw new S3Error(
+          "deleteLifecycle",
+          deleteError.status,
+          deleteError.code,
+          deleteError.detail,
+          `此前 PUT 空配置被拒（HTTP ${error.status}，${putReason}），才改用 DELETE 清空`,
+        );
+      }
+    }
   }
 }
 

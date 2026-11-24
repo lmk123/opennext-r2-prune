@@ -110,6 +110,66 @@ describe("lifecycle", () => {
     await expect(store.getLifecycle()).rejects.toThrow(S3Error);
   });
 
+  it("读 lifecycle 被拒时说明是哪一步、缺什么权限", async () => {
+    const { fetchImpl } = stub([
+      ok("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>", { status: 403 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = await store.getLifecycle().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(S3Error);
+    expect(error).toMatchObject({ operation: "getLifecycle", status: 403, code: "AccessDenied" });
+    expect((error as S3Error).message).toContain("读取 lifecycle 规则失败（HTTP 403，AccessDenied：Access Denied）");
+    expect((error as S3Error).message).toContain("Admin Read only");
+  });
+
+  it("写 lifecycle 被拒时提示需要 Admin Read & Write", async () => {
+    const { fetchImpl } = stub([ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 })]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    expect(error.message).toContain("写入 lifecycle 规则失败（HTTP 403，AccessDenied）");
+    expect(error.message).toContain("Admin Read & Write");
+  });
+
+  it("非 403 的错误不附加权限提示", async () => {
+    const { fetchImpl } = stub([
+      ok("<Error><Code>NoSuchBucket</Code><Message>bucket 不存在</Message></Error>", { status: 404 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = (await store.listBuildIds("incremental-cache").catch((e: unknown) => e)) as S3Error;
+    expect(error.message).toBe("列出 build 目录失败（HTTP 404，NoSuchBucket：bucket 不存在）");
+  });
+
+  it("清空配置时 PUT 空配置被当格式错误拒掉，就退回 DELETE", async () => {
+    const { calls, fetchImpl } = stub([
+      ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 }),
+      () => new Response(null, { status: 204 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await store.putLifecycle({ own: [], foreign: [] });
+    expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
+    expect(new URL(calls[1]!.url).searchParams.has("lifecycle")).toBe(true);
+  });
+
+  it("退回的 DELETE 也失败时，报错里同时说明 PUT 被拒的原因", async () => {
+    const { fetchImpl } = stub([
+      ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 }),
+      ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    expect(error).toMatchObject({ operation: "deleteLifecycle", status: 403, code: "AccessDenied" });
+    expect(error.message).toContain("清空 lifecycle 规则失败（HTTP 403，AccessDenied）");
+    expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
+    expect(error.message).toContain("Admin Read & Write");
+  });
+
+  it("配置不为空时 PUT 被拒就直接报错，不会退回 DELETE", async () => {
+    const { calls, fetchImpl } = stub([ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 })]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await expect(store.putLifecycle({ own: [], foreign: ["<ID>mine</ID>"] })).rejects.toThrow(S3Error);
+    expect(calls.map((c) => c.method)).toEqual(["PUT"]);
+  });
+
   it("写入时带上 Content-MD5", async () => {
     const { calls, fetchImpl } = stub([ok("", { status: 200 })]);
     const store = new R2Store({
@@ -124,7 +184,6 @@ describe("lifecycle", () => {
           buildId: "b1",
           prefix: "incremental-cache/b1/",
           expireDays: 1,
-          style: "filter",
           enabled: true,
         },
       ],

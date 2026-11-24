@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "lmk123": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/lmk123/cc-plugins.git"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "context-keeper@lmk123": true
+  }
+}
