@@ -2,6 +2,9 @@
 paths:
   - "src/run.ts"
   - "src/plan.ts"
+  - "src/xml.ts"
+  - "src/cli.ts"
+  - "src/store.ts"
   - "test/run.test.ts"
 ---
 
