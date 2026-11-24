@@ -22,6 +22,7 @@ pnpm start --help                           # 直接跑源码；不要写 `pnpm 
 - 代码注释、报错信息、README、commit message 都用中文；commit 用 `feat:` / `fix:` / `perf:` / `chore:` 前缀。
 - 报错信息要说明是哪一步失败、怎么补救。
 - 改动行为时同步更新 README 以及 `cli.ts` 里的 `USAGE`。
+- 参数校验有两份：`cli.ts` 按开关名报错，`index.ts` 的 `validate` 按库选项名报错，改一处要同步另一处。
 - `.secrets/` 存放本地真实环境实测用的凭证（已 gitignore），不要读出或提交其内容。
 
 ## 更多上下文

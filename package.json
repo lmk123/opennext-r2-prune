@@ -18,6 +18,13 @@
   "author": "lmk123",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
   "bin": {
     "opennext-r2-prune": "./dist/cli.js"
   },

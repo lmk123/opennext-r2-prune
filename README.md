@@ -146,6 +146,61 @@ lifecycle 是 bucket 级配置，R2 的 Object 级 token **不论只读还是读
 bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--dry-run` 时 **Admin Read only** 就够了，
 它不能写入任何东西，适合首次核对计划。
 
+### 作为库调用
+
+同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
+`AbortSignal`），Node 20+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
+
+```ts
+import { createHash } from "node:crypto";
+import { prune } from "opennext-r2-prune";
+
+const result = await prune({
+  bucket: "my-cache",
+  accountId: process.env.CLOUDFLARE_ACCOUNT_ID!,
+  accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+  worker: "my-worker",
+  apiToken: process.env.CLOUDFLARE_API_TOKEN!,
+  // dryRun: true,
+  // 不给 confirm 就直接写入
+  confirm: (plan) => plan.expire.length < 50,
+  // 可选：带上 Content-MD5（实测 R2 不校验它，Worker 里没有 MD5 可以不传）
+  md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
+  // 务必报出来：探测失败而中止时，这是得知这些危险规则的唯一途径
+  onWholeBucketRules: (ids) => console.warn("对整个 bucket 生效的规则：", ids),
+});
+console.log(result.expire, result.written, result.verified);
+```
+
+选项与命令行开关一一对应，改成驼峰：`--build-id-url` → `buildIdUrl`、`--recent-builds` →
+`recentBuilds`、`--allow-root-prefix` → `allowRootPrefix`、`--dry-run` → `dryRun`，`--url` 对应
+`siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。报错文案沿用命令行的
+开关名。
+
+需要先看计划、再决定写不写时，用两段式的 `planPrune`：
+
+```ts
+import { planPrune } from "opennext-r2-prune";
+
+const planned = await planPrune(options); // 只发读请求，全部安全校验在这一步做完
+if (planned.changed && (await askSomeone(planned.expire))) {
+  const outcome = await planned.apply(); // 写入并回读核对；只能调用一次
+}
+```
+
+失败一律以异常抛出，不会写到一半悄悄返回：
+
+- 参数不对抛 `PruneOptionsError`，一个请求都不发。
+- 探测、列举或安全校验失败抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
+  `XmlAssumptionError` 之一，此时没有任何写请求。
+- 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
+  `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败）
+  务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
+
+返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
+`cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
+
 ## 安全设计
 
 删除不可逆，所以这几条是硬性的：
