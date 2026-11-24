@@ -2,3 +2,6 @@ node_modules/
 dist/
 .idea/
 *.log
+
+# 本地实测用的临时凭证，绝不提交
+.secrets/

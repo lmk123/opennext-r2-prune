@@ -6,7 +6,7 @@ import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
 import { type ExpireState, type KeptBuild, PlanError, type PrunePlan } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
 import { R2Store, S3Error } from "./store.ts";
-import { collectPlan, type RunState } from "./run.ts";
+import { collectPlan, type RunState, writeAndVerify } from "./run.ts";
 import { XmlAssumptionError } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
@@ -36,7 +36,6 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --endpoint <地址>             覆盖 S3 endpoint，默认按 account id 拼
   --prefix <前缀>               缓存前缀，默认 incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
   --expire-days <n>            规则的过期天数，默认 1
-  --lifecycle-style <式样>      filter（默认）或 bare，规则里 Prefix 的包装形式
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written 字段）
@@ -64,7 +63,6 @@ function parseCliArgs(argv: string[]) {
       endpoint: { type: "string" },
       prefix: { type: "string" },
       "expire-days": { type: "string" },
-      "lifecycle-style": { type: "string" },
       "dry-run": { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       json: { type: "boolean" },
@@ -150,12 +148,6 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const style = values["lifecycle-style"] ?? "filter";
-  if (style !== "filter" && style !== "bare") {
-    console.error("--lifecycle-style 只能是 filter 或 bare");
-    return 1;
-  }
-
   const onRetry = values.verbose
     ? (attempt: number, reason: string) => console.error(`  第 ${attempt} 次重试：${reason}`)
     : undefined;
@@ -187,7 +179,6 @@ async function main(argv: string[]): Promise<number> {
     force: values.force,
     allowRootPrefix: values["allow-root-prefix"],
     expireDays,
-    style,
     onRetry,
   });
 
@@ -206,6 +197,10 @@ async function main(argv: string[]): Promise<number> {
   }
 
   let written = false;
+  /** 写入后回读核对是否一致；没有写入时为 null */
+  let verified: boolean | null = null;
+  /** 回读不符时是否已撤掉本工具的规则；没有发生撤销时为 null */
+  let rolledBack: boolean | null = null;
   let cancelled = false;
   let failure: string | undefined;
   let code = 0;
@@ -222,17 +217,39 @@ async function main(argv: string[]): Promise<number> {
     note("已取消。");
   } else {
     try {
-      await store.putLifecycle(plan.nextDoc);
+      const result = await writeAndVerify(store, plan.nextDoc);
       written = true;
-      const added = plan.expire.filter((b) => b.state === "new").length;
-      const updated = plan.expire.filter((b) => b.state === "updated").length;
-      note(
-        `\n已写入规则：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 条。` +
-          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
-      );
+      if (result.readBackError !== undefined) {
+        failure = `规则已写入，但回读核对失败：${describe(result.readBackError)}`;
+        console.error(
+          `\n${failure}\n请用 npx wrangler r2 bucket lifecycle list ${bucket} 核对每条 opennext-r2-prune:* 规则的 prefix ` +
+            `是否为 ${normalizePrefix(prefix)}<buildId>/，而不是 (all prefixes)。`,
+        );
+        code = 2;
+      } else if (result.problems.length === 0) {
+        verified = true;
+        const added = plan.expire.filter((b) => b.state === "new").length;
+        const updated = plan.expire.filter((b) => b.state === "updated").length;
+        note(
+          `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${plan.reclaim.length} 条。` +
+            `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
+        );
+      } else {
+        verified = false;
+        rolledBack = result.rolledBack;
+        failure = `写入后回读的规则与期望不符：${result.problems.join("；")}`;
+        const rollback = result.rolledBack
+          ? "已撤掉本工具的全部规则（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
+          : `撤掉本工具规则时也失败了：${describe(result.rollbackError)}\n` +
+            `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 检查，并手动删除所有 opennext-r2-prune:* 规则，` +
+            `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
+        console.error(`\n写入后回读核对失败：\n  ${result.problems.join("\n  ")}\n${rollback}`);
+        code = 2;
+      }
     } catch (error) {
       failure = describe(error);
-      console.error(`\n写入 lifecycle 规则失败：${failure}`);
+      // S3Error 自己就写明了「写入 lifecycle 规则失败」，不再重复一遍
+      console.error(`\n${error instanceof S3Error ? failure : `写入 lifecycle 规则失败：${failure}`}`);
       code = 2;
     }
   }
@@ -244,8 +261,9 @@ async function main(argv: string[]): Promise<number> {
         {
           ...toJson(state, prefix),
           expireDays,
-          style,
           written,
+          verified,
+          rolledBack,
           cancelled,
           error: failure ?? null,
         },
@@ -369,7 +387,7 @@ async function confirm(): Promise<boolean> {
 }
 
 function describe(error: unknown): string {
-  if (error instanceof S3Error) return `${error.code}: ${error.message}`;
+  if (error instanceof S3Error) return error.message;
   if (error instanceof CloudflareApiError) return `Cloudflare API ${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : String(error);
 }

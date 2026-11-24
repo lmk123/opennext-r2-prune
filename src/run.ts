@@ -1,8 +1,9 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
-import { type KeptBuild, makePlan, type PrunePlan } from "./plan.ts";
+import { type KeptBuild, makePlan, type PrunePlan, verifyWritten } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import type { R2Store } from "./store.ts";
+import type { LifecycleDoc } from "./xml.ts";
 
 /**
  * 把「探测 → 列举 → 判定」串起来。与 cli.ts 分开是为了这一层不依赖任何 Node API：
@@ -25,8 +26,6 @@ export interface RunOptions {
   allowRootPrefix?: boolean;
   /** 规则的过期天数，默认 1 */
   expireDays?: number;
-  /** 规则里 Prefix 的包装形式，默认 filter */
-  style?: "filter" | "bare";
   fetchImpl?: typeof fetch;
   /** 读 BUILD_ID 重试时的回调 */
   onRetry?: OnRetry;
@@ -107,7 +106,6 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       current,
       prefix: opts.prefix,
       expireDays: opts.expireDays ?? 1,
-      style: opts.style ?? "filter",
       force: opts.force,
       allowRootPrefix: opts.allowRootPrefix,
     }),
@@ -292,4 +290,41 @@ async function mapWithConcurrency<T, R>(
   // 被中止时 worker 是悄悄退出的，results 里留着空洞，不能当成功交回去
   signal.throwIfAborted();
   return results;
+}
+
+export interface WriteResult {
+  /** 回读后与期望不符的地方，空数组表示规则已按原样生效 */
+  problems: string[];
+  /**
+   * 回读不符时是否已撤掉本工具的全部规则。撤规则只会让删除推迟，绝不会删到数据，
+   * 所以出了不符就先撤，等查明原因再重跑。null 表示无需撤销（回读一致）。
+   */
+  rolledBack: boolean | null;
+  /** 撤销失败时的原因 */
+  rollbackError?: unknown;
+  /** 写入成功、但回读失败时的原因。此时无从核对，problems 为空、rolledBack 为 null */
+  readBackError?: unknown;
+}
+
+/**
+ * 写入规则，再读回来逐条核对。对不上时立即重写一份只含外部规则的配置，把本工具的规则全部撤掉
+ * —— 一条前缀被服务端丢掉的删除规则会作用于整个 bucket，不能让它留在那里等人发现。
+ */
+export async function writeAndVerify(store: R2Store, doc: LifecycleDoc): Promise<WriteResult> {
+  await store.putLifecycle(doc);
+  let actual: LifecycleDoc;
+  try {
+    actual = await store.getLifecycle();
+  } catch (readBackError) {
+    return { problems: [], rolledBack: null, readBackError };
+  }
+  const problems = verifyWritten(doc, actual);
+  if (problems.length === 0) return { problems, rolledBack: null };
+
+  try {
+    await store.putLifecycle({ own: [], foreign: actual.foreign });
+    return { problems, rolledBack: true };
+  } catch (rollbackError) {
+    return { problems, rolledBack: false, rollbackError };
+  }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
-import { collectPlan } from "../src/run.ts";
+import { collectPlan, writeAndVerify } from "../src/run.ts";
 import { PlanError } from "../src/plan.ts";
 import { R2Store } from "../src/store.ts";
 import { XmlAssumptionError } from "../src/xml.ts";
@@ -590,5 +590,74 @@ describe("collectPlan + Cloudflare API", () => {
         fetchImpl: cf.fetchImpl,
       }),
     ).rejects.toThrow(/没有任何 deployment/);
+  });
+});
+
+/**
+ * 有状态的假 R2：PUT 进来的配置存下来，GET 时经 mangle 处理后返回，用来模拟服务端的静默改写。
+ * failGetAfterPut 让写入之后的读取失败。
+ */
+function statefulR2(opts: { mangle?: (xml: string) => string; failGetAfterPut?: boolean; failSecondPut?: boolean } = {}) {
+  const puts: string[] = [];
+  let stored = "<LifecycleConfiguration><Rule><ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
+  const fetchImpl = (async (request: Request) => {
+    if (request.method === "PUT") {
+      if (opts.failSecondPut && puts.length === 1) {
+        return new Response("<Error><Code>InternalError</Code></Error>", { status: 400 });
+      }
+      puts.push(await request.text());
+      stored = puts[puts.length - 1]!;
+      return new Response("", { status: 200 });
+    }
+    if (opts.failGetAfterPut && puts.length > 0) {
+      return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
+    }
+    return new Response((opts.mangle ?? ((x) => x))(stored), { status: 200 });
+  }) as unknown as typeof fetch;
+  return { puts, store: new R2Store({ ...CREDS, fetchImpl }) };
+}
+
+const DOC = {
+  own: [{ buildId: "old1", prefix: "incremental-cache/old1/", expireDays: 1, enabled: true }],
+  foreign: ["<ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration>"],
+};
+
+describe("writeAndVerify", () => {
+  it("回读一致时只写一次", async () => {
+    const { puts, store } = statefulR2();
+    const result = await writeAndVerify(store, DOC);
+    expect(result).toEqual({ problems: [], rolledBack: null });
+    expect(puts).toHaveLength(1);
+  });
+
+  it("服务端丢掉前缀时报出问题，并撤掉本工具的全部规则、保留外部规则", async () => {
+    // 模拟实测到的 R2 行为：规则里的前缀被丢掉，删除规则变成作用于整个 bucket
+    const { puts, store } = statefulR2({
+      mangle: (xml) => xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, ""),
+    });
+    const result = await writeAndVerify(store, DOC);
+    expect(result.rolledBack).toBe(true);
+    expect(result.problems.join()).toContain("作用于整个 bucket");
+    expect(puts).toHaveLength(2);
+    expect(puts[1]).not.toContain("opennext-r2-prune:");
+    expect(puts[1]).toContain("<ID>mine</ID>");
+  });
+
+  it("撤销也失败时如实报告", async () => {
+    const { store } = statefulR2({
+      mangle: (xml) => xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, ""),
+      failSecondPut: true,
+    });
+    const result = await writeAndVerify(store, DOC);
+    expect(result.rolledBack).toBe(false);
+    expect(result.rollbackError).toBeDefined();
+  });
+
+  it("写入成功但回读失败时不撤销，交由调用方提示人工核对", async () => {
+    const { puts, store } = statefulR2({ failGetAfterPut: true });
+    const result = await writeAndVerify(store, DOC);
+    expect(result.readBackError).toBeDefined();
+    expect(result.rolledBack).toBeNull();
+    expect(puts).toHaveLength(1);
   });
 });

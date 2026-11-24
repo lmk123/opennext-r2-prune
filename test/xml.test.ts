@@ -79,7 +79,6 @@ describe("parseLifecycle", () => {
         buildId: "oldbuild1",
         prefix: "incremental-cache/oldbuild1/",
         expireDays: 1,
-        style: "filter",
         enabled: true,
       },
     ]);
@@ -106,7 +105,7 @@ describe("parseLifecycle", () => {
     expect(renderLifecycle(parsed)).toContain("tmp &amp; scratch");
   });
 
-  it("也认老式的、Prefix 直接挂在 Rule 下的写法", () => {
+  it("Prefix 直接挂在 Rule 下时记为空前缀 —— R2 不认这种写法，规则实际作用于整个 bucket", () => {
     const bare = `<LifecycleConfiguration><Rule>
       <ID>opennext-r2-prune:b2</ID><Status>Enabled</Status>
       <Prefix>incremental-cache/b2/</Prefix><Expiration><Days>1</Days></Expiration>
@@ -114,15 +113,21 @@ describe("parseLifecycle", () => {
     expect(parseLifecycle(bare).own).toEqual([
       {
         buildId: "b2",
-        prefix: "incremental-cache/b2/",
+        prefix: "",
         expireDays: 1,
-        style: "bare",
         enabled: true,
       },
     ]);
   });
 
-  it("解析出过期天数与式样，好让判定层发现选项变了", () => {
+  it("没有 Filter 也没有 Prefix 的自有规则，同样记为空前缀", () => {
+    const none = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:b4</ID><Status>Enabled</Status><Expiration><Days>2</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    expect(parseLifecycle(none).own[0]!.prefix).toBe("");
+  });
+
+  it("解析出过期天数与状态，好让判定层发现选项变了", () => {
     const doc7 = `<LifecycleConfiguration><Rule>
       <ID>opennext-r2-prune:b3</ID><Status>Disabled</Status>
       <Filter><Prefix>incremental-cache/b3/</Prefix></Filter><Expiration><Days>7</Days></Expiration>
@@ -131,7 +136,6 @@ describe("parseLifecycle", () => {
       buildId: "b3",
       prefix: "incremental-cache/b3/",
       expireDays: 7,
-      style: "filter",
       enabled: false,
     });
   });
@@ -142,22 +146,15 @@ describe("renderLifecycle", () => {
     buildId: "b1",
     prefix: "incremental-cache/b1/",
     expireDays: 1,
-    style: "filter",
     enabled: true,
     ...overrides,
   });
 
-  it("两种 Prefix 包装式样都按规则自身的字段生成", () => {
-    expect(renderLifecycle({ own: [rule()], foreign: [] })).toContain(
-      "<Filter><Prefix>incremental-cache/b1/</Prefix></Filter>",
-    );
-    const bare = renderLifecycle({
-      own: [rule({ style: "bare", expireDays: 2 })],
-      foreign: [],
-    });
-    expect(bare).toContain("<Prefix>incremental-cache/b1/</Prefix>");
-    expect(bare).not.toContain("<Filter>");
-    expect(bare).toContain("<Days>2</Days>");
+  it("Prefix 一律包在 <Filter> 里，绝不生成裸 <Prefix>", () => {
+    const xml = renderLifecycle({ own: [rule({ expireDays: 2 })], foreign: [] });
+    expect(xml).toContain("<Filter><Prefix>incremental-cache/b1/</Prefix></Filter>");
+    expect(xml.replace(/<Filter><Prefix>[^<]*<\/Prefix><\/Filter>/g, "")).not.toContain("<Prefix>");
+    expect(xml).toContain("<Days>2</Days>");
   });
 
   it("拒绝把带可疑字符的 buildId 写进规则", () => {

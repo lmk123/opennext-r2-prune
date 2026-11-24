@@ -15,7 +15,8 @@ DELETE。
 
 本工具换了条路：**给每个作废的 build 目录挂一条 R2 object lifecycle 规则**，把删除
 下沉给 R2 服务端。整个过程一个缓存对象都不列举，目录里有 1 万还是 100 万个文件，代价完全
-一样。而且发给 R2 的请求数是**恒定的**：列一次目录、读一次现有规则、写一次新规则 ——
+一样。而且发给 R2 的请求数是**恒定的**：列一次目录、读一次现有规则、写一次新规则、再读回来
+核对一次 ——
 bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
 
 这不是「给缓存设个自动过期时间」—— 线上 `BUILD_ID` 能活多久无法预知，那种用法不成立。
@@ -44,9 +45,10 @@ bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
    安全校验都在这里做完 —— 有一条不过就直接退出，根本走不到写入。
 
 5. **把计划打给你看，确认后写回去。** 写入是整份 lifecycle 配置的全量覆盖：你自己的规则
-   原样搬回，本工具的规则按上一步的结论重新生成。剩下的交给 R2，它通常在 24 小时内删完。
+   原样搬回，本工具的规则按上一步的结论重新生成。写完立刻把配置读回来逐条核对，确认每条规则
+   的前缀、天数都如实生效（见「安全设计」）。剩下的交给 R2，它通常在 24 小时内删完。
 
-花在 R2 上的永远只有三个请求：列目录、读规则、写规则。第三步的请求数则随「近期版本数 +
+花在 R2 上的永远只有四个请求：列目录、读规则、写规则、回读核对（无需写入时只有前两个）。第三步的请求数则随「近期版本数 +
 预览数」增长：列 deployments（通常一页就够）、每个近期版本读一次 URL 再读一次 `BUILD_ID`、
 列一次预览、每个预览读一次 `BUILD_ID`。读站点、近期版本与预览几条线同时进行，各自内部并发探测。
 
@@ -70,6 +72,9 @@ node dist/cli.js \
 传 `--yes`。
 
 所有参数都可以用环境变量代替，见 `--help`。
+
+R2 API token 的权限见下文「定时任务」一节末尾：`--dry-run` 需要 Admin Read only，写入需要
+Admin Read & Write（Object 级 token 读写不了 lifecycle）。
 
 ### 它怎么知道该保留哪些 build
 
@@ -134,8 +139,12 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 ```
 
-R2 API token 需要 **Object Read & Write** 权限（lifecycle 是 bucket 级配置）；Cloudflare
-API token 需要 **Workers Scripts › Read**。
+R2 API token 需要 **Admin Read & Write** 权限；Cloudflare API token 需要 **Workers Scripts › Read**。
+
+lifecycle 是 bucket 级配置，R2 的 Object 级 token **不论只读还是读写**，读、写 lifecycle 都会被拒
+（403 AccessDenied，已在真实 R2 上实测），只有 Admin 级 token 能用。Admin 级 token 无法限定到单个
+bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--dry-run` 时 **Admin Read only** 就够了，
+它不能写入任何东西，适合首次核对计划。
 
 ## 安全设计
 
@@ -156,6 +165,11 @@ API token 需要 **Workers Scripts › Read**。
   bucket 确实只用来存 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
 - 列出来的 build 目录名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
   降级成警告 —— 那些值会被用来拼删除规则。
+- **写入后回读核对**。PUT 返回成功不代表规则按原样生效：实测 R2 会静默丢掉裸 `<Prefix>`，把只针对
+  一个 build 目录的删除规则变成作用于整个 bucket 的。所以每次写完都把配置读回来，逐条比对本工具
+  规则的前缀、过期天数、状态，以及外部规则的条数。对不上就**立即撤掉本工具的全部规则**（你自己的
+  规则保留）并以退出码 2 报错 —— 撤规则只会让删除推迟，绝不会删到数据。`--json` 输出里的
+  `verified` / `rolledBack` 字段记录了核对与撤销的结果。规则只用 `<Filter><Prefix>` 式样生成。
 
 ## 已知限制
 
@@ -188,11 +202,20 @@ pnpm test
 pnpm build
 ```
 
-首次对真实 bucket 使用时，有两处依赖 R2 的具体行为，如果报错就调整对应开关：
+以下 R2 的具体行为已在真实 bucket 上实测确认（2026-11）：
 
-- 规则里 `Prefix` 的包装形式默认用 S3 v2 的 `<Filter><Prefix>`。R2 若不认，改用
-  `--lifecycle-style bare`。注意 S3 的 GET 会把裸 `<Prefix>` 规范化成 `<Filter><Prefix>` 再
-  返回，所以「已有规则读回来是 filter」不作为改写理由（否则 `bare` 会每次运行都重写一遍规则，
-  永远收敛不了）；切到 `bare` 后，规则会在下一次真正需要写入时一并换成新式样。
-- 写入时默认带 `Content-MD5`。可用 `npx wrangler r2 bucket lifecycle list <BUCKET>`
-  核对规则是否如实写进去了。
+- **`<Filter><Prefix>` 式样**：R2 照单全收，读回来也原样是 `<Filter><Prefix>`。
+- **⚠️ R2 不认裸 `<Prefix>`**（直接挂在 `<Rule>` 下、不包 `<Filter>` 的老式写法）。它不报错，却会
+  **静默丢掉前缀**：读回来的规则没有任何 Prefix，`wrangler r2 bucket lifecycle list` 显示为
+  `prefix: (all prefixes)`，即这条删除规则对**整个 bucket** 生效，会把线上缓存乃至前缀之外的数据
+  一并删掉。因此原先的 `--lifecycle-style bare` 选项已删除，工具只生成 `<Filter><Prefix>`，并在
+  写入后回读核对兜底。
+- **`Content-MD5` 不被校验**：R2 接受带正确摘要、错误摘要或不带摘要的写入。工具照常发送它（符合
+  S3 规范，也兼容会校验的实现），但不要指望它在 R2 上提供完整性保证。
+- **新建的 bucket 自带一条 `Default Multipart Abort Rule`**，工具会把它当作外部规则原样保留（已实测）。
+  所以「bucket 没有任何规则时 GET 返回 404 / `NoSuchLifecycleConfiguration`」这条路径在 R2 上很难
+  走到，未实测；工具对它的处理是当作空配置。
+- **权限**：lifecycle 只有 Admin 级 R2 token 能读写，Object 级 token（只读或读写）一律 403，见上文。
+
+写入后可用 `npx wrangler r2 bucket lifecycle list <BUCKET>` 核对规则是否如实写进去了，重点看每条
+`opennext-r2-prune:*` 规则的 `prefix` 是否是 `incremental-cache/<buildId>/`，而不是 `(all prefixes)`。
