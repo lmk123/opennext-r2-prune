@@ -1,6 +1,14 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
-import { type KeptBuild, makePlan, type PrunePlan, type VerifyProblems, verifyWritten, wholeBucketRules } from "./plan.ts";
+import {
+  type KeptBuild,
+  makePlan,
+  PlanError,
+  type PrunePlan,
+  type VerifyProblems,
+  verifyWritten,
+  wholeBucketRules,
+} from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "./xml.ts";
@@ -389,6 +397,22 @@ export class WriteNotAppliedError extends Error {
     super(message(cause), { cause });
     this.name = "WriteNotAppliedError";
   }
+}
+
+/**
+ * 写入前再读一次配置，必须与算计划时读到的完全一致，否则中止、不发写请求。计划和写入之间隔着确认
+ * （库的调用方可能等上很久）：期间有人改了外部规则，整份覆盖会把改动抹掉；另一趟运行写过规则，
+ * 计划、写入报错时的「没生效」判断、撤销都会以过期的现状为准。两次都是原样读回、同样解析，所以
+ * 外部规则逐字比对，不像写后核对那样只比条数。
+ */
+export async function assertLifecycleUnchanged(store: R2Store, before: LifecycleDoc): Promise<void> {
+  const now = await store.getLifecycle();
+  if (JSON.stringify(now) === JSON.stringify(before)) return;
+  throw new PlanError(
+    `写入前重读 lifecycle 配置，发现它在算出计划之后被改过（本工具规则 ${before.own.length} → ${now.own.length} 条，` +
+      `外部规则 ${before.foreign.length} → ${now.foreign.length} 条，条数相同时是内容变了），已中止，没有写入任何改动。` +
+      `请重新算计划再写入：库调用方重新调用 planPrune()，命令行直接重跑。`,
+  );
 }
 
 /**

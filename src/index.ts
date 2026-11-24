@@ -1,7 +1,7 @@
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
 import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
-import { collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
+import { assertLifecycleUnchanged, collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
 
 /**
@@ -118,6 +118,8 @@ export interface PruneWriteOutcome {
 export interface PrunePlanned extends PrunePlanSummary {
   /**
    * 按计划写入规则并回读核对。changed 为 false 时什么都不发。只能调用一次。
+   * 写入前会重读 lifecycle 配置：算出计划之后被改过就抛 PlanError（重读失败抛 S3Error），不发写请求。
+   * 不会重新探测线上 build，planPrune 之后有部署或回滚的话请重新 planPrune。
    * 写入失败、核对不符（无论撤销成功与否）都抛 PruneWriteError。
    */
   apply(): Promise<PruneWriteOutcome>;
@@ -267,6 +269,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
       if (applied) throw new Error("apply() 只能调用一次；要再写入请重新调用 planPrune()。");
       applied = true;
       if (!plan.changed) return { written: false, verified: null, rolledBack: null, warnings: [], writeError: null };
+      // 计划按 planPrune 时的配置算出，这之后被改过就不能照着写：会抹掉别人的改动，撤销也会以错误的现状为准
+      await assertLifecycleUnchanged(store, state.lifecycle);
 
       let result: Awaited<ReturnType<typeof writeAndVerify>>;
       try {

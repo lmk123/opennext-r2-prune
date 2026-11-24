@@ -192,16 +192,20 @@ console.log(result.expire, result.written, result.verified);
 ```ts
 import { planPrune } from "opennext-r2-prune";
 
-const planned = await planPrune(options); // 只发读请求，全部安全校验在这一步做完
+const planned = await planPrune(options); // 只发读请求，探测与安全校验在这一步做完
 if (planned.changed && (await askSomeone(planned.expire))) {
   const outcome = await planned.apply(); // 写入并回读核对；只能调用一次
 }
 ```
 
+计划只在算出的那一刻成立，`planPrune` 与 `apply()` 之间别隔太久。`apply()` 写入前会重读 lifecycle 配置，
+算出计划之后被改过（别人改了规则、另一趟运行写过）就抛 `PlanError`，不写入任何东西。它**不会**重新探测线上 build：
+这期间有部署或回滚的话，被判作废的 build 可能又上线了，请重新调用 `planPrune`。
+
 失败一律以异常抛出，不会写到一半悄悄返回：
 
 - 参数不对抛 `PruneOptionsError`，一个请求都不发。
-- 探测、列举或安全校验失败抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
+- 探测、列举或安全校验失败（包括 `apply()` 写入前发现配置被改过）抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
   `XmlAssumptionError` 之一，此时没有任何写请求。重试耗尽仍连不上 R2 也是 `S3Error`（`status` 为 0）。
 - 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
   `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败，
@@ -230,6 +234,8 @@ if (planned.changed && (await askSomeone(planned.expire))) {
   bucket 确实只用来存 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
 - 列出来的 build 目录名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
   降级成警告 —— 那些值会被用来拼删除规则。
+- **写入前重读配置**。确认环节可能隔了很久，写入前再读一次 lifecycle，与算计划时读到的不一致（有人改了规则、
+  另一趟运行写过）就中止、不写入，以免整份覆盖抹掉别人的改动。
 - **写入后回读核对**。PUT 返回成功不代表规则按原样生效：实测 R2 会静默丢掉裸 `<Prefix>`，把只针对
   一个 build 目录的删除规则变成作用于整个 bucket 的。所以每次写完都把配置读回来，逐条比对本工具
   规则的前缀、过期天数、状态（同一个 buildId 读回多条也算不符），以及外部规则的条数。刚写完可能

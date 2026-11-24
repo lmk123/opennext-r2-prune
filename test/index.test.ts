@@ -1,6 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
 import { PlanError, planPrune, prune, PruneOptionsError, PruneWriteError } from "../src/index.ts";
 
+/** 让 writeAndVerify 抛出约定之外的异常；默认不设，照常调用真实实现 */
+const hooks = vi.hoisted(() => ({ writeAndVerifyThrows: undefined as unknown }));
+vi.mock("../src/run.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/run.ts")>();
+  return {
+    ...actual,
+    writeAndVerify: (...args: Parameters<typeof actual.writeAndVerify>) =>
+      hooks.writeAndVerifyThrows === undefined
+        ? actual.writeAndVerify(...args)
+        : Promise.reject(hooks.writeAndVerifyThrows),
+  };
+});
+
 /**
  * 库入口：参数校验、dryRun、confirm 取消、写入失败，都不能让写请求漏出去。
  */
@@ -53,7 +66,11 @@ function fakeWorld(opts: {
     return new Response(`<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`);
   }) as unknown as typeof fetch;
   const puts = () => calls.filter((c) => c.method === "PUT");
-  return { calls, puts, fetch: fetchImpl };
+  /** 模拟别人在计划与写入之间改了配置 */
+  const setLifecycle = (xml: string) => {
+    lifecycle = xml;
+  };
+  return { calls, puts, setLifecycle, fetch: fetchImpl };
 }
 
 const SITE = { siteUrl: "https://example.com" };
@@ -150,6 +167,32 @@ describe("prune", () => {
 });
 
 describe("planPrune", () => {
+  it("计划之后 lifecycle 被改过时 apply 抛 PlanError，没有写请求", async () => {
+    const world = fakeWorld({ buildIds: ["live", "old"], online: "live" });
+    const planned = await planPrune({ ...CREDS, ...SITE, fetch: world.fetch });
+    world.setLifecycle(
+      "<LifecycleConfiguration><Rule><ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter>" +
+        "<Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>",
+    );
+    await expect(planned.apply()).rejects.toThrow(PlanError);
+    await expect(planned.apply()).rejects.toThrow(/只能调用一次/);
+    expect(world.puts()).toHaveLength(0);
+  });
+
+  it("写入阶段意外出错时按「可能已写入」报，并给出手动检查的办法", async () => {
+    const world = fakeWorld({ buildIds: ["live", "old"], online: "live" });
+    const planned = await planPrune({ ...CREDS, ...SITE, fetch: world.fetch });
+    hooks.writeAndVerifyThrows = new TypeError("意外");
+    try {
+      const error = await planned.apply().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(PruneWriteError);
+      expect(error).toMatchObject({ written: true, verified: null, rolledBack: null });
+      expect((error as PruneWriteError).message).toMatch(/无从确认规则是否已写入[\s\S]*opennext-r2-prune:\*/);
+    } finally {
+      hooks.writeAndVerifyThrows = undefined;
+    }
+  });
+
   it("apply 只能调用一次", async () => {
     const world = fakeWorld({ buildIds: ["live", "old"], online: "live" });
     const planned = await planPrune({ ...CREDS, ...SITE, fetch: world.fetch });
