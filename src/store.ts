@@ -53,6 +53,7 @@ const PERMISSION_HINT: Record<S3Operation, string> = {
 export class S3Error extends Error {
   // 显式声明字段而不用构造函数参数属性：那是 Node 的类型擦除模式跑不了的语法，
   // 而 package.json 的 start 脚本正是靠它直接跑源码
+  /** HTTP 状态码；重试耗尽仍没拿到响应（网络层失败）时为 0 */
   readonly status: number;
   readonly code: string;
   readonly operation: S3Operation;
@@ -63,7 +64,8 @@ export class S3Error extends Error {
   constructor(operation: S3Operation, status: number, code: string, detail: string, context?: string) {
     const reason = detail && detail !== code ? `${code}：${detail}` : code;
     const hint = status === 403 ? `\n${PERMISSION_HINT[operation]}` : "";
-    super(`${OPERATION_LABEL[operation]}失败（HTTP ${status}，${reason}）${context ? `。${context}` : ""}${hint}`);
+    const where = status === 0 ? "没有拿到响应" : `HTTP ${status}`;
+    super(`${OPERATION_LABEL[operation]}失败（${where}，${reason}）${context ? `。${context}` : ""}${hint}`);
     this.name = "S3Error";
     this.operation = operation;
     this.status = status;
@@ -90,10 +92,17 @@ export class R2Store {
 
   async #request(operation: S3Operation, url: string, init?: RequestInit): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
-    const response = await withRetry(
-      async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
-      this.#opts.onRetry,
-    );
+    let response: Response;
+    try {
+      response = await withRetry(
+        async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
+        this.#opts.onRetry,
+      );
+    } catch (error) {
+      // 重试耗尽的网络层失败也归成 S3Error（status 为 0），和 cloudflare.ts 一致：库的调用方按文档列出的
+      // 错误类型分类，cli 也不会甩堆栈。status 0 不在 4xx 里，写入时仍按「可能已生效」回读核对
+      throw new S3Error(operation, 0, "network", String(error), "请确认网络与 endpoint 可达，稍后重跑");
+    }
     if (response.status < 400) return response;
 
     const body = await response.text();

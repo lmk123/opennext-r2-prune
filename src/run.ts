@@ -321,7 +321,7 @@ export interface WriteResult {
   /**
    * PUT 本身报了错，但请求可能已在服务端生效（超时、重试耗尽的 5xx……），所以仍回读核对：与期望
    * 一致就当作已写入（problems 为空）；读回来仍是写入前的配置、且没有对整个 bucket 生效的自有规则，
-   * 或者写入被服务端明确拒绝、又读不回来，就把这个错误直接抛给调用方，不会出现在返回值里；
+   * 或者写入被服务端明确拒绝、又读不回来，就包成 WriteNotAppliedError 抛给调用方，不会出现在返回值里；
    * 其余情况（读不回来、读到的既不是新配置也不是旧配置、旧配置里本就有整 bucket 规则）一律撤销。
    */
   writeError?: unknown;
@@ -381,6 +381,17 @@ function message(error: unknown): string {
 }
 
 /**
+ * 写入请求报错，且能确认没有生效：bucket 仍是写入前的样子。cause 是写入请求的原始错误。
+ * writeAndVerify 只用它表示「没写进去」，调用方据此报 written: false；其余异常一律不能当作没写入。
+ */
+export class WriteNotAppliedError extends Error {
+  constructor(cause: unknown) {
+    super(message(cause), { cause });
+    this.name = "WriteNotAppliedError";
+  }
+}
+
+/**
  * 写入是否被明确拒绝、不会生效：请求根本没发出去（渲染配置时就失败），或者服务端回了 4xx
  * （429 限流除外，它会被重试）。这时不必等「读到新配置」，回读一次只为看看旧配置里有没有危险规则。
  */
@@ -428,10 +439,10 @@ export async function writeAndVerify(
   let unchanged = false;
   if (failed) {
     if ("error" in check) {
-      if (rejected) throw writeError;
+      if (rejected) throw new WriteNotAppliedError(writeError);
     } else if (verifyWritten(before, check.actual).own.length === 0) {
       unchanged = true;
-      if (wholeBucketRules(check.actual).length === 0) throw writeError;
+      if (wholeBucketRules(check.actual).length === 0) throw new WriteNotAppliedError(writeError);
     }
   }
 

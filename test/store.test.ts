@@ -228,4 +228,19 @@ describe("重试", () => {
     await expect(store.listBuildIds("incremental-cache")).rejects.toThrow("密钥无效");
     expect(call).toBe(1);
   });
+
+  it("网络层失败重试耗尽后报成 S3Error（status 0），不甩原生 TypeError", async () => {
+    let call = 0;
+    const fetchImpl = (async () => {
+      call++;
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    const error = await store.listBuildIds("incremental-cache").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(S3Error);
+    expect(error).toMatchObject({ status: 0, code: "network", operation: "list" });
+    expect((error as S3Error).message).toMatch(/列出 build 目录失败（没有拿到响应[\s\S]*endpoint 可达/);
+    expect(call).toBe(3);
+  });
 });

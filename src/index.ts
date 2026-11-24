@@ -1,7 +1,7 @@
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
 import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
-import { collectPlan, writeAndVerify } from "./run.ts";
+import { collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
 
 /**
@@ -129,9 +129,9 @@ export interface PrunePlanned extends PrunePlanSummary {
  */
 export class PruneWriteError extends Error {
   readonly detail: string;
-  /** 本次的新规则是否（可能）留在了 bucket 上。撤销失败时为 true，务必手动检查 */
+  /** 本次的新规则是否（可能）留在了 bucket 上。撤销失败、写入阶段意外出错时为 true，务必手动检查 */
   readonly written: boolean;
-  /** 写入请求本身失败、根本没走到核对时为 null，否则为 false */
+  /** 没走到核对（写入请求失败、写入阶段意外出错）时为 null，否则为 false */
   readonly verified: false | null;
   /** 核对不符时是否已撤掉本工具的规则并回读确认；没有发生撤销时为 null */
   readonly rolledBack: boolean | null;
@@ -205,7 +205,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
   const recentBuilds = opts.worker ? (opts.recentBuilds ?? 3) : null;
 
   const store = new R2Store({
-    endpoint: opts.endpoint ?? `https://${opts.accountId}.r2.cloudflarestorage.com`,
+    // 用 || 而不是 ??：validate 把空串当作没给，这里也得回退，否则空串 endpoint 会拼出无效 URL
+    endpoint: opts.endpoint || `https://${opts.accountId}.r2.cloudflarestorage.com`,
     bucket: opts.bucket,
     accessKeyId: opts.accessKeyId,
     secretAccessKey: opts.secretAccessKey,
@@ -271,13 +272,24 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
       try {
         result = await writeAndVerify(store, plan.nextDoc, state.lifecycle);
       } catch (error) {
-        // 能确认写入没有生效：bucket 仍是写入前的样子
-        const detail = describeError(error);
-        // S3Error 自己就写明了「写入 lifecycle 规则失败」，不再重复一遍
-        const message = error instanceof S3Error ? detail : `写入 lifecycle 规则失败：${detail}`;
+        if (error instanceof WriteNotAppliedError) {
+          // 能确认写入没有生效：bucket 仍是写入前的样子
+          const cause = error.cause;
+          const detail = describeError(cause);
+          // S3Error 自己就写明了「写入 lifecycle 规则失败」，不再重复一遍
+          const message = cause instanceof S3Error ? detail : `写入 lifecycle 规则失败：${detail}`;
+          throw new PruneWriteError(
+            message,
+            { detail, written: false, verified: null, rolledBack: null, warnings: [] },
+            cause,
+          );
+        }
+        // 约定之外的异常：不知道写入走到了哪一步，新规则可能已经在 bucket 上，只能按「可能已写入」报
+        const detail = `写入阶段意外出错，无从确认规则是否已写入：${describeError(error)}`;
         throw new PruneWriteError(
-          message,
-          { detail, written: false, verified: null, rolledBack: null, warnings: [] },
+          `${detail}\n请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，` +
+            `并手动删除所有 opennext-r2-prune:* 规则，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
+          { detail, written: true, verified: null, rolledBack: null, warnings: [] },
           error,
         );
       }

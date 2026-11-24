@@ -202,10 +202,10 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 
 - 参数不对抛 `PruneOptionsError`，一个请求都不发。
 - 探测、列举或安全校验失败抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
-  `XmlAssumptionError` 之一，此时没有任何写请求。
+  `XmlAssumptionError` 之一，此时没有任何写请求。重试耗尽仍连不上 R2 也是 `S3Error`（`status` 为 0）。
 - 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
-  `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败）
-  务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
+  `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败，
+  或写入阶段意外出错、无从确认）务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
 - 重复调用同一个 `apply()` 是用法错误，抛普通 `Error`，不发任何请求；要再写入请重新调用 `planPrune`。
 
 返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
