@@ -25,8 +25,9 @@ pnpm start --help                           # 直接跑源码；不要写 `pnpm 
 2. 探测保留集：`--url` 读站点 `/BUILD_ID`；`--worker` 经 `cloudflare.ts` 找近期 deployment 的版本 URL 与全部
    预览 URL，逐个读 `/BUILD_ID`（`build-id.ts`）。三条线并发，任何一处失败就 abort 全部在途请求并整体退出。
 3. `plan.ts` `makePlan`：纯函数，不发请求，**所有安全校验都在这里抛 `PlanError`**，校验不过就走不到写入。
-4. `run.ts` `writeAndVerify`：PUT 后立即 GET 回读，用 `verifyWritten` 逐条比对；对不上就重写一份只含外部
-   规则的配置撤掉本工具全部规则，CLI 以退出码 2 结束。
+4. `run.ts` `writeAndVerify`：PUT 后 GET 回读（不符时重读，最多 3 次），用 `verifyWritten` 逐条比对；本工具
+   规则对不上或读不回来，就用**写入前**的外部规则重写一份配置撤掉本工具全部规则，再回读确认撤销，CLI 以
+   退出码 2 结束。只有外部规则条数不符时只提示、不撤销。
 
 分层约束：
 - `cli.ts` 是**唯一**允许用 Node 专属 API 的文件（参数、环境变量、终端交互、`node:crypto` 的 MD5 注入）。

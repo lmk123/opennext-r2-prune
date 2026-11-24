@@ -38,7 +38,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --expire-days <n>            规则的过期天数，默认 1
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
-  --json                       输出机器可读的结果（写入之后才输出，含 written 字段）
+  --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
   --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
   --verbose                    打印重试等额外信息
@@ -180,6 +180,14 @@ async function main(argv: string[]): Promise<number> {
     allowRootPrefix: values["allow-root-prefix"],
     expireDays,
     onRetry,
+    // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
+    onWholeBucketRules: (buildIds) =>
+      console.error(
+        `\n⚠️ 警告：bucket 上有 ${buildIds.length} 条本工具的规则没有前缀，正对整个 bucket 生效：` +
+          `${buildIds.map((id) => `opennext-r2-prune:${id}`).join(", ")}。\n` +
+          `R2 会按它删掉 bucket 里的全部对象。本次运行写入成功即会把它改写；若本次中止或只是 --dry-run，` +
+          `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 核对并手动删除这些规则。`,
+      ),
   });
 
   const { plan } = state;
@@ -197,10 +205,12 @@ async function main(argv: string[]): Promise<number> {
   }
 
   let written = false;
-  /** 写入后回读核对是否一致；没有写入时为 null */
+  /** 写入后回读核对是否一致：没有写入时为 null；读不回来、无从核对也算 false */
   let verified: boolean | null = null;
-  /** 回读不符时是否已撤掉本工具的规则；没有发生撤销时为 null */
+  /** 核对不过时是否已撤掉本工具的规则并回读确认；没有发生撤销时为 null */
   let rolledBack: boolean | null = null;
+  /** 不影响本工具规则安全、只需提示的核对结果（外部规则条数不符） */
+  let warnings: string[] = [];
   let cancelled = false;
   let failure: string | undefined;
   let code = 0;
@@ -219,14 +229,11 @@ async function main(argv: string[]): Promise<number> {
     try {
       const result = await writeAndVerify(store, plan.nextDoc);
       written = true;
-      if (result.readBackError !== undefined) {
-        failure = `规则已写入，但回读核对失败：${describe(result.readBackError)}`;
-        console.error(
-          `\n${failure}\n请用 npx wrangler r2 bucket lifecycle list ${bucket} 核对每条 opennext-r2-prune:* 规则的 prefix ` +
-            `是否为 ${normalizePrefix(prefix)}<buildId>/，而不是 (all prefixes)。`,
-        );
-        code = 2;
-      } else if (result.problems.length === 0) {
+      warnings = result.warnings;
+      for (const warning of warnings) {
+        console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
+      }
+      if (result.readBackError === undefined && result.problems.length === 0) {
         verified = true;
         const added = plan.expire.filter((b) => b.state === "new").length;
         const updated = plan.expire.filter((b) => b.state === "updated").length;
@@ -237,13 +244,17 @@ async function main(argv: string[]): Promise<number> {
       } else {
         verified = false;
         rolledBack = result.rolledBack;
-        failure = `写入后回读的规则与期望不符：${result.problems.join("；")}`;
+        const reason =
+          result.readBackError !== undefined
+            ? [`写入后读不回配置，无从核对：${describe(result.readBackError)}`]
+            : result.problems;
+        failure = `写入后回读核对失败：${reason.join("；")}`;
         const rollback = result.rolledBack
-          ? "已撤掉本工具的全部规则（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
-          : `撤掉本工具规则时也失败了：${describe(result.rollbackError)}\n` +
+          ? "已撤掉本工具的全部规则并回读确认（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
+          : `撤掉本工具的规则时失败了：${describe(result.rollbackError)}\n` +
             `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 检查，并手动删除所有 opennext-r2-prune:* 规则，` +
             `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
-        console.error(`\n写入后回读核对失败：\n  ${result.problems.join("\n  ")}\n${rollback}`);
+        console.error(`\n写入后回读核对失败：\n  ${reason.join("\n  ")}\n${rollback}`);
         code = 2;
       }
     } catch (error) {
@@ -264,6 +275,7 @@ async function main(argv: string[]): Promise<number> {
           written,
           verified,
           rolledBack,
+          warnings,
           cancelled,
           error: failure ?? null,
         },
@@ -366,6 +378,8 @@ function toJson(state: RunState, prefix: string) {
     onlineBuildId: state.onlineBuildId ?? (online.length === 1 ? online[0] : null),
     onlineBuildIds: online,
     cloudflare: state.cloudflare,
+    // 运行前就已对整个 bucket 生效的自有规则（前缀为空），非空时需要人工确认它们已被改写
+    wholeBucketRules: state.wholeBucketRules,
     changed: plan.changed,
     // keep 仍是完整的保留集；其中不在 bucket 里的另见 absent
     keep: [...plan.keep, ...plan.absent],

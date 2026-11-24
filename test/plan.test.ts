@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix, verifyWritten } from "../src/plan.ts";
+import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix, verifyWritten, wholeBucketRules } from "../src/plan.ts";
 import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
@@ -283,22 +283,48 @@ describe("verifyWritten", () => {
   const doc = { own: [ownRule("old1"), ownRule("old2")], foreign: ["<ID>mine</ID>"] };
 
   it("读回来一致时没有问题", () => {
-    expect(verifyWritten(doc, structuredClone(doc))).toEqual([]);
+    expect(verifyWritten(doc, structuredClone(doc))).toEqual({ own: [], foreign: [] });
   });
 
-  it("前缀被丢掉、天数或状态不符、规则缺失或多出、外部规则条数不符，都要报出来", () => {
+  it("前缀被丢掉、天数或状态不符、规则缺失或多出，都记为本工具规则的问题；外部规则条数单独列出", () => {
     const actual = {
       own: [ownRule("old1", { prefix: "", expireDays: 2, enabled: false }), ownRule("extra")],
       foreign: [],
     };
-    const problems = verifyWritten(doc, actual);
-    expect(problems).toEqual([
+    expect(verifyWritten(doc, actual)).toEqual({
+      own: [
+        "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
+        "规则 old1 的过期天数读回来是 2，应为 1",
+        "规则 old1 的状态读回来是 停用，应为 启用",
+        "规则 old2 读回来不见了",
+        "读回来多出一条本工具的规则 extra",
+      ],
+      foreign: ["外部规则写入 1 条，读回来 0 条"],
+    });
+  });
+
+  it("同一个 buildId 读回来多条时逐条核对，危险的那条不会被正确的那条盖住", () => {
+    const actual = {
+      own: [ownRule("old1", { prefix: "" }), ownRule("old1"), ownRule("old2")],
+      foreign: ["<ID>mine</ID>"],
+    };
+    expect(verifyWritten(doc, actual).own).toEqual([
+      "规则 old1 读回来有 2 条",
       "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
-      "规则 old1 的过期天数读回来是 2，应为 1",
-      "规则 old1 的状态读回来是 停用，应为 启用",
-      "规则 old2 读回来不见了",
-      "读回来多出一条本工具的规则 extra",
-      "外部规则写入 1 条，读回来 0 条",
     ]);
+  });
+
+  it("只有外部规则条数不符时，本工具的规则没有问题", () => {
+    expect(verifyWritten(doc, { ...structuredClone(doc), foreign: [] }).own).toEqual([]);
+  });
+});
+
+describe("wholeBucketRules", () => {
+  it("只挑出启用中、前缀为空的自有规则", () => {
+    const doc = {
+      own: [ownRule("ok"), ownRule("bad", { prefix: "" }), ownRule("off", { prefix: "", enabled: false })],
+      foreign: [],
+    };
+    expect(wholeBucketRules(doc)).toEqual(["bad"]);
   });
 });

@@ -595,10 +595,18 @@ describe("collectPlan + Cloudflare API", () => {
 
 /**
  * 有状态的假 R2：PUT 进来的配置存下来，GET 时经 mangle 处理后返回，用来模拟服务端的静默改写。
- * failGetAfterPut 让写入之后的读取失败。
+ * mangle 收到的第二个参数是第几次 GET（从 0 起），可以模拟「刚写完读到旧配置」。
  */
-function statefulR2(opts: { mangle?: (xml: string) => string; failGetAfterPut?: boolean; failSecondPut?: boolean } = {}) {
+function statefulR2(
+  opts: {
+    mangle?: (xml: string, getIndex: number) => string;
+    /** 第几次 PUT（从 0 起）起，之后的 GET 全部失败 */
+    failGetAfterPut?: number;
+    failSecondPut?: boolean;
+  } = {},
+) {
   const puts: string[] = [];
+  let gets = 0;
   let stored = "<LifecycleConfiguration><Rule><ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
   const fetchImpl = (async (request: Request) => {
     if (request.method === "PUT") {
@@ -609,55 +617,121 @@ function statefulR2(opts: { mangle?: (xml: string) => string; failGetAfterPut?: 
       stored = puts[puts.length - 1]!;
       return new Response("", { status: 200 });
     }
-    if (opts.failGetAfterPut && puts.length > 0) {
+    if (opts.failGetAfterPut !== undefined && puts.length > opts.failGetAfterPut) {
       return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
     }
-    return new Response((opts.mangle ?? ((x) => x))(stored), { status: 200 });
+    return new Response((opts.mangle ?? ((x) => x))(stored, gets++), { status: 200 });
   }) as unknown as typeof fetch;
-  return { puts, store: new R2Store({ ...CREDS, fetchImpl }) };
+  return { puts, store: new R2Store({ ...CREDS, fetchImpl }), getCount: () => gets };
 }
 
+const FOREIGN = "<ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration>";
 const DOC = {
   own: [{ buildId: "old1", prefix: "incremental-cache/old1/", expireDays: 1, enabled: true }],
-  foreign: ["<ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration>"],
+  foreign: [FOREIGN],
 };
+const NO_WAIT = { sleep: async () => {} };
+const dropOwnPrefix = (xml: string) =>
+  xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, "");
 
 describe("writeAndVerify", () => {
   it("回读一致时只写一次", async () => {
     const { puts, store } = statefulR2();
-    const result = await writeAndVerify(store, DOC);
-    expect(result).toEqual({ problems: [], rolledBack: null });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result).toEqual({ problems: [], warnings: [], rolledBack: null });
     expect(puts).toHaveLength(1);
   });
 
-  it("服务端丢掉前缀时报出问题，并撤掉本工具的全部规则、保留外部规则", async () => {
-    // 模拟实测到的 R2 行为：规则里的前缀被丢掉，删除规则变成作用于整个 bucket
-    const { puts, store } = statefulR2({
-      mangle: (xml) => xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, ""),
+  it("刚写完读到旧配置时隔一会儿重读，读到一致就不撤销", async () => {
+    const before = "<LifecycleConfiguration><Rule>" + FOREIGN + "</Rule></LifecycleConfiguration>";
+    const sleeps: number[] = [];
+    const { puts, store } = statefulR2({ mangle: (xml, i) => (i === 0 ? before : xml) });
+    const result = await writeAndVerify(store, DOC, {
+      sleep: async (ms) => void sleeps.push(ms),
+      readBackDelayMs: 10,
     });
-    const result = await writeAndVerify(store, DOC);
+    expect(result.rolledBack).toBeNull();
+    expect(sleeps).toEqual([10]);
+    expect(puts).toHaveLength(1);
+  });
+
+  it("服务端丢掉前缀时报出问题，撤掉本工具的全部规则、保留外部规则，并回读确认撤销", async () => {
+    // 模拟实测到的 R2 行为：规则里的前缀被丢掉，删除规则变成作用于整个 bucket
+    const { puts, store, getCount } = statefulR2({ mangle: dropOwnPrefix });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
     expect(result.rolledBack).toBe(true);
     expect(result.problems.join()).toContain("作用于整个 bucket");
     expect(puts).toHaveLength(2);
     expect(puts[1]).not.toContain("opennext-r2-prune:");
     expect(puts[1]).toContain("<ID>mine</ID>");
+    // 写入后读满 3 次仍不符，撤销后再读 1 次确认
+    expect(getCount()).toBe(4);
+  });
+
+  it("自有规则的 ID 被改得认不出时，撤销用写入前的外部规则，不会把它当外部规则留下", async () => {
+    const { puts, store } = statefulR2({
+      mangle: (xml) => dropOwnPrefix(xml).replace("<ID>opennext-r2-prune:old1</ID>", "<ID>renamed</ID>"),
+    });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result.problems).toContain("规则 old1 读回来不见了");
+    expect(result.rolledBack).toBe(true);
+    expect(puts[1]).not.toContain("renamed");
+    expect(puts[1]).toContain("<ID>mine</ID>");
   });
 
   it("撤销也失败时如实报告", async () => {
-    const { store } = statefulR2({
-      mangle: (xml) => xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, ""),
-      failSecondPut: true,
-    });
-    const result = await writeAndVerify(store, DOC);
+    const { store } = statefulR2({ mangle: dropOwnPrefix, failSecondPut: true });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
     expect(result.rolledBack).toBe(false);
     expect(result.rollbackError).toBeDefined();
   });
 
-  it("写入成功但回读失败时不撤销，交由调用方提示人工核对", async () => {
-    const { puts, store } = statefulR2({ failGetAfterPut: true });
-    const result = await writeAndVerify(store, DOC);
+  it("撤销写入成功、但读回来仍有本工具的规则时，不报已撤销", async () => {
+    // 撤销之后服务端仍返回带自有规则的旧配置
+    const { store } = statefulR2({
+      mangle: (xml, i) =>
+        i < 3 ? dropOwnPrefix(xml) : "<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+    });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
+    expect(result.rolledBack).toBe(false);
+    expect(String(result.rollbackError)).toContain("撤销后读回来仍有本工具的规则");
+  });
+
+  it("写入成功但回读失败时无从核对，照样撤销", async () => {
+    const { puts, store } = statefulR2({ failGetAfterPut: 0 });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
     expect(result.readBackError).toBeDefined();
+    expect(puts).toHaveLength(2);
+    expect(puts[1]).not.toContain("opennext-r2-prune:");
+    // 撤销之后也读不回来，无法确认
+    expect(result.rolledBack).toBe(false);
+    expect(String(result.rollbackError)).toContain("回读确认失败");
+  });
+
+  it("只有外部规则条数不符时只给提示，不撤销本工具的规则", async () => {
+    const { puts, store } = statefulR2({ mangle: (xml) => xml.replace(/<Rule><ID>mine<\/ID>[\s\S]*?<\/Rule>/, "") });
+    const result = await writeAndVerify(store, DOC, NO_WAIT);
     expect(result.rolledBack).toBeNull();
+    expect(result.problems).toEqual([]);
+    expect(result.warnings).toEqual(["外部规则写入 1 条，读回来 0 条"]);
     expect(puts).toHaveLength(1);
+  });
+});
+
+describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
+  it("在探测之前回调，探测失败时也已经报过", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
+    const { store, calls } = fakeR2({ buildIds: ["old1", "live"], lifecycle });
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({
+        store,
+        prefix: "incremental-cache",
+        keep: [],
+        onWholeBucketRules: (ids) => void seen.push(ids),
+      }),
+    ).rejects.toThrow(PlanError);
+    expect(seen).toEqual([["old1"]]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 });

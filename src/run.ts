@@ -1,6 +1,6 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
-import { type KeptBuild, makePlan, type PrunePlan, verifyWritten } from "./plan.ts";
+import { type KeptBuild, makePlan, type PrunePlan, type VerifyProblems, verifyWritten, wholeBucketRules } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import type { R2Store } from "./store.ts";
 import type { LifecycleDoc } from "./xml.ts";
@@ -31,6 +31,11 @@ export interface RunOptions {
   onRetry?: OnRetry;
   /** 并发探测预览时的并发数 */
   concurrency?: number;
+  /**
+   * 读到现有配置里有对整个 bucket 生效的自有规则时立即回调（在探测之前）。探测或校验失败
+   * 时整趟会中止，调用方拿不到 RunState，靠这个回调才能在中止前把危险规则报出来。
+   */
+  onWholeBucketRules?: (buildIds: string[]) => void;
 }
 
 export interface CloudflareSource {
@@ -52,6 +57,8 @@ export interface RunState {
    * （含线上当前的；少于 --recent-builds 说明全部 deployment 已经翻完了）、有几个预览
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
+  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的自有规则的 buildId */
+  wholeBucketRules: string[];
   plan: PrunePlan;
 }
 
@@ -64,6 +71,8 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     opts.store.listBuildIds(opts.prefix),
     opts.store.getLifecycle(),
   ]);
+  const dangerous = wholeBucketRules(current);
+  if (dangerous.length > 0) opts.onWholeBucketRules?.(dangerous);
 
   const fetchImpl = opts.fetchImpl ?? fetch;
   const probe: Probe = (url, signal) => probeBuildId(url, fetchImpl, opts.onRetry, signal);
@@ -100,6 +109,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       recent && previews
         ? { deploymentsScanned: recent.scanned, recentBuilds: recent.distinct, previews: previews.length }
         : null,
+    wholeBucketRules: dangerous,
     plan: makePlan({
       existing,
       keep: keeps,
@@ -293,38 +303,97 @@ async function mapWithConcurrency<T, R>(
 }
 
 export interface WriteResult {
-  /** 回读后与期望不符的地方，空数组表示规则已按原样生效 */
+  /** 本工具规则回读后与期望不符的地方，空数组表示本工具的规则已按原样生效（或无从核对） */
   problems: string[];
+  /** 外部规则条数不符这类不影响本工具规则安全的问题，只提示、不触发撤销 */
+  warnings: string[];
+  /** 写入成功、但回读失败时的原因。此时无从核对，按「不符」处理并撤销 */
+  readBackError?: unknown;
   /**
-   * 回读不符时是否已撤掉本工具的全部规则。撤规则只会让删除推迟，绝不会删到数据，
-   * 所以出了不符就先撤，等查明原因再重跑。null 表示无需撤销（回读一致）。
+   * 是否撤掉了本工具的全部规则。撤规则只会让删除推迟，绝不会删到数据，所以核对不过（或无从核对）
+   * 就先撤，等查明原因再重跑。null = 无需撤销；true = 已撤销并回读确认；false = 撤销失败或无法确认。
    */
   rolledBack: boolean | null;
-  /** 撤销失败时的原因 */
+  /** 撤销失败或无法确认的原因 */
   rollbackError?: unknown;
-  /** 写入成功、但回读失败时的原因。此时无从核对，problems 为空、rolledBack 为 null */
-  readBackError?: unknown;
+}
+
+export interface VerifyOptions {
+  /** 回读与期望不符时最多读几次（含第一次），默认 3。应对写入后短时间内还读到旧配置 */
+  readBackAttempts?: number;
+  /** 两次回读之间等多久，默认 2000 毫秒 */
+  readBackDelayMs?: number;
+  /** 测试注入用 */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+type ReadBack = { problems: VerifyProblems } | { error: unknown };
+
+/** 读回配置并核对，不符时隔一会儿再读，直到一致或次数用完。读取本身失败就立即返回（withRetry 已重试过）。 */
+async function readBack(store: R2Store, expected: LifecycleDoc, opts: VerifyOptions): Promise<ReadBack> {
+  const attempts = Math.max(1, opts.readBackAttempts ?? 3);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let problems: VerifyProblems = { own: [], foreign: [] };
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await sleep(opts.readBackDelayMs ?? 2000);
+    let actual: LifecycleDoc;
+    try {
+      actual = await store.getLifecycle();
+    } catch (error) {
+      return { error };
+    }
+    problems = verifyWritten(expected, actual);
+    if (problems.own.length === 0 && problems.foreign.length === 0) break;
+  }
+  return { problems };
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
- * 写入规则，再读回来逐条核对。对不上时立即重写一份只含外部规则的配置，把本工具的规则全部撤掉
- * —— 一条前缀被服务端丢掉的删除规则会作用于整个 bucket，不能让它留在那里等人发现。
+ * 写入规则，再读回来逐条核对。本工具的规则对不上、或根本读不回来时，立即重写一份只含外部规则的
+ * 配置把本工具的规则全部撤掉 —— 一条前缀被服务端丢掉的删除规则会作用于整个 bucket，不能让它
+ * 留在那里等人发现。撤销同样要读回来确认，否则「已撤销」只是一句没有根据的保证。
  */
-export async function writeAndVerify(store: R2Store, doc: LifecycleDoc): Promise<WriteResult> {
+export async function writeAndVerify(
+  store: R2Store,
+  doc: LifecycleDoc,
+  opts: VerifyOptions = {},
+): Promise<WriteResult> {
   await store.putLifecycle(doc);
-  let actual: LifecycleDoc;
-  try {
-    actual = await store.getLifecycle();
-  } catch (readBackError) {
-    return { problems: [], rolledBack: null, readBackError };
+  const check = await readBack(store, doc, opts);
+  if ("problems" in check && check.problems.own.length === 0) {
+    return { problems: [], warnings: check.problems.foreign, rolledBack: null };
   }
-  const problems = verifyWritten(doc, actual);
-  if (problems.length === 0) return { problems, rolledBack: null };
+  const base =
+    "error" in check
+      ? { problems: [], warnings: [], readBackError: check.error }
+      : { problems: check.problems.own, warnings: check.problems.foreign };
 
+  // 外部规则用写入前读到、本次原样搬运的那份，而不是回读到的：被服务端改掉 ID 的自有规则会被
+  // 认成外部规则，照着回读结果写回去就等于把它留下了；回读残缺时还会把用户的规则一并弄丢。
+  const rollbackDoc: LifecycleDoc = { own: [], foreign: doc.foreign };
   try {
-    await store.putLifecycle({ own: [], foreign: actual.foreign });
-    return { problems, rolledBack: true };
+    await store.putLifecycle(rollbackDoc);
   } catch (rollbackError) {
-    return { problems, rolledBack: false, rollbackError };
+    return { ...base, rolledBack: false, rollbackError };
   }
+  const after = await readBack(store, rollbackDoc, opts);
+  if ("error" in after) {
+    return {
+      ...base,
+      rolledBack: false,
+      rollbackError: new Error(`撤销已写入，但回读确认失败：${message(after.error)}`),
+    };
+  }
+  if (after.problems.own.length > 0) {
+    return {
+      ...base,
+      rolledBack: false,
+      rollbackError: new Error(`撤销后读回来仍有本工具的规则：${after.problems.own.join("；")}`),
+    };
+  }
+  return { ...base, rolledBack: true };
 }

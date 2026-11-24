@@ -199,40 +199,63 @@ function expireState(before: OwnRule | undefined, after: OwnRule): ExpireState {
   return sameRule(before, after) ? "pending" : "updated";
 }
 
+/** 回读核对的结果。own 不为空说明本工具的规则没有按原样生效，必须撤销；foreign 只需提示。 */
+export interface VerifyProblems {
+  own: string[];
+  foreign: string[];
+}
+
 /**
- * 写入后把配置读回来，与期望写入的逐条比对，返回所有对不上的地方（空数组即一致）。
+ * 写入后把配置读回来，与期望写入的逐条比对，列出所有对不上的地方（两个数组都为空即一致）。
  *
  * PUT 返回 200 不代表规则按原样生效：实测 R2 会静默丢掉裸 <Prefix>，把一条只针对某个
  * build 目录的删除规则变成作用于整个 bucket 的。这类服务端的静默改写只有读回来才看得见。
- * 外部规则整块原样搬运，服务端可能调整它们的写法，所以只核对条数。
+ * 同一个 buildId 读回来的每一条都要核对：只按 buildId 取一条，会让重复出来的危险规则蒙混过去。
+ * 外部规则整块原样搬运，服务端可能调整它们的写法，所以只核对条数，且单独列出 —— 它不影响
+ * 本工具规则是否安全，不该因此撤掉本工具的规则。
  */
-export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): string[] {
-  const problems: string[] = [];
-  const actualById = new Map(actual.own.map((rule) => [rule.buildId, rule]));
+export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): VerifyProblems {
+  const own: string[] = [];
+  const actualById = new Map<string, OwnRule[]>();
+  for (const rule of actual.own) {
+    const rules = actualById.get(rule.buildId);
+    if (rules) rules.push(rule);
+    else actualById.set(rule.buildId, [rule]);
+  }
   const expectedIds = new Set(expected.own.map((rule) => rule.buildId));
 
   for (const want of expected.own) {
-    const got = actualById.get(want.buildId);
-    if (!got) {
-      problems.push(`规则 ${want.buildId} 读回来不见了`);
+    const rules = actualById.get(want.buildId) ?? [];
+    if (rules.length === 0) {
+      own.push(`规则 ${want.buildId} 读回来不见了`);
       continue;
     }
-    if (got.prefix !== want.prefix) {
-      const shown = got.prefix === "" ? "空（作用于整个 bucket！）" : got.prefix;
-      problems.push(`规则 ${want.buildId} 的前缀读回来是 ${shown}，应为 ${want.prefix}`);
-    }
-    if (got.expireDays !== want.expireDays) {
-      problems.push(`规则 ${want.buildId} 的过期天数读回来是 ${got.expireDays}，应为 ${want.expireDays}`);
-    }
-    if (got.enabled !== want.enabled) {
-      problems.push(`规则 ${want.buildId} 的状态读回来是 ${got.enabled ? "启用" : "停用"}，应为 ${want.enabled ? "启用" : "停用"}`);
+    if (rules.length > 1) own.push(`规则 ${want.buildId} 读回来有 ${rules.length} 条`);
+    for (const got of rules) {
+      if (got.prefix !== want.prefix) {
+        const shown = got.prefix === "" ? "空（作用于整个 bucket！）" : got.prefix;
+        own.push(`规则 ${want.buildId} 的前缀读回来是 ${shown}，应为 ${want.prefix}`);
+      }
+      if (got.expireDays !== want.expireDays) {
+        own.push(`规则 ${want.buildId} 的过期天数读回来是 ${got.expireDays}，应为 ${want.expireDays}`);
+      }
+      if (got.enabled !== want.enabled) {
+        own.push(`规则 ${want.buildId} 的状态读回来是 ${got.enabled ? "启用" : "停用"}，应为 ${want.enabled ? "启用" : "停用"}`);
+      }
     }
   }
   for (const rule of actual.own) {
-    if (!expectedIds.has(rule.buildId)) problems.push(`读回来多出一条本工具的规则 ${rule.buildId}`);
+    if (!expectedIds.has(rule.buildId)) own.push(`读回来多出一条本工具的规则 ${rule.buildId}`);
   }
-  if (actual.foreign.length !== expected.foreign.length) {
-    problems.push(`外部规则写入 ${expected.foreign.length} 条，读回来 ${actual.foreign.length} 条`);
-  }
-  return problems;
+
+  const foreign =
+    actual.foreign.length === expected.foreign.length
+      ? []
+      : [`外部规则写入 ${expected.foreign.length} 条，读回来 ${actual.foreign.length} 条`];
+  return { own, foreign };
+}
+
+/** 启用中、前缀为空的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是这样）。 */
+export function wholeBucketRules(doc: LifecycleDoc): string[] {
+  return doc.own.filter((rule) => rule.enabled && rule.prefix === "").map((rule) => rule.buildId);
 }

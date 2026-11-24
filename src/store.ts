@@ -29,13 +29,14 @@ export interface StoreOptions {
   onRetry?: OnRetry;
 }
 
-/** 本工具发给 R2 的三种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
-export type S3Operation = "list" | "getLifecycle" | "putLifecycle";
+/** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
+export type S3Operation = "list" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
 const OPERATION_LABEL: Record<S3Operation, string> = {
   list: "列出 build 目录",
   getLifecycle: "读取 lifecycle 规则",
   putLifecycle: "写入 lifecycle 规则",
+  deleteLifecycle: "清空 lifecycle 规则",
 };
 
 // R2 的 token 权限分 Object 级（可限定 bucket）与 Admin 级（整个账号）。lifecycle 是 bucket 级配置，
@@ -46,6 +47,7 @@ const PERMISSION_HINT: Record<S3Operation, string> = {
     "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
     "只跑 --dry-run 需要 Admin Read only，写入规则需要 Admin Read & Write。",
   putLifecycle: "写入 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都写不了。",
+  deleteLifecycle: "清空 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都做不了。",
 };
 
 export class S3Error extends Error {
@@ -150,13 +152,24 @@ export class R2Store {
     }
   }
 
+  /**
+   * 整份覆盖 lifecycle 配置。一条规则都不剩时走清空：S3 规范不允许不含 <Rule> 的配置，
+   * 而 R2 文档既没写它对空配置的态度，也没把 DeleteBucketLifecycle 列为已支持。所以先按 PUT
+   * 试，被当成格式错误（400）拒掉再退回 DELETE。到底生效没有，由调用方的回读核对确认。
+   */
   async putLifecycle(doc: LifecycleDoc): Promise<void> {
     const body = renderLifecycle(doc);
     const headers: Record<string, string> = { "Content-Type": "application/xml" };
     const md5 = this.#opts.md5Base64?.(body);
     if (md5) headers["Content-MD5"] = md5;
 
-    await this.#request("putLifecycle", `${this.#base}?lifecycle`, { method: "PUT", body, headers });
+    try {
+      await this.#request("putLifecycle", `${this.#base}?lifecycle`, { method: "PUT", body, headers });
+    } catch (error) {
+      const empty = doc.own.length === 0 && doc.foreign.length === 0;
+      if (!empty || !(error instanceof S3Error) || error.status !== 400) throw error;
+      await this.#request("deleteLifecycle", `${this.#base}?lifecycle`, { method: "DELETE" });
+    }
   }
 }
 

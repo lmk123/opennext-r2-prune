@@ -139,6 +139,24 @@ describe("lifecycle", () => {
     expect(error.message).toBe("列出 build 目录失败（HTTP 404，NoSuchBucket：bucket 不存在）");
   });
 
+  it("清空配置时 PUT 空配置被当格式错误拒掉，就退回 DELETE", async () => {
+    const { calls, fetchImpl } = stub([
+      ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 }),
+      () => new Response(null, { status: 204 }),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await store.putLifecycle({ own: [], foreign: [] });
+    expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
+    expect(new URL(calls[1]!.url).searchParams.has("lifecycle")).toBe(true);
+  });
+
+  it("配置不为空时 PUT 被拒就直接报错，不会退回 DELETE", async () => {
+    const { calls, fetchImpl } = stub([ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 })]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await expect(store.putLifecycle({ own: [], foreign: ["<ID>mine</ID>"] })).rejects.toThrow(S3Error);
+    expect(calls.map((c) => c.method)).toEqual(["PUT"]);
+  });
+
   it("写入时带上 Content-MD5", async () => {
     const { calls, fetchImpl } = stub([ok("", { status: 200 })]);
     const store = new R2Store({
