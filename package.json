@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "tsup",
+    "prepare": "tsup",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "start": "node --experimental-strip-types src/cli.ts"

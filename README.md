@@ -151,6 +151,15 @@ bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--
 同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
 `AbortSignal`），Node 20+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
 
+本包没有发布到 npm，请从 GitHub 安装，安装时 `prepare` 脚本会构建出 `dist`：
+
+```bash
+npm install github:lmk123/opennext-r2-prune
+```
+
+pnpm 默认不跑 git 依赖的构建脚本，会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。这时要按报错里给出的完整写法
+（含 commit），把本包加进 `pnpm-workspace.yaml` 的 `allowBuilds`，只写包名不管用。
+
 ```ts
 import { createHash } from "node:crypto";
 import { prune } from "opennext-r2-prune";
@@ -175,8 +184,8 @@ console.log(result.expire, result.written, result.verified);
 
 选项与命令行开关一一对应，改成驼峰：`--build-id-url` → `buildIdUrl`、`--recent-builds` →
 `recentBuilds`、`--allow-root-prefix` → `allowRootPrefix`、`--dry-run` → `dryRun`，`--url` 对应
-`siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。报错文案沿用命令行的
-开关名。
+`siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。参数校验的报错用
+上面的选项名；探测与安全校验阶段的报错沿用命令行的开关名（比如「请改用 --keep」），按这张对应表换算。
 
 需要先看计划、再决定写不写时，用两段式的 `planPrune`：
 
@@ -197,6 +206,7 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
   `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败）
   务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
+- 重复调用同一个 `apply()` 是用法错误，抛普通 `Error`，不发任何请求；要再写入请重新调用 `planPrune`。
 
 返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
 `cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。

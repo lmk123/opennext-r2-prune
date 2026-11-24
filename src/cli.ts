@@ -168,7 +168,9 @@ async function main(argv: string[]): Promise<number> {
     accessKeyId: accessKeyId!,
     secretAccessKey: secretAccessKey!,
     worker,
-    apiToken,
+    // 环境变量里的 CLOUDFLARE_API_TOKEN 可能是给 wrangler 准备的，没开 --worker 时不能传下去：
+    // 库的校验见到 apiToken 就要求 worker，会把只用 --url 的人拦下
+    apiToken: worker ? apiToken : undefined,
     recentBuilds: worker ? recentBuilds : undefined,
     siteUrl,
     buildIdUrl: values["build-id-url"],
