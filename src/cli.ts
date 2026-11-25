@@ -50,17 +50,18 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --expire-days <n>            规则的过期天数，默认 1
   --grace-hours <n>            目录写入不满 n 小时的 build 不判作废，默认 24；0 关闭
                                OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住。
-                               规则名额不够、要分批挂时，也按这里读到的写入时间先挂最老的；为 0 时按 build id 挑
+                               规则名额不够、要分批挂时，也按这里读到的写入时间先挂最老的；为 0 时按 build id 挑。
+                               名额一条不剩时不读写入时间
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段；
-                               deferred 是规则名额不够、这次没挂规则的作废 build）
+                               deferred 是规则名额不够、这次没挂规则的 build）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
   --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
   --verbose                    打印重试等额外信息
   --help, -h                   显示本帮助
 
-退出码：0 成功（有 build 因规则名额不够推迟也算）/ 1 参数或校验失败 / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
+退出码：0 成功（有 build 因规则名额不够推迟也算）/ 1 参数或校验失败（含规则名额永远空不出来） / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
 
 function parseCliArgs(argv: string[]) {
   return parseArgs({
@@ -362,8 +363,8 @@ function printPlan(plan: PrunePlanSummary): void {
 
   if (plan.deferred.length > 0) {
     console.log(
-      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条，分批挂时给你自己的规则留 ${RESERVED_RULES} 条余量），` +
-        `以下 ${plan.deferred.length} 个作废 build 这次不挂规则：`,
+      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条，本工具挂规则时给你自己的规则留 ${RESERVED_RULES} 条余量），` +
+        `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时不读写入时间，刚写入的也列在这里）：`,
     );
     for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
     console.log(

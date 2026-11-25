@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify, WriteNotAppliedError } from "../src/run.ts";
-import { MAX_RULES, PlanError } from "../src/plan.ts";
+import { MAX_RULES, PlanError, RESERVED_RULES } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
 
@@ -19,7 +19,14 @@ const CREDS = {
 };
 
 /** 一个按 URL 派发的假 R2。writtenAt 里没有的 build 按「早就写好的」回答 */
-function fakeR2(opts: { buildIds: string[]; lifecycle?: string; writtenAt?: Record<string, string>; failWrittenAt?: boolean }) {
+function fakeR2(opts: {
+  buildIds: string[];
+  lifecycle?: string;
+  writtenAt?: Record<string, string>;
+  failWrittenAt?: boolean;
+  /** 下面一个对象都没有的前缀 */
+  emptyScopes?: string[];
+}) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -36,6 +43,9 @@ function fakeR2(opts: { buildIds: string[]; lifecycle?: string; writtenAt?: Reco
     // 读写入时间：只要一个对象
     if (url.searchParams.get("max-keys") === "1") {
       if (opts.failWrittenAt) return new Response("<Error><Code>InternalError</Code></Error>", { status: 400 });
+      if (opts.emptyScopes?.includes(url.searchParams.get("prefix")!)) {
+        return new Response("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
+      }
       const buildId = url.searchParams.get("prefix")!.split("/")[1]!;
       const time = opts.writtenAt?.[buildId] ?? "2020-01-01T00:00:00.000Z";
       return new Response(
@@ -284,7 +294,7 @@ describe("collectPlan 与规则总数上限", () => {
           <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
       )
       .join("");
-    const { store } = fakeR2({
+    const { store, calls } = fakeR2({
       buildIds: ["live", "old1", "old2", "new1"],
       lifecycle: userRules(MAX_RULES - 2).replace("</LifecycleConfiguration>", `${rules}</LifecycleConfiguration>`),
     });
@@ -295,6 +305,42 @@ describe("collectPlan 与规则总数上限", () => {
     ]);
     expect(state.plan.deferred).toEqual([{ buildId: "new1" }]);
     expect(state.plan.changed).toBe(false);
+    // 名额为 0 时一条也挂不上，不读写入时间
+    expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
+  });
+
+  /** 用户的规则 users 条，外加本工具为前缀 site-b/ 写的 n 条 */
+  const withOtherSite = (users: number, n: number) =>
+    userRules(users).replace(
+      "</LifecycleConfiguration>",
+      `${Array.from(
+        { length: n },
+        (_, i) => `<Rule><ID>opennext-r2-prune:site-b/b${i}/</ID><Status>Enabled</Status>
+          <Filter><Prefix>site-b/b${i}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
+      ).join("")}</LifecycleConfiguration>`,
+    );
+
+  it("名额被弃用前缀（下面已经没有对象）的规则占满时中止，不发任何写请求", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 500),
+      emptyScopes: ["site-b/"],
+    });
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
+    ).rejects.toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\//);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("名额被仍在用的别的前缀占着时只推迟，不中止", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 500),
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.deferred).toEqual([{ buildId: "old1" }]);
+    expect(state.plan.changed).toBe(false);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix") === "site-b/")).toBe(true);
   });
 
   it("graceHours 为 0 时不读写入时间，名额不够就按 buildId 挑", async () => {

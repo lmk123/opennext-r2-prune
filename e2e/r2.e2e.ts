@@ -188,12 +188,15 @@ describe("基本流程", () => {
     ]);
     expect(result.deferred).toEqual([{ buildId: "build-d" }]);
     expect(result).toMatchObject({ written: true, verified: true, warnings: [], writeError: null });
-    const rules = await r2.rules();
-    expect(rules).toHaveLength(1000);
-    expect(rules.filter((rule) => rule.id.startsWith("opennext-r2-prune:")).map((rule) => rule.id).sort()).toEqual([
-      ownId(SITE_A, "build-b"),
-      ownId(SITE_A, "build-c"),
-    ]);
+    // 刚写完可能读到旧配置；等读回的稳定下来，下面第二趟才不会按旧配置再写一次
+    await eventually(async () => {
+      const rules = await r2.rules();
+      expect(rules).toHaveLength(1000);
+      expect(rules.filter((rule) => rule.id.startsWith("opennext-r2-prune:")).map((rule) => rule.id).sort()).toEqual([
+        ownId(SITE_A, "build-b"),
+        ownId(SITE_A, "build-c"),
+      ]);
+    });
 
     // 名额仍满时推迟的接着等，不写入
     const again = options(SITE_A, { keep: ["build-a"] });

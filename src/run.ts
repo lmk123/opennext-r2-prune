@@ -7,6 +7,7 @@ import {
   makePlan,
   PlanError,
   type PrunePlan,
+  ruleBudget,
   type VerifyProblems,
   verifyWritten,
   wholeBucketRules,
@@ -141,10 +142,24 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长。
   // 顺带拿到的写入时间也决定名额不够时先挂谁；--grace-hours 0 时不读，名额不够就按 buildId 挑
   const candidates = draft.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  const ruled = draft.expire.length - candidates.length;
+
+  // 名额不够时才去看别的前缀是不是已经弃用（下面一个对象都没有）：那里的规则没人回收，名额可能永远空不出来
+  let budget = ruleBudget(current, ruled);
+  let emptyScopes: Set<string> | undefined;
+  if (candidates.length > budget.room && current.others.length > 0) {
+    const scopes = [...new Set(current.others.map((rule) => rule.scope))];
+    const empty = await mapWithConcurrency(scopes, concurrency, signal, (scope) => opts.store.isEmptyUnder(scope));
+    emptyScopes = new Set(scopes.filter((_, i) => empty[i]));
+    budget = ruleBudget(current, ruled, emptyScopes);
+  }
+
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
   let writtenAt: Map<string, Date | null> | undefined;
-  if (graceMs > 0 && candidates.length > 0) {
+  // 名额为 0 时一条也挂不上，不必读：积压大时每轮都逐个读，请求数随积压增长。名额永远空不出来时仍要读，
+  // 好分清要中止的是不是全是刚写入的 build
+  if (graceMs > 0 && candidates.length > 0 && (budget.room > 0 || budget.exhausted)) {
     const now = (opts.now ?? Date.now)();
     const times = await mapWithConcurrency(candidates, concurrency, signal, (buildId) =>
       opts.store.buildWrittenAt(opts.prefix, buildId),
@@ -157,7 +172,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       }
     }
   }
-  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt });
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyScopes });
 
   return {
     onlineBuildId,

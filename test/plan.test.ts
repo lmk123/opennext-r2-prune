@@ -256,6 +256,53 @@ describe("规则总数上限", () => {
     expect(plan.deferred).toEqual([]);
   });
 
+  it("全部挂得下时也只挂到上限减余量，余量照样留给用户", () => {
+    const plan = makePlan(
+      input({ existing: ["online1", ...ids("old", 495)], current: lifecycle([], foreign(500)) }),
+    );
+    expect(plan.expire).toHaveLength(MAX_RULES - RESERVED_RULES - 500);
+    expect(plan.deferred).toHaveLength(495 - (MAX_RULES - RESERVED_RULES - 500));
+  });
+
+  it("用户的规则还没挤进余量时，总数不超过上限减余量", () => {
+    const users = MAX_RULES - RESERVED_RULES - 5;
+    const plan = makePlan(
+      input({ existing: ["online1", ...ids("old", 20)], current: lifecycle([], foreign(users)) }),
+    );
+    expect(plan.expire).toHaveLength(5);
+    expect(plan.nextDoc.own.length + plan.nextDoc.foreign.length).toBe(MAX_RULES - RESERVED_RULES);
+  });
+
+  it("弃用前缀（下面已经没有对象）的规则加上用户的规则占满名额时中止，并列出那些前缀", () => {
+    const others = otherSite(MAX_RULES - RESERVED_RULES - 500);
+    expect(() =>
+      makePlan(
+        input({
+          existing: ["online1", "new1"],
+          current: { ...lifecycle([], [...foreign(500), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
+          emptyScopes: new Set(["site-b/"]),
+        }),
+      ),
+    ).toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\/[\s\S]*wrangler r2 bucket lifecycle list/);
+  });
+
+  it("名额永远空不出来、但还有回收要写时先照常写入，不中止", () => {
+    const others = otherSite(MAX_RULES - RESERVED_RULES - 500);
+    const plan = makePlan(
+      input({
+        existing: ["online1", "new1"],
+        current: {
+          ...lifecycle([ownRule("online1")], [...foreign(500), ...others.map((rule) => `<ID>${rule.id}</ID>`)]),
+          others,
+        },
+        emptyScopes: new Set(["site-b/"]),
+      }),
+    );
+    expect(plan.reclaim).toEqual([{ buildId: "online1", reason: "revived" }]);
+    expect(plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(plan.changed).toBe(true);
+  });
+
   it("skipRuleLimit 时不截断也不中止", () => {
     const plan = makePlan(input({ current: lifecycle([], foreign(MAX_RULES)), skipRuleLimit: true }));
     expect(plan.expire.map((b) => b.buildId)).toEqual(["old1", "old2"]);

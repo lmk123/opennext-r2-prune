@@ -31,11 +31,12 @@ export interface StoreOptions {
 }
 
 /** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
-export type S3Operation = "list" | "writtenAt" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
+export type S3Operation = "list" | "writtenAt" | "scopeEmpty" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
 const OPERATION_LABEL: Record<S3Operation, string> = {
   list: "列出 build 目录",
   writtenAt: "读取 build 目录的写入时间",
+  scopeEmpty: "查看别的缓存前缀下还有没有对象",
   getLifecycle: "读取 lifecycle 规则",
   putLifecycle: "写入 lifecycle 规则",
   deleteLifecycle: "清空 lifecycle 规则",
@@ -46,6 +47,7 @@ const OPERATION_LABEL: Record<S3Operation, string> = {
 const PERMISSION_HINT: Record<S3Operation, string> = {
   list: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
   writtenAt: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
+  scopeEmpty: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
   getLifecycle:
     "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
     "只跑 --dry-run 需要 Admin Read only，写入规则需要 Admin Read & Write。",
@@ -166,6 +168,16 @@ export class R2Store {
     } while (token);
 
     return found;
+  }
+
+  /** prefix（原样使用，不再规范化）下一个对象都没有时为 true。只取一个对象，一个请求 */
+  async isEmptyUnder(prefix: string): Promise<boolean> {
+    const url = new URL(this.#base);
+    url.searchParams.set("list-type", "2");
+    url.searchParams.set("prefix", prefix);
+    url.searchParams.set("max-keys", "1");
+    const result = parseListObjects(await (await this.#request("scopeEmpty", url.toString())).text());
+    return result.lastModified.length === 0 && result.commonPrefixes.length === 0;
   }
 
   /**

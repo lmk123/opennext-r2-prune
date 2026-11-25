@@ -113,8 +113,8 @@ export interface PrunePlanSummary {
   /** 交给 R2 删除的 build */
   expire: ExpiringBuild[];
   /**
-   * 已判作废、但 lifecycle 规则名额不够（R2 每个 bucket 最多 1000 条，分批挂时给用户自己的规则留些余量），这次没挂规则的 build（不算保留）。
-   * 之后的运行回收已删完的规则、空出名额后再挂，逐轮清完
+   * 保留集之外、但 lifecycle 规则名额不够（R2 每个 bucket 最多 1000 条，本工具挂规则时给用户自己的规则留 10 条余量），这次没挂规则的 build（不算保留）。
+   * 之后的运行回收已删完的规则、空出名额后再挂，逐轮清完。名额一条不剩时不读写入时间，刚写入的 build 也列在这里
    */
   deferred: DeferredBuild[];
   /** 要回收或摘除的已有规则 */

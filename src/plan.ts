@@ -2,6 +2,7 @@ import { normalizePrefix, rulePrefix } from "./prefix.ts";
 import {
   type LifecycleDoc,
   MAX_RULE_ID_LENGTH,
+  type OtherScopeRule,
   type OwnRule,
   type ParsedLifecycle,
   RULE_ID_PREFIX,
@@ -18,7 +19,7 @@ import {
 export const MAX_RULES = 1000;
 
 /**
- * 名额不够、要分批挂时给用户自己的规则留的余量。不留的话积压清完之前 bucket 一直是满的，
+ * 本工具挂规则时给用户自己的规则留的余量：总数只挂到 MAX_RULES - RESERVED_RULES。不留的话 bucket 会被挂满，
  * 用户新加规则会被 R2 以 MalformedXML 拒绝，很难查出是条数超了
  */
 export const RESERVED_RULES = 10;
@@ -61,7 +62,10 @@ export interface ReclaimedRule {
   reason: ReclaimReason;
 }
 
-/** 已判作废、但 lifecycle 规则名额不够，这次没挂上规则的 build。之后的运行回收规则、空出名额后再挂 */
+/**
+ * 保留集之外、但 lifecycle 规则名额不够，这次没挂上规则的 build。之后的运行回收规则、空出名额后再挂。
+ * 名额为 0 时不读写入时间（见 collectPlan），刚写入、本该暂且不判的 build 这时也列在这里
+ */
 export interface DeferredBuild {
   buildId: string;
 }
@@ -109,6 +113,11 @@ export interface PlanInput {
    * 刚写入的 build 会占名额，名额被外部规则占满时还会白白中止
    */
   skipRuleLimit?: boolean;
+  /**
+   * 一个对象都没有的别的缓存前缀（与 others[].scope 同形）。在用的站点前缀下至少有线上 build 的缓存，
+   * 所以这些前缀下本工具写的规则不会有哪一趟去回收，算名额时和用户自己的规则一样当成永久占用
+   */
+  emptyScopes?: ReadonlySet<string>;
 }
 
 /**
@@ -253,9 +262,9 @@ export function makePlan(input: PlanInput): PrunePlan {
       reason: existingSet.has(buildId) ? ("revived" as const) : ("emptied" as const),
     }));
 
-  const { attach, deferred } = input.skipRuleLimit
-    ? { attach: new Set(expireIds), deferred: [] }
-    : fitRuleLimit(expireIds, currentById, current, input.writtenAt);
+  const { attach, deferred, budget } = input.skipRuleLimit
+    ? { attach: new Set(expireIds), deferred: [], budget: undefined }
+    : fitRuleLimit(expireIds, currentById, current, input.writtenAt, input.emptyScopes);
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
   // 另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
@@ -269,6 +278,16 @@ export function makePlan(input: PlanInput): PrunePlan {
       enabled: true,
     }));
 
+  const changed =
+    current.own.length !== nextOwn.length ||
+    nextOwn.some((rule) => !sameRule(currentById.get(rule.buildId), rule));
+
+  // 名额被永远不会自己空出来的规则占满时，推迟的 build 再等多少轮也挂不上，只能由人清理。
+  // 还有别的改动（摘掉回滚 build 的规则、回收删完的）时先照常写入，它们不能被名额问题挡住；下一趟没别的可写时再中止
+  if (budget?.exhausted && deferred.length > 0 && !changed) {
+    throw new PlanError(exhaustedMessage(budget, deferred.length));
+  }
+
   return {
     keep,
     absent,
@@ -279,51 +298,91 @@ export function makePlan(input: PlanInput): PrunePlan {
     })),
     reclaim,
     nextDoc: { prefix: current.prefix, own: nextOwn, foreign: current.foreign },
-    changed:
-      current.own.length !== nextOwn.length ||
-      nextOwn.some((rule) => !sameRule(currentById.get(rule.buildId), rule)),
+    changed,
   };
+}
+
+/** 规则名额的核算结果 */
+export interface RuleBudget {
+  /** 这次还能新挂几条规则 */
+  room: number;
+  /** 本工具最多挂到的规则总数 */
+  cap: number;
+  /** 用户自己的规则条数 */
+  users: number;
+  /** 本工具为已经没有对象的前缀写的规则，没有哪一趟会回收 */
+  stale: OtherScopeRule[];
+  /** 用户的规则加上 stale 就占满了 cap：名额永远空不出来 */
+  exhausted: boolean;
+}
+
+/**
+ * 核算 lifecycle 规则名额。ruled 是这一趟留着已有规则的作废 build 个数。
+ *
+ * 总数只挂到上限减去 RESERVED_RULES，给用户自己的规则留余量；用户的规则已经挤进这段余量时让给本工具，
+ * 否则每轮一条都挂不上。本工具为别的在用前缀写的规则会被那个前缀的运行回收，不算永久占用。
+ */
+export function ruleBudget(current: ParsedLifecycle, ruled: number, emptyScopes?: ReadonlySet<string>): RuleBudget {
+  // foreign 里也装着本工具为别的前缀写的、以及拆不开的规则的原文，扣掉才是用户自己的
+  const users = current.foreign.length - current.others.length - current.malformed.length;
+  const stale = emptyScopes ? current.others.filter((rule) => emptyScopes.has(rule.scope)) : [];
+  const cap = users >= MAX_RULES - RESERVED_RULES ? MAX_RULES : MAX_RULES - RESERVED_RULES;
+  return {
+    room: Math.max(0, cap - current.foreign.length - ruled),
+    cap,
+    users,
+    stale,
+    exhausted: users + stale.length >= cap,
+  };
+}
+
+function exhaustedMessage(budget: RuleBudget, deferred: number): string {
+  const scopes = [...new Set(budget.stale.map((rule) => rule.scope))];
+  const staleNote =
+    budget.stale.length > 0
+      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则还有 ${budget.stale.length} 条——这些前缀下已经一个对象都没有，` +
+        `没有站点在用，不会有哪一趟运行回收它们`
+      : "";
+  const capNote =
+    budget.cap < MAX_RULES ? `，本工具挂规则时最多挂到 ${budget.cap} 条、给你自己的规则留 ${RESERVED_RULES} 条余量` : "";
+  const staleFix =
+    budget.stale.length > 0
+      ? `（弃用前缀下的规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/，确认那个前缀确实弃用后删掉）`
+      : "";
+  return (
+    `核对 lifecycle 规则名额时中止：R2 每个 bucket 最多 ${MAX_RULES} 条 lifecycle 规则，bucket 上你自己的规则有 ` +
+    `${budget.users} 条${staleNote}${capNote}，名额永远空不出来，${deferred} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
+    `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉${staleFix}，空出名额后重跑。`
+  );
 }
 
 /**
  * 按 R2 的规则总数上限挑出这次挂规则的作废 build，其余推迟到之后的运行。
  *
  * 已经挂着规则的一律留下（哪怕要改写）：摘掉它，R2 正在进行的删除就停了，下次还得重新排队。
- * 全都挂得下就全挂；挂不下时总数只挂到上限减去 RESERVED_RULES，给用户自己的规则留余量（用户的规则
- * 已经挤进这段余量时让给本工具，保证每轮至少能挂上几条），按写入时间从早到晚挂满。
- * 推迟的 build 不挂规则也不算保留；R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。
+ * 名额（见 ruleBudget）够就全挂，不够时按写入时间从早到晚挂满。推迟的 build 不挂规则也不算保留；
+ * R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。
  *
- * 只有用户自己的规则就占满上限时才中止：那时名额永远空不出来，只能由人来清理。本工具为别的前缀写的
- * 规则占着名额时只推迟不中止：那个前缀的运行删完会自己回收，中止会让共用 bucket 的另一个站点每趟都失败。
+ * 本工具为别的在用前缀写的规则占着名额时只推迟不中止：那个前缀的运行删完会自己回收，中止会让共用 bucket
+ * 的另一个站点每趟都失败。名额永远空不出来时由 makePlan 中止。
  */
 function fitRuleLimit(
   expireIds: string[],
   currentById: ReadonlyMap<string, OwnRule>,
   current: ParsedLifecycle,
   writtenAt: ReadonlyMap<string, Date | null> | undefined,
-): { attach: Set<string>; deferred: string[] } {
-  const foreign = current.foreign.length;
+  emptyScopes: ReadonlySet<string> | undefined,
+): { attach: Set<string>; deferred: string[]; budget: RuleBudget } {
   const ruled = expireIds.filter((id) => currentById.has(id));
   const unruled = expireIds.filter((id) => !currentById.has(id));
-  if (unruled.length <= MAX_RULES - foreign - ruled.length) return { attach: new Set(expireIds), deferred: [] };
+  const budget = ruleBudget(current, ruled.length, emptyScopes);
+  if (unruled.length <= budget.room) return { attach: new Set(expireIds), deferred: [], budget };
 
-  // foreign 里也装着本工具为别的前缀写的、以及拆不开的规则的原文，扣掉才是用户自己的
-  const users = foreign - current.others.length - current.malformed.length;
-  if (users >= MAX_RULES) {
-    throw new PlanError(
-      `核对 lifecycle 规则名额时中止：bucket 上你自己的 lifecycle 规则已有 ${users} 条，占满了 R2 每个 bucket ` +
-        `${MAX_RULES} 条的上限，${unruled.length} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
-        `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉，空出名额后重跑。`,
-    );
-  }
-
-  const cap = Math.max(MAX_RULES - RESERVED_RULES, Math.min(MAX_RULES, users + RESERVED_RULES));
-  const room = Math.max(0, cap - foreign - ruled.length);
   const time = (id: string) => writtenAt?.get(id)?.getTime() ?? Number.POSITIVE_INFINITY;
   // 两边都没有时间时 Infinity - Infinity 是 NaN，同样落到按 buildId 排
   const order = [...unruled].sort((a, b) => time(a) - time(b) || (a < b ? -1 : a > b ? 1 : 0));
-  const attach = new Set([...ruled, ...order.slice(0, room)]);
-  return { attach, deferred: unruled.filter((id) => !attach.has(id)) };
+  const attach = new Set([...ruled, ...order.slice(0, budget.room)]);
+  return { attach, deferred: unruled.filter((id) => !attach.has(id)), budget };
 }
 
 /** 逐字段比对，任何一项不同都意味着这条规则得重写 —— 只比条数会漏掉选项变更。 */
