@@ -149,6 +149,7 @@ describe("规则总数上限", () => {
     expect(plan.expire.some((b) => deferred.has(b.buildId))).toBe(false);
     expect(plan.keep.some((b) => deferred.has(b.buildId))).toBe(false);
     expect(plan.changed).toBe(true);
+    expect(plan.quotaExhausted).toBe(false);
   });
 
   it("没给写入时间时按 buildId 挑", () => {
@@ -317,6 +318,8 @@ describe("规则总数上限", () => {
     expect(plan.reclaim).toEqual([{ buildId: "online1", reason: "revived" }]);
     expect(plan.deferred).toEqual([{ buildId: "new1" }]);
     expect(plan.changed).toBe(true);
+    // 推迟的等多少轮也挂不上，要让调用方知道得手动清理，别说成「之后的运行再挂」
+    expect(plan.quotaExhausted).toBe(true);
   });
 
   it("弃用前缀的规则和用户的规则合起来挤进余量时让出余量，不中止", () => {

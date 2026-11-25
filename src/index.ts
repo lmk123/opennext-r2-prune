@@ -117,6 +117,11 @@ export interface PrunePlanSummary {
    * 之后的运行回收已删完的规则、空出名额后再挂，逐轮清完。名额一条不剩时不读写入时间，刚写入的 build 也列在这里
    */
   deferred: DeferredBuild[];
+  /**
+   * 规则名额永远空不出来（你自己的规则加上没人回收的规则占满了 1000 条）：deferred 里的 build 等多少轮也挂不上，
+   * 得手动清理规则。只在这趟还有别的改动要写时可能为 true；没别的可写时 planPrune 直接抛 PlanError
+   */
+  quotaExhausted: boolean;
   /** 要回收或摘除的已有规则 */
   reclaim: ReclaimedRule[];
 }
@@ -292,6 +297,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
     absent: plan.absent,
     expire: plan.expire,
     deferred: plan.deferred,
+    quotaExhausted: plan.quotaExhausted,
     reclaim: plan.reclaim,
 
     async apply() {

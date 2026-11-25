@@ -77,6 +77,11 @@ export interface PrunePlan {
   expire: ExpiringBuild[];
   /** 名额不够，这次不挂规则的作废 build。它们不在 expire 里，也不算保留 */
   deferred: DeferredBuild[];
+  /**
+   * 名额永远空不出来：deferred 等多少轮也挂不上，得手动清理规则。只在这趟还有别的改动要写时可能为 true，
+   * 没别的可写时 makePlan 直接中止
+   */
+  quotaExhausted: boolean;
   reclaim: ReclaimedRule[];
   nextDoc: LifecycleDoc;
   /** 与现状一致时为 false，此时无需发 PUT */
@@ -114,7 +119,7 @@ export interface PlanInput {
    */
   skipRuleLimit?: boolean;
   /**
-   * 本工具为别的前缀写的规则里，目录眼下一个对象都没有的那些（键见 otherRuleDir）。目录删完了规则还在，
+   * 本工具为别的前缀写的规则里，目录眼下一个对象都没有（列那个前缀时没列出来）的那些（键见 otherRuleDir）。目录删完了规则还在，
    * 说明那个前缀的运行还没回收、也可能再也不会回收（改 --prefix 前的旧前缀），算名额时和用户自己的规则
    * 一样当成永久占用
    */
@@ -293,6 +298,7 @@ export function makePlan(input: PlanInput): PrunePlan {
     keep,
     absent,
     deferred: deferred.map((buildId) => ({ buildId })),
+    quotaExhausted: (budget?.exhausted ?? false) && deferred.length > 0,
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,
       state: duplicated.has(rule.buildId) ? "updated" : expireState(currentById.get(rule.buildId), rule),
@@ -317,7 +323,11 @@ export interface RuleBudget {
   exhausted: boolean;
 }
 
-/** 别的前缀下一条规则作用的 build 目录，即 emptyRuleDirs 的键 */
+/**
+ * 别的前缀下一条规则对应的 build 目录，即 emptyRuleDirs 的键。按规则 ID 拆出的前缀和 buildId 拼，不看规则的
+ * Filter 前缀：那个前缀的运行回收规则时，看的就是自己列出的目录里还有没有这个 buildId，两边口径一致才判得准
+ * 「有没有哪一趟会回收它」
+ */
 export function otherRuleDir(rule: OtherScopeRule): string {
   return `${rule.scope}${rule.buildId}/`;
 }

@@ -14,6 +14,7 @@ import {
   verifyWritten,
   wholeBucketRules,
 } from "./plan.ts";
+import { rulePrefix } from "./prefix.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
 import { type LifecycleDoc, type ParsedLifecycle, XmlAssumptionError } from "./xml.ts";
@@ -146,26 +147,29 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const candidates = draft.expire.filter((b) => b.state === "new").map((b) => b.buildId);
   const ruled = draft.expire.length - candidates.length;
 
-  // 名额不够时才去看本工具为别的前缀写的规则，作用的目录是不是已经删空：删空了规则还在，可能没人回收，
-  // 名额可能永远空不出来。这些规则全算上也挤不进余量时，看了也改变不了结果，不看
+  // 名额为 0 时才去看本工具为别的前缀写的规则，作用的目录是不是已经删空：删空了规则还在，可能没人回收，
+  // 名额可能永远空不出来，也可能让出余量。名额还有时看了也改变不了结果：别的前缀的规则多到能起作用，
+  // 上限就已经放宽到 MAX_RULES，而名额永远空不出来意味着名额为 0。这些规则全算上也挤不进余量时同理，不看。
+  // 按前缀各列一遍目录，不逐条探查：名额为 0 时每趟都要看，逐条看请求数会随别的前缀的规则数增长
   let budget = ruleBudget(current, ruled);
   let emptyRuleDirs: Set<string> | undefined;
   const findEmptyRuleDirs = async () => {
-    const dirs = [...new Set(current.others.map(otherRuleDir))];
+    const scopes = [...new Set(current.others.map((rule) => rule.scope))];
     // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
     const looking = new AbortController();
-    const empty = await mapWithConcurrency(dirs, concurrency, looking.signal, (dir) =>
-      opts.store.isEmptyUnder(dir, looking.signal).catch((error: unknown) => {
+    const listed = await mapWithConcurrency(scopes, concurrency, looking.signal, (scope) =>
+      opts.store.listBuildIds(scope, looking.signal, "listOtherScope").catch((error: unknown) => {
         looking.abort();
         throw error;
       }),
     );
-    emptyRuleDirs = new Set(dirs.filter((_, i) => empty[i]));
+    // 按归一化后的前缀拼：ID 里的前缀不规范的规则，哪一趟都不会认领它，理应算作没人回收
+    const present = new Set(scopes.flatMap((scope, i) => listed[i]!.map((buildId) => rulePrefix(scope, buildId))));
+    emptyRuleDirs = new Set(current.others.map(otherRuleDir).filter((dir) => !present.has(dir)));
     budget = ruleBudget(current, ruled, emptyRuleDirs);
   };
-  const othersMatter = othersCanMatter(current);
-  // 名额为 0 时先看：读不读写入时间要看名额是不是永远空不出来，删空目录的规则还可能让出余量、空出名额
-  if (candidates.length > 0 && budget.room === 0 && othersMatter) await findEmptyRuleDirs();
+  // 在读写入时间之前看：读不读要看名额是不是永远空不出来，删空目录的规则还可能让出余量、空出名额
+  if (candidates.length > 0 && budget.room === 0 && othersCanMatter(current)) await findEmptyRuleDirs();
 
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
@@ -193,10 +197,6 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         fresh.push({ buildId, reason: "fresh", source: `写入于 ${read.writtenAt.toISOString()}` });
       }
     });
-  }
-  // 名额还有时，筛掉刚写入的再判断够不够：刚写入的不占名额，筛完够用就不必去看别的前缀
-  if (!emptyRuleDirs && candidates.length - fresh.length > budget.room && othersMatter) {
-    await findEmptyRuleDirs();
   }
   const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyRuleDirs });
 

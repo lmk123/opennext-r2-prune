@@ -55,7 +55,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段；
-                               deferred 是规则名额不够、这次没挂规则的 build）
+                               deferred 是规则名额不够、这次没挂规则的 build；quotaExhausted 为 true 时名额永远空不出来，要手动清理规则）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
   --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
   --verbose                    打印重试等额外信息
@@ -268,10 +268,11 @@ async function main(argv: string[]): Promise<number> {
       note(
         `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${planned.reclaim.length} 个 build 的规则。` +
           `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。` +
-          (planned.deferred.length > 0
+          (planned.deferred.length > 0 && !planned.quotaExhausted
             ? `\n另有 ${planned.deferred.length} 个作废 build 因规则名额不够没有挂规则，之后的运行空出名额后再挂。`
             : ""),
       );
+      if (planned.quotaExhausted) console.error(`\n注意：${quotaExhaustedNote(planned.deferred.length)}`);
     } catch (error) {
       if (!(error instanceof PruneWriteError)) throw error;
       ({ written, verified, rolledBack, warnings } = error);
@@ -368,11 +369,16 @@ function printPlan(plan: PrunePlanSummary): void {
         `你自己的规则加上别的前缀下目录已删空、却没被回收的规则已经挤进这段余量时才挂满 ${MAX_RULES} 条），` +
         `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时可能没读写入时间，刚写入的也可能列在这里）：`,
     );
-    for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
-    console.log(
-      `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。名额若被本工具为别的前缀写的规则占着，` +
-        `要等那个前缀的运行回收；改 --prefix 前留下的旧前缀规则不会自己回收，得手动删掉。`,
-    );
+    if (plan.quotaExhausted) {
+      for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额永远空不出来，要手动清理规则`);
+      console.log(`  ${quotaExhaustedNote(plan.deferred.length)}`);
+    } else {
+      for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
+      console.log(
+        `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。名额若被本工具为别的前缀写的规则占着，` +
+          `要等那个前缀的运行回收；改 --prefix 前留下的旧前缀规则不会自己回收，得手动删掉。`,
+      );
+    }
   }
 
   const revived = plan.reclaim.filter((r) => r.reason === "revived");
@@ -412,8 +418,18 @@ function toJson(plan: PrunePlanSummary) {
     expire: plan.expire,
     // 名额不够、这次没挂规则的作废 build，不在 expire 里，也不算保留
     deferred: plan.deferred,
+    quotaExhausted: plan.quotaExhausted,
     reclaim: plan.reclaim,
   };
+}
+
+/** 名额永远空不出来、但这趟仍有别的改动要写时的提示：推迟的 build 不会自己挂上，下一趟没别的可写时会中止 */
+function quotaExhaustedNote(deferred: number): string {
+  return (
+    `你自己的规则加上没人回收的规则（多半是改 --prefix 前的旧前缀写的、目录已经删空的）已经占满 ${MAX_RULES} 条，` +
+    `名额永远空不出来，这 ${deferred} 个推迟的 build 等多少轮也挂不上；下一趟没有别的改动可写时会中止（退出码 1）。` +
+    `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉，空出名额后重跑。`
+  );
 }
 
 async function confirm(): Promise<boolean> {
