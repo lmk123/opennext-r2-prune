@@ -58,7 +58,7 @@ bucket 里积了 3 个还是 300 个 build，发出去的请求一样多。
 ## 用法
 
 ```bash
-node dist/cli.js \
+npx opennext-r2-prune \
   --worker <WORKER_NAME> \
   --api-token <CLOUDFLARE_API_TOKEN> \
   --account-id <CLOUDFLARE_ACCOUNT_ID> \
@@ -125,11 +125,9 @@ jobs:
   prune:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: npm ci && npm run build
-      - run: node dist/cli.js --yes
+      - run: npx opennext-r2-prune@0.1 --yes
         env:
           WORKER_NAME: your-worker
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -151,14 +149,9 @@ bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--
 同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
 `AbortSignal`），Node 22.12+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
 
-本包没有发布到 npm，请从 GitHub 安装，安装时 `prepare` 脚本会构建出 `dist`：
-
 ```bash
-npm install github:lmk123/opennext-r2-prune
+npm install opennext-r2-prune
 ```
-
-pnpm 默认不跑 git 依赖的构建脚本，会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。这时要按报错里给出的完整写法
-（含 commit），把本包加进 `pnpm-workspace.yaml` 的 `allowBuilds`，只写包名不管用。
 
 ```ts
 import { createHash } from "node:crypto";
