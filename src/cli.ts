@@ -16,6 +16,7 @@ import {
   S3Error,
   XmlAssumptionError,
 } from "./index.ts";
+import { MAX_RULES, RESERVED_RULES } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
 import { ruleId } from "./xml.ts";
 
@@ -48,16 +49,18 @@ const USAGE = `用法：opennext-r2-prune [选项]
                                多个站点共用一个 bucket 时必须各用各的、互不嵌套的前缀，每趟只管自己前缀下的规则
   --expire-days <n>            规则的过期天数，默认 1
   --grace-hours <n>            目录写入不满 n 小时的 build 不判作废，默认 24；0 关闭
-                               OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住
+                               OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住。
+                               规则名额不够、要分批挂时，也按这里读到的写入时间先挂最老的；为 0 时按 build id 挑
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
-  --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段）
+  --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段；
+                               deferred 是规则名额不够、这次没挂规则的作废 build）
   --force                      跳过「保留的 build 必须存在于 bucket」这项检查
   --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
   --verbose                    打印重试等额外信息
   --help, -h                   显示本帮助
 
-退出码：0 成功 / 1 参数或校验失败 / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
+退出码：0 成功（有 build 因规则名额不够推迟也算）/ 1 参数或校验失败 / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
 
 function parseCliArgs(argv: string[]) {
   return parseArgs({
@@ -237,7 +240,7 @@ async function main(argv: string[]): Promise<number> {
   if (!planned.changed) {
     note(
       planned.deferred.length > 0
-        ? "\n规则名额已满，本次无需改动；推迟的 build 等之后的运行回收规则、空出名额后再挂。"
+        ? "\n规则名额不够，本次无需改动；推迟的 build 等之后的运行回收规则、空出名额后再挂。"
         : "\n规则已经是最新的，无需改动。",
     );
   } else if (values["dry-run"]) {
@@ -264,7 +267,7 @@ async function main(argv: string[]): Promise<number> {
         `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${planned.reclaim.length} 个 build 的规则。` +
           `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。` +
           (planned.deferred.length > 0
-            ? `\n另有 ${planned.deferred.length} 个作废 build 因规则名额已满没有挂规则，之后的运行空出名额后再挂。`
+            ? `\n另有 ${planned.deferred.length} 个作废 build 因规则名额不够没有挂规则，之后的运行空出名额后再挂。`
             : ""),
       );
     } catch (error) {
@@ -359,12 +362,13 @@ function printPlan(plan: PrunePlanSummary): void {
 
   if (plan.deferred.length > 0) {
     console.log(
-      `\nlifecycle 规则已到 R2 每个 bucket 1000 条的上限，以下 ${plan.deferred.length} 个作废 build 这次不挂规则：`,
+      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条，分批挂时给你自己的规则留 ${RESERVED_RULES} 条余量），` +
+        `以下 ${plan.deferred.length} 个作废 build 这次不挂规则：`,
     );
-    for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额已满，下次运行再挂`);
+    for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
     console.log(
-      `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完；` +
-        `想快些可以清理 bucket 上不再需要的 lifecycle 规则。`,
+      `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。名额若被本工具为别的前缀写的规则占着，` +
+        `要等那个前缀的运行回收；改 --prefix 前留下的旧前缀规则不会自己回收，得手动删掉。`,
     );
   }
 
@@ -403,7 +407,7 @@ function toJson(plan: PrunePlanSummary) {
     keep: [...plan.keep, ...plan.absent],
     absent: plan.absent,
     expire: plan.expire,
-    // 名额已满、这次没挂规则的作废 build，不在 expire 里，也不算保留
+    // 名额不够、这次没挂规则的作废 build，不在 expire 里，也不算保留
     deferred: plan.deferred,
     reclaim: plan.reclaim,
   };

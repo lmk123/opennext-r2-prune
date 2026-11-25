@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { makePlan, MAX_RULES, PlanError, type PlanInput, verifyWritten, wholeBucketRules } from "../src/plan.ts";
+import {
+  makePlan,
+  MAX_RULES,
+  PlanError,
+  type PlanInput,
+  RESERVED_RULES,
+  verifyWritten,
+  wholeBucketRules,
+} from "../src/plan.ts";
 import { rulePrefix } from "../src/prefix.ts";
 import { type OwnRule, type ParsedLifecycle, XmlAssumptionError } from "../src/xml.ts";
 
@@ -117,15 +125,25 @@ describe("规则总数上限", () => {
     others: [],
     malformed: [],
   });
+  /** n 条本工具为别的前缀 site-b/ 写的规则（原文同样在 foreign 里） */
+  const otherSite = (n: number) =>
+    ids("b", n).map((buildId) => ({
+      buildId,
+      prefix: `site-b/${buildId}/`,
+      expireDays: 1,
+      enabled: true,
+      id: `opennext-r2-prune:site-b/${buildId}/`,
+      scope: "site-b/",
+    }));
 
-  it("名额不够时只挂满剩余名额，其余列为推迟，既不挂规则也不算保留", () => {
+  it("名额不够时只挂到上限减去给用户留的余量，其余列为推迟，既不挂规则也不算保留", () => {
     const olds = ids("old", 2000);
     const plan = makePlan(
       input({ existing: ["online1", ...olds], current: lifecycle([], foreign(300)) }),
     );
-    expect(plan.expire).toHaveLength(MAX_RULES - 300);
-    expect(plan.deferred).toHaveLength(2000 - (MAX_RULES - 300));
-    expect(plan.nextDoc.own.length + plan.nextDoc.foreign.length).toBe(MAX_RULES);
+    expect(plan.expire).toHaveLength(MAX_RULES - RESERVED_RULES - 300);
+    expect(plan.deferred).toHaveLength(2000 - (MAX_RULES - RESERVED_RULES - 300));
+    expect(plan.nextDoc.own.length + plan.nextDoc.foreign.length).toBe(MAX_RULES - RESERVED_RULES);
     const deferred = new Set(plan.deferred.map((b) => b.buildId));
     expect(plan.expire.some((b) => deferred.has(b.buildId))).toBe(false);
     expect(plan.keep.some((b) => deferred.has(b.buildId))).toBe(false);
@@ -162,15 +180,17 @@ describe("规则总数上限", () => {
   it("已挂着规则、仍该删的 build 不因名额被摘掉，哪怕规则要改写", () => {
     const ruled = ids("ruled", 10);
     const own = ruled.map((id, i) => ownRule(id, i === 0 ? { expireDays: 7 } : {}));
+    // 分批时只挂到上限减余量，这里留给新规则的正好一条
+    const news = ids("new", RESERVED_RULES + 2);
     const plan = makePlan(
       input({
-        existing: ["online1", ...ruled, "new1", "new2"],
-        current: lifecycle(own, foreign(MAX_RULES - 11)),
+        existing: ["online1", ...ruled, ...news],
+        current: lifecycle(own, foreign(MAX_RULES - RESERVED_RULES - 11)),
       }),
     );
-    expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual([...ruled, "new1"]);
+    expect(plan.nextDoc.own.map((r) => r.buildId)).toEqual([...ruled, news[0]]);
     expect(plan.expire.find((b) => b.buildId === ruled[0])!.state).toBe("updated");
-    expect(plan.deferred).toEqual([{ buildId: "new2" }]);
+    expect(plan.deferred.map((b) => b.buildId)).toEqual(news.slice(1));
   });
 
   it("剩余名额为 0 时新判作废的全部推迟，已有规则照旧，无需写入", () => {
@@ -198,7 +218,28 @@ describe("规则总数上限", () => {
     expect(plan.deferred).toEqual([]);
   });
 
-  it("外部规则自己就占满上限、一条新规则都挂不上时中止，并说明怎么补救", () => {
+  it("用户的规则已挤进余量时把余量让给本工具，每轮仍能挂上几条", () => {
+    const plan = makePlan(
+      input({ existing: ["online1", ...ids("old", 20)], current: lifecycle([], foreign(MAX_RULES - 5)) }),
+    );
+    expect(plan.expire).toHaveLength(5);
+    expect(plan.deferred).toHaveLength(15);
+  });
+
+  it("名额被本工具为别的前缀写的规则占满时只推迟、不中止：那个前缀删完会自己回收", () => {
+    const others = otherSite(MAX_RULES - 300);
+    const plan = makePlan(
+      input({
+        existing: ["online1", "new1"],
+        current: { ...lifecycle([], [...foreign(300), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
+      }),
+    );
+    expect(plan.expire).toEqual([]);
+    expect(plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(plan.changed).toBe(false);
+  });
+
+  it("用户自己的规则占满上限、一条新规则都挂不上时中止，并说明怎么补救", () => {
     expect(() => makePlan(input({ current: lifecycle([], foreign(MAX_RULES)) }))).toThrow(
       /核对 lifecycle 规则名额时中止[\s\S]*1000 条[\s\S]*wrangler r2 bucket lifecycle list/,
     );
