@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PlanError, planPrune, prune, type PruneRunOptions, XmlAssumptionError } from "../src/index.ts";
+import { R2Store } from "../src/store.ts";
 import {
   BASELINE_EXPECTED,
   BASELINE_RULES,
@@ -163,6 +164,17 @@ describe("基本流程", () => {
       { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
     ]);
     expect(planned.expire).toEqual([]);
+
+    // 写入了多久按 R2 响应的 Date 头算；真实 R2 不带它时会悄悄退回本机时钟
+    const store = new R2Store({
+      endpoint: `https://${env.accountId}.r2.cloudflarestorage.com`,
+      bucket: env.bucket,
+      accessKeyId: env.accessKeyId,
+      secretAccessKey: env.secretAccessKey,
+    });
+    const read = await store.buildWrittenAt(SITE_A, "build-b");
+    expect(read?.serverTime).toBeInstanceOf(Date);
+    expect(Math.abs(read!.serverTime!.getTime() - read!.writtenAt.getTime())).toBeLessThan(3_600_000);
     expect(planned.changed).toBe(false);
     expect(spy.writes()).toEqual([]);
     await expectRules(BASELINE_EXPECTED);

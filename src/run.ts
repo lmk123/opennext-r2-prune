@@ -41,7 +41,7 @@ export interface RunOptions {
    * 再上传 version、切流量，这段时间里新 build 既不是线上也不在任何 deployment 里，不这样等一等就会被当成作废的删掉
    */
   graceHours?: number;
-  /** 当前时间（毫秒），测试注入用 */
+  /** 当前时间（毫秒），R2 响应没带 Date 头时才用；测试注入用 */
   now?: () => number;
   fetchImpl?: typeof fetch;
   /** 读 BUILD_ID 重试时的回调 */
@@ -153,10 +153,13 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       }),
     );
     candidates.forEach((buildId, i) => {
-      const time = writtenAt[i];
+      const read = writtenAt[i];
       // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
-      if (time && now - time.getTime() < graceMs) {
-        fresh.push({ buildId, reason: "fresh", source: `写入于 ${time.toISOString()}` });
+      if (!read) return;
+      // 用 R2 自己的时钟比：本机时钟走快时拿 Date.now() 比，会把正在部署的 build 算成老的
+      const reference = read.serverTime?.getTime() ?? now;
+      if (reference - read.writtenAt.getTime() < graceMs) {
+        fresh.push({ buildId, reason: "fresh", source: `写入于 ${read.writtenAt.toISOString()}` });
       }
     });
   }

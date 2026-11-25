@@ -26,17 +26,31 @@ const ok = (body: string, init?: ResponseInit) => () => new Response(body, init)
 describe("buildWrittenAt", () => {
   it("只取 build 目录里的一个对象，读它的写入时间", async () => {
     const { calls, fetchImpl } = stub([
-      ok(`<ListBucketResult><IsTruncated>true</IsTruncated>
+      ok(
+        `<ListBucketResult><IsTruncated>true</IsTruncated>
         <Contents><Key>incremental-cache/b1/a.cache</Key><LastModified>2026-11-25T11:31:02.000Z</LastModified></Contents>
-      </ListBucketResult>`),
+      </ListBucketResult>`,
+        { headers: { date: "Wed, 25 Nov 2026 12:00:00 GMT" } },
+      ),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
 
-    expect(await store.buildWrittenAt("incremental-cache", "b1")).toEqual(new Date("2026-11-25T11:31:02.000Z"));
+    expect(await store.buildWrittenAt("incremental-cache", "b1")).toEqual({
+      writtenAt: new Date("2026-11-25T11:31:02.000Z"),
+      serverTime: new Date("2026-11-25T12:00:00.000Z"),
+    });
     expect(calls).toHaveLength(1);
     const url = new URL(calls[0]!.url);
     expect(url.searchParams.get("prefix")).toBe("incremental-cache/b1/");
     expect(url.searchParams.get("max-keys")).toBe("1");
+  });
+
+  it("响应没带 Date 头时 serverTime 为 null，交给调用方用本机时间", async () => {
+    const { fetchImpl } = stub([
+      ok(`<ListBucketResult><Contents><Key>incremental-cache/b1/a</Key><LastModified>2026-11-25T11:31:02.000Z</LastModified></Contents></ListBucketResult>`),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    expect((await store.buildWrittenAt("incremental-cache", "b1"))?.serverTime).toBeNull();
   });
 
   it("目录已空时返回 null", async () => {

@@ -19,7 +19,14 @@ const CREDS = {
 };
 
 /** 一个按 URL 派发的假 R2。writtenAt 里没有的 build 按「早就写好的」回答 */
-function fakeR2(opts: { buildIds: string[]; lifecycle?: string; writtenAt?: Record<string, string>; failWrittenAt?: boolean }) {
+function fakeR2(opts: {
+  buildIds: string[];
+  lifecycle?: string;
+  writtenAt?: Record<string, string>;
+  failWrittenAt?: boolean;
+  /** 读写入时间时响应的 Date 头，即 R2 那边的「此刻」；不给就不带这个头 */
+  serverDate?: string;
+}) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -40,6 +47,7 @@ function fakeR2(opts: { buildIds: string[]; lifecycle?: string; writtenAt?: Reco
       const time = opts.writtenAt?.[buildId] ?? "2020-01-01T00:00:00.000Z";
       return new Response(
         `<ListBucketResult><Contents><Key>${url.searchParams.get("prefix")}x</Key><LastModified>${time}</LastModified></Contents></ListBucketResult>`,
+        opts.serverDate ? { headers: { date: opts.serverDate } } : undefined,
       );
     }
 
@@ -159,6 +167,29 @@ describe("collectPlan", () => {
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
+  it("按 R2 的 Date 头算写入了多久，不受本机时钟影响", async () => {
+    // 本机时钟快了两天：拿它比会把刚写入的 deploying 当成老 build
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1"],
+      writtenAt: { deploying: "2026-11-25T11:31:02.000Z", old1: "2026-11-24T11:59:00.000Z" },
+      serverDate: "Wed, 25 Nov 2026 12:00:00 GMT",
+    });
+
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      keep: ["live"],
+      now: () => Date.parse("2026-11-27T12:00:00.000Z"),
+    });
+
+    expect(state.plan.keep.map((b) => [b.buildId, b.reason])).toEqual([
+      ["live", "explicit"],
+      ["deploying", "fresh"],
+    ]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
   it("graceHours 为 0 时不读写入时间", async () => {
     const { store, calls } = fakeR2({
       buildIds: ["live", "deploying"],
@@ -190,7 +221,9 @@ describe("collectPlan", () => {
 
   it("一个写入时间读失败时，中止其余在途的读取", async () => {
     let slowAborted = false;
+    const methods: string[] = [];
     const fetchImpl = (async (request: Request, init?: RequestInit) => {
+      methods.push(request.method);
       const url = new URL(request.url);
       if (url.searchParams.has("lifecycle")) {
         return new Response("<Error><Code>NoSuchLifecycleConfiguration</Code></Error>", { status: 404 });
@@ -218,6 +251,7 @@ describe("collectPlan", () => {
       /读取 build 目录的写入时间失败/,
     );
     expect(slowAborted).toBe(true);
+    expect(methods).not.toContain("PUT");
   });
 
   it("规则上限按排除刚写入的 build 之后的计划判", async () => {
