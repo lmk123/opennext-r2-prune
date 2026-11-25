@@ -57,6 +57,8 @@ function options(prefix: string, extra: Partial<PruneRunOptions> = {}) {
     prefix,
     md5Base64,
     fetch: spy.impl,
+    // 用例里的 build 都是现场布置的，按默认的 24 小时全都算刚写入；只有专门测它的用例才打开
+    graceHours: 0,
     ...extra,
   };
   return { opts, spy };
@@ -148,6 +150,24 @@ describe("基本流程", () => {
     expect(second.changed).toBe(false);
     expect(second.expire.map((b) => b.state)).toEqual(["pending", "pending"]);
     expect(again.spy.writes()).toEqual([]);
+  });
+
+  it("刚写入的 build 不判作废：真实 R2 的 LastModified 能解析，且不能替保留集充数", async () => {
+    await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
+
+    const planned = await planPrune(options(SITE_A, { keep: ["build-a"], graceHours: 24 }).opts);
+    expect(planned.keep).toEqual([
+      { buildId: "build-a", reason: "explicit" },
+      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
+    ]);
+    expect(planned.expire).toEqual([]);
+    expect(planned.changed).toBe(false);
+
+    // 保留集填错时，刚写入的 build 不能让「有交集」这条校验蒙混过去
+    const { opts, spy } = options(SITE_A, { keep: ["bogus"], force: true, graceHours: 24 });
+    await expect(planPrune(opts)).rejects.toThrow(/没有交集/);
+    expect(spy.writes()).toEqual([]);
+    await expectRules(BASELINE_EXPECTED);
   });
 
   it("目录删空后回收规则，回滚的 build 摘掉规则，改了过期天数就改写规则", async () => {
@@ -334,7 +354,8 @@ describe("CLI", () => {
   function cli(args: string[]) {
     const result = spawnSync(
       process.execPath,
-      ["--experimental-strip-types", "--no-warnings", "src/cli.ts", ...args],
+      // 同 options()：现场布置的 build 都算刚写入。同一开关传两次时以后面的为准，用例可以覆盖
+      ["--experimental-strip-types", "--no-warnings", "src/cli.ts", "--grace-hours", "0", ...args],
       {
         encoding: "utf8",
         timeout: 120_000,

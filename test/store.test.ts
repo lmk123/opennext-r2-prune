@@ -23,6 +23,43 @@ function stub(responses: (() => Response)[]) {
 
 const ok = (body: string, init?: ResponseInit) => () => new Response(body, init);
 
+describe("buildWrittenAt", () => {
+  it("只取 build 目录里的一个对象，读它的写入时间", async () => {
+    const { calls, fetchImpl } = stub([
+      ok(`<ListBucketResult><IsTruncated>true</IsTruncated>
+        <Contents><Key>incremental-cache/b1/a.cache</Key><LastModified>2026-11-25T11:31:02.000Z</LastModified></Contents>
+      </ListBucketResult>`),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    expect(await store.buildWrittenAt("incremental-cache", "b1")).toEqual(new Date("2026-11-25T11:31:02.000Z"));
+    expect(calls).toHaveLength(1);
+    const url = new URL(calls[0]!.url);
+    expect(url.searchParams.get("prefix")).toBe("incremental-cache/b1/");
+    expect(url.searchParams.get("max-keys")).toBe("1");
+  });
+
+  it("目录已空时返回 null", async () => {
+    const { fetchImpl } = stub([ok(`<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`)]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    expect(await store.buildWrittenAt("incremental-cache", "b1")).toBeNull();
+  });
+
+  it("解析不出时间时中止，不当成老 build", async () => {
+    const { fetchImpl } = stub([
+      ok(`<ListBucketResult><Contents><Key>incremental-cache/b1/a</Key><LastModified>昨天</LastModified></Contents></ListBucketResult>`),
+    ]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await expect(store.buildWrittenAt("incremental-cache", "b1")).rejects.toThrow(XmlAssumptionError);
+  });
+
+  it("读取被拒时说明是哪一步", async () => {
+    const { fetchImpl } = stub([ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 })]);
+    const store = new R2Store({ ...CREDS, fetchImpl });
+    await expect(store.buildWrittenAt("incremental-cache", "b1")).rejects.toThrow(/读取 build 目录的写入时间失败/);
+  });
+});
+
 describe("listBuildIds", () => {
   it("用 Delimiter 一次拿到全部 buildId，不遍历缓存对象", async () => {
     const { calls, fetchImpl } = stub([

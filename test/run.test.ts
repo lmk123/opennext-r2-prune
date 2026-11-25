@@ -18,8 +18,8 @@ const CREDS = {
   secretAccessKey: "sk",
 };
 
-/** 一个按 URL 派发的假 R2 */
-function fakeR2(opts: { buildIds: string[]; lifecycle?: string }) {
+/** 一个按 URL 派发的假 R2。writtenAt 里没有的 build 按「早就写好的」回答 */
+function fakeR2(opts: { buildIds: string[]; lifecycle?: string; writtenAt?: Record<string, string>; failWrittenAt?: boolean }) {
   const calls: { method: string; url: string }[] = [];
   const fetchImpl = (async (request: Request) => {
     const url = new URL(request.url);
@@ -30,6 +30,16 @@ function fakeR2(opts: { buildIds: string[]; lifecycle?: string }) {
       return new Response(
         opts.lifecycle ?? "<Error><Code>NoSuchLifecycleConfiguration</Code></Error>",
         { status: opts.lifecycle ? 200 : 404 },
+      );
+    }
+
+    // 读写入时间：只要一个对象
+    if (url.searchParams.get("max-keys") === "1") {
+      if (opts.failWrittenAt) return new Response("<Error><Code>InternalError</Code></Error>", { status: 400 });
+      const buildId = url.searchParams.get("prefix")!.split("/")[1]!;
+      const time = opts.writtenAt?.[buildId] ?? "2020-01-01T00:00:00.000Z";
+      return new Response(
+        `<ListBucketResult><Contents><Key>${url.searchParams.get("prefix")}x</Key><LastModified>${time}</LastModified></Contents></ListBucketResult>`,
       );
     }
 
@@ -98,9 +108,18 @@ describe("collectPlan", () => {
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b2"]);
   });
 
-  it("发给 R2 的请求数与 build 数量无关", async () => {
+  it("已挂上规则的 build 不再读写入时间，请求数不随它们增长", async () => {
     const olds = Array.from({ length: 50 }, (_, i) => `old${i}`);
-    const { store, calls } = fakeR2({ buildIds: ["live", ...olds] });
+    const rules = olds
+      .map(
+        (id) => `<Rule><ID>opennext-r2-prune:incremental-cache/${id}/</ID><Status>Enabled</Status>
+          <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
+      )
+      .join("");
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "new1", ...olds],
+      lifecycle: `<LifecycleConfiguration>${rules}</LifecycleConfiguration>`,
+    });
 
     const state = await collectPlan({
       store,
@@ -109,9 +128,56 @@ describe("collectPlan", () => {
       fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
     });
 
-    expect(state.plan.expire).toHaveLength(50);
-    // 只有「列一次目录」和「读一次规则」，50 个 build 和 3 个 build 一样多
+    expect(state.plan.expire).toHaveLength(51);
+    // 「列一次目录」「读一次规则」，再加上唯一一个要新挂规则的 new1 读一次写入时间
+    expect(calls).toHaveLength(3);
+    expect(new URL(calls[2]!.url).searchParams.get("prefix")).toBe("incremental-cache/new1/");
+  });
+
+  it("刚写入、还没上线的 build 不判作废", async () => {
+    // OpenNext 部署时先写缓存再切流量：正赶上部署时，新 build 已在 bucket 里，线上还是旧的
+    const now = Date.parse("2026-11-25T12:00:00.000Z");
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1"],
+      writtenAt: { deploying: "2026-11-25T11:31:02.000Z", old1: "2026-11-24T11:59:00.000Z" },
+    });
+
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      siteUrl: "https://example.com",
+      fetchImpl: siteReplying("live", { headers: { "content-type": "text/plain" } }),
+      now: () => now,
+    });
+
+    expect(state.plan.keep).toContainEqual({
+      buildId: "deploying",
+      reason: "fresh",
+      source: "写入于 2026-11-25T11:31:02.000Z",
+    });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("graceHours 为 0 时不读写入时间", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying"],
+      writtenAt: { deploying: new Date().toISOString() },
+    });
+    const state = await collectPlan({
+      store,
+      prefix: "incremental-cache",
+      keep: ["live"],
+      graceHours: 0,
+    });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["deploying"]);
     expect(calls).toHaveLength(2);
+  });
+
+  it("读不到写入时间时中止，没有写请求", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], failWrittenAt: true });
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(S3Error);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
   it("目录名不符合布局假设时中止，不猜也不降级", async () => {

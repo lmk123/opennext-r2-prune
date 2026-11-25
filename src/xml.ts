@@ -50,12 +50,14 @@ function text(xml: string, tag: string): string | undefined {
 export interface ListObjectsResult {
   /** Delimiter 模式下的 CommonPrefixes，原样保留（含请求前缀与结尾斜杠） */
   commonPrefixes: string[];
+  /** 每个 <Contents> 的 <LastModified> 原文，顺序同响应；缺这个字段的对象记为 undefined */
+  lastModified: (string | undefined)[];
   isTruncated: boolean;
   nextContinuationToken: string | undefined;
 }
 
 /**
- * 只取 CommonPrefixes 与分页字段。<Contents> 里的对象 key 一概不碰：build 目录全靠
+ * 只取 CommonPrefixes、对象的写入时间与分页字段。<Contents> 里的对象 key 一概不碰：build 目录全靠
  * CommonPrefixes 认，key 从不参与拼规则，对它做布局断言只会让一个毫不相干的对象名
  * （--allow-root-prefix 下 bucket 根上随便一个带空格的文件）把整次运行打断。
  */
@@ -67,6 +69,7 @@ export function parseListObjects(xml: string): ListObjectsResult {
 
   return {
     commonPrefixes,
+    lastModified: blocks(xml, "Contents").map((block) => text(block, "LastModified")?.trim()),
     isTruncated: text(xml, "IsTruncated")?.trim() === "true",
     nextContinuationToken: text(xml, "NextContinuationToken"),
   };

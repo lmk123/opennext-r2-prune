@@ -12,7 +12,7 @@ import {
 } from "./xml.ts";
 
 /**
- * R2 的 S3 兼容接口，只实现本工具用到的三个操作。
+ * R2 的 S3 兼容接口，只实现本工具用到的几个操作。
  * 刻意不碰任何 Node 专属 API，这样将来整块搬进 Cloudflare Worker 也不用改。
  */
 
@@ -31,10 +31,11 @@ export interface StoreOptions {
 }
 
 /** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
-export type S3Operation = "list" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
+export type S3Operation = "list" | "writtenAt" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
 const OPERATION_LABEL: Record<S3Operation, string> = {
   list: "列出 build 目录",
+  writtenAt: "读取 build 目录的写入时间",
   getLifecycle: "读取 lifecycle 规则",
   putLifecycle: "写入 lifecycle 规则",
   deleteLifecycle: "清空 lifecycle 规则",
@@ -44,6 +45,7 @@ const OPERATION_LABEL: Record<S3Operation, string> = {
 // 实测 Object 级 token 不论只读还是读写，GET / PUT ?lifecycle 都返回 403 AccessDenied，只有 Admin 级能用。
 const PERMISSION_HINT: Record<S3Operation, string> = {
   list: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
+  writtenAt: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
   getLifecycle:
     "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
     "只跑 --dry-run 需要 Admin Read only，写入规则需要 Admin Read & Write。",
@@ -164,6 +166,30 @@ export class R2Store {
     } while (token);
 
     return found;
+  }
+
+  /**
+   * build 目录里按 key 排第一的对象的写入时间，目录已空时为 null。只取一个对象，不论目录多大都是一个请求。
+   * 正在写入的 build 每个对象都是新的，取哪个都一样；老 build 被 ISR 改写过的对象可能偏新，那只会让它晚几天判作废。
+   */
+  async buildWrittenAt(prefix: string, buildId: string): Promise<Date | null> {
+    const url = new URL(this.#base);
+    url.searchParams.set("list-type", "2");
+    url.searchParams.set("prefix", `${normalizePrefix(prefix)}${buildId}/`);
+    url.searchParams.set("max-keys", "1");
+
+    const result = parseListObjects(await (await this.#request("writtenAt", url.toString())).text());
+    if (result.lastModified.length === 0) return null;
+    const raw = result.lastModified[0];
+    const time = raw === undefined ? Number.NaN : Date.parse(raw);
+    // 读不出时间就无从判断它是不是正在部署的新 build，不能当成老的去删
+    if (Number.isNaN(time)) {
+      throw new XmlAssumptionError(
+        `读取 build ${buildId} 的写入时间时，对象的 LastModified 是 ${JSON.stringify(raw)}，解析不出时间，` +
+          `无法判断它是不是刚写入、还没上线的 build，已中止。可加 --grace-hours 0 跳过这项检查。`,
+      );
+    }
+    return new Date(time);
   }
 
   /** 读出 lifecycle 配置，并从缓存前缀 prefix 的视角分拣出本工具的规则 */

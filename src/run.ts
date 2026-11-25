@@ -36,6 +36,13 @@ export interface RunOptions {
   allowRootPrefix?: boolean;
   /** 规则的过期天数，默认 1 */
   expireDays?: number;
+  /**
+   * 目录写入不满这么多小时的 build 不判作废，默认 24；0 关闭这项检查。OpenNext 部署时先把缓存写进 R2，
+   * 再上传 version、切流量，这段时间里新 build 既不是线上也不在任何 deployment 里，不这样等一等就会被当成作废的删掉
+   */
+  graceHours?: number;
+  /** 当前时间（毫秒），测试注入用 */
+  now?: () => number;
   fetchImpl?: typeof fetch;
   /** 读 BUILD_ID 重试时的回调 */
   onRetry?: OnRetry;
@@ -119,6 +126,35 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     ...(previews ?? []),
     ...(opts.keep ?? []).map((buildId) => ({ buildId, reason: "explicit" as const })),
   ];
+  const planInput = {
+    existing,
+    current,
+    prefix: opts.prefix,
+    expireDays: opts.expireDays ?? 1,
+    force: opts.force,
+    allowRootPrefix: opts.allowRootPrefix,
+  };
+  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间
+  let plan = makePlan({ ...planInput, keep: keeps });
+
+  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长
+  const candidates = plan.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  const graceMs = (opts.graceHours ?? 24) * 3_600_000;
+  if (graceMs > 0 && candidates.length > 0) {
+    const now = (opts.now ?? Date.now)();
+    const writtenAt = await mapWithConcurrency(candidates, concurrency, signal, (buildId) =>
+      opts.store.buildWrittenAt(opts.prefix, buildId),
+    );
+    const fresh: KeptBuild[] = [];
+    candidates.forEach((buildId, i) => {
+      const time = writtenAt[i];
+      // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
+      if (time && now - time.getTime() < graceMs) {
+        fresh.push({ buildId, reason: "fresh", source: `写入于 ${time.toISOString()}` });
+      }
+    });
+    if (fresh.length > 0) plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
+  }
 
   return {
     onlineBuildId,
@@ -129,15 +165,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         : null,
     wholeBucketRules: dangerous,
     lifecycle: current,
-    plan: makePlan({
-      existing,
-      keep: keeps,
-      current,
-      prefix: opts.prefix,
-      expireDays: opts.expireDays ?? 1,
-      force: opts.force,
-      allowRootPrefix: opts.allowRootPrefix,
-    }),
+    plan,
   };
 }
 

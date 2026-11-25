@@ -24,7 +24,7 @@ import { ruleId } from "./xml.ts";
 const USAGE = `用法：opennext-r2-prune [选项]
 
 给 R2 里作废的 OpenNext 缓存目录挂上 lifecycle 规则，由 R2 在 24 小时内后台删除。
-本工具不列举缓存对象，所以目录里有多少个文件都不影响耗时。
+本工具不遍历缓存对象，所以目录里有多少个文件都不影响耗时。
 
 必填（可用环境变量代替）：
   --bucket <名字>              R2 bucket 名                [R2_BUCKET]
@@ -47,6 +47,8 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --prefix <前缀>               缓存前缀，默认 incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
                                多个站点共用一个 bucket 时必须各用各的、互不嵌套的前缀，每趟只管自己前缀下的规则
   --expire-days <n>            规则的过期天数，默认 1
+  --grace-hours <n>            目录写入不满 n 小时的 build 不判作废，默认 24；0 关闭
+                               OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段）
@@ -74,6 +76,7 @@ function parseCliArgs(argv: string[]) {
       endpoint: { type: "string" },
       prefix: { type: "string" },
       "expire-days": { type: "string" },
+      "grace-hours": { type: "string" },
       "dry-run": { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       json: { type: "boolean" },
@@ -146,6 +149,13 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
+  const graceHoursRaw = values["grace-hours"] ?? "24";
+  if (!/^\d+$/.test(graceHoursRaw)) {
+    console.error("--grace-hours 必须是不小于 0 的整数");
+    return 1;
+  }
+  const graceHours = Number(graceHoursRaw);
+
   // 只认纯数字：Number() 会把 "0x3"、"1e1"、" 3 " 都当成合法整数
   const recentBuildsRaw = values["recent-builds"] ?? "3";
   const recentBuilds = Number(recentBuildsRaw);
@@ -179,6 +189,7 @@ async function main(argv: string[]): Promise<number> {
     keep,
     prefix,
     expireDays,
+    graceHours,
     force: values.force,
     allowRootPrefix: values["allow-root-prefix"],
     // Web Crypto 没有 MD5，而 S3 规范要求 PutBucketLifecycleConfiguration 带上它
@@ -294,6 +305,7 @@ const KEEP_NOTE: Record<KeptBuild["reason"], string> = {
   recent: "近期线上",
   preview: "预览",
   explicit: "--keep 指定",
+  fresh: "刚写入，暂不判作废",
 };
 
 function keepNote(build: KeptBuild): string {
@@ -360,6 +372,7 @@ function toJson(plan: PrunePlanSummary) {
   const online = plan.onlineBuildIds;
   return {
     prefix: plan.prefix,
+    graceHours: plan.graceHours,
     // 只走 --worker 时也要有值；灰度中线上不止一个 build，单个字段说不清，看 onlineBuildIds
     onlineBuildId: plan.onlineBuildId ?? (online.length === 1 ? online[0] : null),
     onlineBuildIds: online,
