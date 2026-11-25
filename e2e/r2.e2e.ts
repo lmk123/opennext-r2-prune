@@ -66,16 +66,18 @@ const ids = (builds: { buildId: string }[]) => builds.map((b) => b.buildId).sort
 
 beforeAll(async () => {
   // 只看残留规则不够：上次若在清空配置的用例前后被打断，bucket 上是一份一条规则都没有的配置，认不出是残留
-  const saved = await r2.getObject(SNAPSHOT_KEY);
-  if (saved !== null) {
-    throw new Error(
+  const snapshotExistsError = async () => {
+    const saved = await r2.getObject(SNAPSHOT_KEY);
+    return new Error(
       `bucket ${env.bucket} 上有 ${SNAPSHOT_KEY}：另一趟实测正在跑，或上次中途被打断、没来得及写回原配置，已中止。` +
         `确认没有别的实测在跑后，把其中记下的原配置写回 lifecycle（xml 为 null 表示原本没有任何配置），` +
-        `再删掉这个对象后重跑：\n${saved}`,
+        `再删掉这个对象后重跑：\n${saved ?? "（读的时候它已经不在了，多半是另一趟实测刚跑完）"}`,
     );
-  }
+  };
+  // 先查一次只为报对原因：另一趟正在跑时，它的规则会被下面误报成上次的残留。真正的互斥靠后面的条件写入
+  if ((await r2.getObject(SNAPSHOT_KEY)) !== null) throw await snapshotExistsError();
   const { xml } = await r2.getLifecycle();
-  // 更早的版本没有快照对象，被打断后只留下实测的规则：照常跑会把这份残留当成原配置记下、跑完照样写回
+  // 快照对象被手动删掉、规则却没写回时，只剩实测的规则：照常跑会把这份残留当成原配置记下、跑完照样写回
   const leftovers = xml === null ? [] : parseRules(xml).map((rule) => rule.id).filter(isE2eRuleId);
   if (leftovers.length > 0) {
     throw new Error(
@@ -84,7 +86,7 @@ beforeAll(async () => {
     );
   }
   // 快照存进 bucket 之后才算开跑：存失败时 snapshot 仍是 undefined，afterAll 不会动 lifecycle
-  await r2.putObject(SNAPSHOT_KEY, JSON.stringify({ bucket: env.bucket, xml }));
+  if (!(await r2.createObject(SNAPSHOT_KEY, JSON.stringify({ bucket: env.bucket, xml })))) throw await snapshotExistsError();
   snapshot = xml;
   // 先打出原配置：中途被打断（Ctrl-C、超时）时 afterAll 来不及写回，只能照这份（或 SNAPSHOT_KEY 里的）手动恢复
   console.error(
@@ -372,26 +374,42 @@ describe("CLI", () => {
 describe.skipIf(!env.worker)("探测 Worker 的线上与预览 build（需要 WORKER_NAME 与 CLOUDFLARE_API_TOKEN）", () => {
   const SITE_W = `${E2E_ROOT}/site-worker`;
   const worker = () => ({ worker: env.worker!.name, apiToken: env.worker!.apiToken });
+  /** 线上状态要探测两次（先拿到 build 去布置，再正式算计划），两次之间 Worker 发版就对不上，这时重来 */
+  const ATTEMPTS = 3;
 
   it("把探测到的 build 布置进测试 bucket，它们被保留，其余判作废", async () => {
-    // 先用 force 跑一趟只读的计划，拿到 Worker 此刻的线上、近期与预览 build
-    await r2.seedBuilds(SITE_W, ["e2e-anchor"]);
-    const discover = await planPrune(options(SITE_W, { ...worker(), keep: ["e2e-anchor"], force: true }).opts);
-    const probed = [...discover.keep, ...discover.absent].filter((b) => b.reason !== "explicit");
-    expect(discover.onlineBuildIds.length).toBeGreaterThan(0);
-    console.info(
-      `探测到 ${probed.length} 个 build：${probed.map((b) => `${b.buildId}（${b.reason}${b.source ? ` ${b.source}` : ""}）`).join("、")}`,
-    );
+    for (let attempt = 1; ; attempt++) {
+      // 先用 force 跑一趟只读的计划，拿到 Worker 此刻的线上、近期与预览 build
+      await r2.deleteUnder(`${SITE_W}/`);
+      await r2.seedBuilds(SITE_W, ["e2e-anchor"]);
+      const discover = await planPrune(options(SITE_W, { ...worker(), keep: ["e2e-anchor"], force: true }).opts);
+      const probed = [...discover.keep, ...discover.absent].filter((b) => b.reason !== "explicit");
+      expect(discover.onlineBuildIds.length).toBeGreaterThan(0);
+      console.info(
+        `探测到 ${probed.length} 个 build：${probed.map((b) => `${b.buildId}（${b.reason}${b.source ? ` ${b.source}` : ""}）`).join("、")}`,
+      );
 
-    await r2.deleteUnder(`${SITE_W}/`);
-    const probedIds = [...new Set(probed.map((b) => b.buildId))];
-    await r2.seedBuilds(SITE_W, [...probedIds, "e2e-stale"]);
+      await r2.deleteUnder(`${SITE_W}/`);
+      const probedIds = [...new Set(probed.map((b) => b.buildId))].sort();
+      await r2.seedBuilds(SITE_W, [...probedIds, "e2e-stale"]);
 
-    const { opts } = options(SITE_W, worker());
-    const result = await prune(opts);
-    expect(ids(result.keep)).toEqual([...probedIds].sort());
-    expect(result.expire).toEqual([{ buildId: "e2e-stale", state: "new" }]);
-    expect(result).toMatchObject({ written: true, verified: true });
-    await expectRules([...BASELINE_EXPECTED, ownRule(SITE_W, "e2e-stale")]);
-  });
+      // 新上线的 build 没布置进来时 planPrune 会以「不存在」中止，所以报错也算对不上
+      const planned = await planPrune(options(SITE_W, worker()).opts).catch((error: unknown) => error as Error);
+      const reprobed = planned instanceof Error ? null : ids([...planned.keep, ...planned.absent]);
+      if (planned instanceof Error || JSON.stringify(reprobed) !== JSON.stringify(probedIds)) {
+        if (attempt >= ATTEMPTS) {
+          if (planned instanceof Error) throw planned;
+          expect(reprobed).toEqual(probedIds);
+        }
+        console.info(`第二次探测与第一次对不上（${planned instanceof Error ? planned.message : reprobed!.join("、")}），多半是期间发了版，重来`);
+        continue;
+      }
+
+      expect(ids(planned.keep)).toEqual(probedIds);
+      expect(planned.expire).toEqual([{ buildId: "e2e-stale", state: "new" }]);
+      expect(await planned.apply()).toMatchObject({ written: true, verified: true });
+      await expectRules([...BASELINE_EXPECTED, ownRule(SITE_W, "e2e-stale")]);
+      return;
+    }
+  }, ATTEMPTS * 180_000);
 });

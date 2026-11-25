@@ -339,7 +339,8 @@ pnpm test:e2e
   配置时写回一份空配置），并清空 `e2e/` 下的对象。bucket 名里没有一段是 `test`（以连字符分隔，如
   `opennext-r2-prune-test`；`latest` 这类只是含有 test 的不算）时拒绝运行，防止 `.env` 或 shell 里留着线上凭证时误跑。
 - 另外填了 `WORKER_NAME` 与 `CLOUDFLARE_API_TOKEN` 时，会多跑一组：探测该 Worker 此刻的线上、近期与预览
-  build，布置进测试 bucket，核对它们被保留、其余被判作废。Cloudflare 那边只发读请求。
+  build，布置进测试 bucket，核对它们被保留、其余被判作废。Cloudflare 那边只发读请求。布置前后各探测一次，
+  两次对不上（期间 Worker 发了版）就重来，最多 3 次。
 - 开跑时先把原配置打在 stderr 上，并存进 bucket 根下的 `e2e-lifecycle-snapshot.json`，原配置写回之后才删掉它：
   中途被打断、来不及写回时，照其中一份手动写回，再删掉这个对象。这个对象还在（另一趟实测正在跑，或上次被打断）、
   或者 bucket 上还留着上次实测的规则（ID 以 `e2e-` 或 `opennext-r2-prune:e2e/` 开头）时拒绝运行，免得把残留

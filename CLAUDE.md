@@ -12,7 +12,7 @@ pnpm test:e2e                               # 真实 R2 实测，自动读 .env�
 
 ## 分层约束
 
-- `cli.ts` 是**唯一**允许用 Node 专属 API 的文件，其余模块只用 Web 标准 API（`fetch`、`AbortSignal`、`aws4fetch`），为将来搬进 Cloudflare Cron Worker 保留。
+- `src/` 里 `cli.ts` 是**唯一**允许用 Node 专属 API 的文件，其余模块只用 Web 标准 API（`fetch`、`AbortSignal`、`aws4fetch`），为将来搬进 Cloudflare Cron Worker 保留。
 - 所有网络请求都走 `retry.ts` 的 `withRetry`。
 
 ## 不能破坏的不变量

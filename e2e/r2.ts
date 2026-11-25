@@ -153,6 +153,16 @@ export class RawR2 {
     return this.#send(this.#key(key), { method: "PUT", body, headers: { "Content-Type": "application/json" } });
   }
 
+  /**
+   * 对象不存在时才写入（If-None-Match: *），已存在返回 false。查与写是同一个请求，两趟实测同时开跑也只有一趟能成功。
+   * 首个响应丢了被重试时会读到自己写的对象而返回 false，由调用方当作「已存在」中止，宁可多报不能漏
+   */
+  async createObject(key: string, body: string): Promise<boolean> {
+    const headers = { "Content-Type": "application/json", "If-None-Match": "*" };
+    const { status } = await this.#send(this.#key(key), { method: "PUT", body, headers }, (s) => s < 300 || s === 412);
+    return status !== 412;
+  }
+
   /** 读对象内容；对象不存在时返回 null */
   async getObject(key: string): Promise<string | null> {
     return (await this.#getOptional(this.#key(key), "NoSuchKey")).body;
