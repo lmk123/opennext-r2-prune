@@ -1,6 +1,6 @@
 {
   "name": "opennext-r2-prune",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Prune stale build caches of @opennextjs/cloudflare (OpenNext for Next.js on Cloudflare Workers) from your R2 incremental cache bucket, using R2 lifecycle rules instead of listing and deleting objects. CLI and library.",
   "keywords": [
     "opennext",

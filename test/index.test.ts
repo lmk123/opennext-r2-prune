@@ -85,12 +85,14 @@ describe("prune", () => {
     expect(world.calls).toHaveLength(0);
   });
 
-  it("recentBuilds 不配 worker、expireDays 非整数都拒绝，一个请求都不发", async () => {
+  it("recentBuilds 不配 worker、expireDays / graceHours 非法都拒绝，一个请求都不发", async () => {
     const world = fakeWorld({ buildIds: ["live"], online: "live" });
     await expect(prune({ ...CREDS, ...SITE, recentBuilds: 5, fetch: world.fetch })).rejects.toThrow(
       /recentBuilds 需要配合 worker/,
     );
     await expect(prune({ ...CREDS, ...SITE, expireDays: 1.5, fetch: world.fetch })).rejects.toThrow(/expireDays/);
+    await expect(prune({ ...CREDS, ...SITE, graceHours: -1, fetch: world.fetch })).rejects.toThrow(/graceHours/);
+    await expect(prune({ ...CREDS, ...SITE, graceHours: 1.5, fetch: world.fetch })).rejects.toThrow(/graceHours/);
     await expect(prune({ ...CREDS, worker: "w", fetch: world.fetch })).rejects.toThrow(/apiToken/);
     expect(world.calls).toHaveLength(0);
   });

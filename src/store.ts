@@ -30,6 +30,14 @@ export interface StoreOptions {
   onRetry?: OnRetry;
 }
 
+/** buildWrittenAt 的结果 */
+export interface BuildWrittenAt {
+  /** 按 key 排第一的对象的 LastModified */
+  writtenAt: Date;
+  /** 响应的 Date 头，即 R2 那边的「此刻」；缺失或解析不出时为 null，由调用方退回本机时间 */
+  serverTime: Date | null;
+}
+
 /** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
 export type S3Operation = "list" | "writtenAt" | "scopeEmpty" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
@@ -111,13 +119,14 @@ export class R2Store {
     this.#base = `${opts.endpoint.replace(/\/+$/, "")}/${opts.bucket}`;
   }
 
-  async #request(operation: S3Operation, url: string, init?: RequestInit): Promise<Response> {
+  async #request(operation: S3Operation, url: string, init?: RequestInit, signal?: AbortSignal): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
     let response: Response;
     try {
       response = await withRetry(
         async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
         this.#opts.onRetry,
+        signal,
       );
     } catch (error) {
       // 重试耗尽的网络层失败也归成 S3Error（status 为 0），和 cloudflare.ts 一致：库的调用方按文档列出的
@@ -183,14 +192,17 @@ export class R2Store {
   /**
    * build 目录里按 key 排第一的对象的写入时间，目录已空时为 null。只取一个对象，不论目录多大都是一个请求。
    * 正在写入的 build 每个对象都是新的，取哪个都一样；老 build 被 ISR 改写过的对象可能偏新，那只会让它晚几天判作废。
+   * 同时交回响应的 Date 头：拿 R2 自己的时钟算写入了多久，跑工具的机器时钟不准也不会把新 build 算老。
+   * signal 中止时不再重试，免得整趟已经失败，还在退避的请求把进程拖住。
    */
-  async buildWrittenAt(prefix: string, buildId: string): Promise<Date | null> {
+  async buildWrittenAt(prefix: string, buildId: string, signal?: AbortSignal): Promise<BuildWrittenAt | null> {
     const url = new URL(this.#base);
     url.searchParams.set("list-type", "2");
     url.searchParams.set("prefix", `${normalizePrefix(prefix)}${buildId}/`);
     url.searchParams.set("max-keys", "1");
 
-    const result = parseListObjects(await (await this.#request("writtenAt", url.toString())).text());
+    const response = await this.#request("writtenAt", url.toString(), undefined, signal);
+    const result = parseListObjects(await response.text());
     if (result.lastModified.length === 0) return null;
     const raw = result.lastModified[0];
     const time = raw === undefined ? Number.NaN : Date.parse(raw);
@@ -201,7 +213,8 @@ export class R2Store {
           `无法判断它是不是刚写入、还没上线的 build，已中止。可加 --grace-hours 0 跳过这项检查。`,
       );
     }
-    return new Date(time);
+    const date = Date.parse(response.headers.get("date") ?? "");
+    return { writtenAt: new Date(time), serverTime: Number.isNaN(date) ? null : new Date(date) };
   }
 
   /** 读出 lifecycle 配置，并从缓存前缀 prefix 的视角分拣出本工具的规则 */
