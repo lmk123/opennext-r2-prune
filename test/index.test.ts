@@ -164,6 +164,43 @@ describe("prune", () => {
     await prune({ ...CREDS, ...SITE, endpoint: "", dryRun: true, fetch: world.fetch });
     expect(world.calls.some((c) => c.url.startsWith("https://acct123.r2.cloudflarestorage.com/my-cache"))).toBe(true);
   });
+
+  it("规则名额不够时分批挂，R2 删完一批后下一轮回收规则、挂上推迟的", async () => {
+    const buildIds = ["live", "a", "b", "c", "d"];
+    const world = fakeWorld({ buildIds, online: "live" });
+    const userRules = Array.from(
+      { length: 998 },
+      (_, i) =>
+        `<Rule><ID>user-${i}</ID><Status>Enabled</Status><Filter><Prefix>uploads/${i}/</Prefix></Filter>` +
+        `<Expiration><Days>30</Days></Expiration></Rule>`,
+    ).join("");
+    world.setLifecycle(`<LifecycleConfiguration>${userRules}</LifecycleConfiguration>`);
+
+    const first = await prune({ ...CREDS, ...SITE, fetch: world.fetch });
+    expect(first.expire).toEqual([
+      { buildId: "a", state: "new" },
+      { buildId: "b", state: "new" },
+    ]);
+    expect(first.deferred).toEqual([{ buildId: "c" }, { buildId: "d" }]);
+    expect(first).toMatchObject({ written: true, verified: true });
+
+    // R2 还没删完：名额仍满，推迟的接着等，不写入
+    const second = await prune({ ...CREDS, ...SITE, fetch: world.fetch });
+    expect(second).toMatchObject({ changed: false, written: false });
+    expect(second.deferred).toEqual([{ buildId: "c" }, { buildId: "d" }]);
+    expect(world.puts()).toHaveLength(1);
+
+    // R2 删完了 a、b：回收它们的规则，空出的名额当场给 c、d
+    buildIds.splice(1, 2);
+    const third = await prune({ ...CREDS, ...SITE, fetch: world.fetch });
+    expect(third.reclaim).toEqual([
+      { buildId: "a", reason: "emptied" },
+      { buildId: "b", reason: "emptied" },
+    ]);
+    expect(third.expire.map((b) => b.buildId)).toEqual(["c", "d"]);
+    expect(third.deferred).toEqual([]);
+    expect(third).toMatchObject({ written: true, verified: true, warnings: [] });
+  });
 });
 
 describe("planPrune", () => {

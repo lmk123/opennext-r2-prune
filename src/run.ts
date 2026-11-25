@@ -134,27 +134,30 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     force: opts.force,
     allowRootPrefix: opts.allowRootPrefix,
   };
-  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间
-  let plan = makePlan({ ...planInput, keep: keeps });
+  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间。
+  // 这一遍不管规则名额：刚写入的 build 还没筛掉，算进去会白占名额，甚至让本可以继续的一趟中止
+  const draft = makePlan({ ...planInput, keep: keeps, skipRuleLimit: true });
 
-  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长
-  const candidates = plan.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长。
+  // 顺带拿到的写入时间也决定名额不够时先挂谁；--grace-hours 0 时不读，名额不够就按 buildId 挑
+  const candidates = draft.expire.filter((b) => b.state === "new").map((b) => b.buildId);
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
+  const fresh: KeptBuild[] = [];
+  let writtenAt: Map<string, Date | null> | undefined;
   if (graceMs > 0 && candidates.length > 0) {
     const now = (opts.now ?? Date.now)();
-    const writtenAt = await mapWithConcurrency(candidates, concurrency, signal, (buildId) =>
+    const times = await mapWithConcurrency(candidates, concurrency, signal, (buildId) =>
       opts.store.buildWrittenAt(opts.prefix, buildId),
     );
-    const fresh: KeptBuild[] = [];
-    candidates.forEach((buildId, i) => {
-      const time = writtenAt[i];
+    writtenAt = new Map(candidates.map((buildId, i) => [buildId, times[i] ?? null]));
+    for (const [buildId, time] of writtenAt) {
       // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
       if (time && now - time.getTime() < graceMs) {
         fresh.push({ buildId, reason: "fresh", source: `写入于 ${time.toISOString()}` });
       }
-    });
-    if (fresh.length > 0) plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
+    }
   }
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt });
 
   return {
     onlineBuildId,

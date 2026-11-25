@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify, WriteNotAppliedError } from "../src/run.ts";
-import { PlanError } from "../src/plan.ts";
+import { MAX_RULES, PlanError } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
 
@@ -214,6 +214,95 @@ describe("collectPlan", () => {
     expect(state.plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(state.plan.nextDoc.own).toHaveLength(0);
     expect(state.plan.changed).toBe(true);
+  });
+});
+
+describe("collectPlan 与规则总数上限", () => {
+  /** n 条用户自己的规则 */
+  const userRules = (n: number) =>
+    `<LifecycleConfiguration>${Array.from(
+      { length: n },
+      (_, i) => `<Rule><ID>user-${i}</ID><Status>Enabled</Status>
+        <Filter><Prefix>uploads/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
+    ).join("")}</LifecycleConfiguration>`;
+  const now = Date.parse("2026-11-25T12:00:00.000Z");
+
+  it("名额不够时按写入时间先挂最早的，其余推迟，不中止", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "a", "b", "c"],
+      lifecycle: userRules(998),
+      writtenAt: { a: "2026-03-01T00:00:00.000Z", b: "2026-01-01T00:00:00.000Z", c: "2026-02-01T00:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b", "c"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "a" }]);
+    expect(state.plan.nextDoc.foreign).toHaveLength(998);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("名额按 --grace-hours 筛过之后算：刚写入的 build 不占名额", async () => {
+    // 只剩一个名额；deploying 写入最晚，先算名额的话它会和 old1 抢，筛过之后 old1 独占
+    const { store } = fakeR2({
+      buildIds: ["live", "deploying", "old1", "old2"],
+      lifecycle: userRules(MAX_RULES - 1),
+      writtenAt: {
+        deploying: "2026-11-25T11:00:00.000Z",
+        old1: "2026-01-01T00:00:00.000Z",
+        old2: "2026-02-01T00:00:00.000Z",
+      },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live", "deploying"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "old2" }]);
+  });
+
+  it("外部规则占满上限、但要新挂规则的 build 都刚写入时不中止", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying"],
+      lifecycle: userRules(MAX_RULES),
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.changed).toBe(false);
+    expect(state.plan.deferred).toEqual([]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("外部规则自己就占满上限、一条新规则都挂不上时中止，不发任何写请求", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], lifecycle: userRules(MAX_RULES) });
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
+    ).rejects.toThrow(/核对 lifecycle 规则名额时中止/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("已挂着规则的 build 不因名额被摘掉，新判作废的推迟", async () => {
+    const rules = ["old1", "old2"]
+      .map(
+        (id) => `<Rule><ID>opennext-r2-prune:incremental-cache/${id}/</ID><Status>Enabled</Status>
+          <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
+      )
+      .join("");
+    const { store } = fakeR2({
+      buildIds: ["live", "old1", "old2", "new1"],
+      lifecycle: userRules(MAX_RULES - 2).replace("</LifecycleConfiguration>", `${rules}</LifecycleConfiguration>`),
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire).toEqual([
+      { buildId: "old1", state: "pending" },
+      { buildId: "old2", state: "pending" },
+    ]);
+    expect(state.plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(state.plan.changed).toBe(false);
+  });
+
+  it("graceHours 为 0 时不读写入时间，名额不够就按 buildId 挑", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "c", "a", "b"], lifecycle: userRules(MAX_RULES - 2) });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], graceHours: 0 });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["a", "b"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "c" }]);
+    expect(calls).toHaveLength(2);
   });
 });
 

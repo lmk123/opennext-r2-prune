@@ -170,6 +170,49 @@ describe("基本流程", () => {
     await expectRules(BASELINE_EXPECTED);
   });
 
+  it("规则名额不够时分批挂：挂满 R2 的 1000 条上限，其余推迟；R2 拒绝第 1001 条", async () => {
+    // 外部规则凑到 998 条，只剩两个名额
+    const fillers = Array.from(
+      { length: 998 - BASELINE_RULES.length },
+      (_, i) =>
+        `<Rule><ID>e2e-filler-${i}</ID><Status>Enabled</Status><Filter><Prefix>${E2E_ROOT}/filler/${i}/</Prefix></Filter>` +
+        "<Expiration><Days>3650</Days></Expiration></Rule>",
+    );
+    await r2.setLifecycle(lifecycleXml([...BASELINE_RULES, ...fillers]));
+    await r2.seedBuilds(SITE_A, ["build-a", "build-b", "build-c", "build-d"]);
+
+    const result = await prune(options(SITE_A, { keep: ["build-a"] }).opts);
+    expect(result.expire).toEqual([
+      { buildId: "build-b", state: "new" },
+      { buildId: "build-c", state: "new" },
+    ]);
+    expect(result.deferred).toEqual([{ buildId: "build-d" }]);
+    expect(result).toMatchObject({ written: true, verified: true, warnings: [], writeError: null });
+    const rules = await r2.rules();
+    expect(rules).toHaveLength(1000);
+    expect(rules.filter((rule) => rule.id.startsWith("opennext-r2-prune:")).map((rule) => rule.id).sort()).toEqual([
+      ownId(SITE_A, "build-b"),
+      ownId(SITE_A, "build-c"),
+    ]);
+
+    // 名额仍满时推迟的接着等，不写入
+    const again = options(SITE_A, { keep: ["build-a"] });
+    const second = await prune(again.opts);
+    expect(second).toMatchObject({ changed: false, deferred: [{ buildId: "build-d" }] });
+    expect(again.spy.writes()).toEqual([]);
+
+    // MAX_RULES 的依据：同样写法的规则凑到 1001 条，R2 就拒绝（报的是 MalformedXML，不说是条数超了）
+    const extra = Array.from(
+      { length: 3 },
+      (_, i) =>
+        `<Rule><ID>e2e-filler-extra-${i}</ID><Status>Enabled</Status><Filter><Prefix>${E2E_ROOT}/filler/extra-${i}/</Prefix></Filter>` +
+        "<Expiration><Days>3650</Days></Expiration></Rule>",
+    );
+    await expect(r2.putLifecycle(lifecycleXml([...BASELINE_RULES, ...fillers, ...extra]))).rejects.toThrow(
+      /HTTP 400.*MalformedXML/,
+    );
+  });
+
   it("目录删空后回收规则，回滚的 build 摘掉规则，改了过期天数就改写规则", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b", "build-c"]);
     await prune(options(SITE_A, { keep: ["build-a"] }).opts);

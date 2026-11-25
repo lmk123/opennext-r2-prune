@@ -14,7 +14,7 @@ import {
  * 这里不发任何请求，全部安全校验都在此完成 —— 校验不过就抛错，调用方不会走到写入。
  */
 
-/** R2 的 lifecycle 规则总数上限 */
+/** R2 每个 bucket 的 lifecycle 规则总数上限。实测超出时 PUT 回 400 MalformedXML，不说是条数超了 */
 export const MAX_RULES = 1000;
 
 /**
@@ -55,11 +55,18 @@ export interface ReclaimedRule {
   reason: ReclaimReason;
 }
 
+/** 已判作废、但 lifecycle 规则名额已满，这次没挂上规则的 build。之后的运行回收规则、空出名额后再挂 */
+export interface DeferredBuild {
+  buildId: string;
+}
+
 export interface PrunePlan {
   keep: KeptBuild[];
   /** 要保留、但 bucket 里本来就没有的 build（只可能是 recent / preview），仅供展示 */
   absent: KeptBuild[];
   expire: ExpiringBuild[];
+  /** 名额已满，这次不挂规则的作废 build。它们不在 expire 里，也不算保留 */
+  deferred: DeferredBuild[];
   reclaim: ReclaimedRule[];
   nextDoc: LifecycleDoc;
   /** 与现状一致时为 false，此时无需发 PUT */
@@ -86,6 +93,16 @@ export interface PlanInput {
   force?: boolean;
   /** 承认「前缀为空、缓存直接放在 bucket 根下」这种布局 */
   allowRootPrefix?: boolean;
+  /**
+   * 各 build 目录的写入时间（null = 目录已空、读不到）。规则名额不够时先给写入最早的挂规则；
+   * 不在这里或为 null 的排在后面，彼此按 buildId 排
+   */
+  writtenAt?: ReadonlyMap<string, Date | null>;
+  /**
+   * 不按规则总数上限截断。只给 collectPlan 筛掉刚写入的 build 之前那一遍用：那时算上限，
+   * 刚写入的 build 会占名额，名额被外部规则占满时还会白白中止
+   */
+  skipRuleLimit?: boolean;
 }
 
 /**
@@ -230,27 +247,26 @@ export function makePlan(input: PlanInput): PrunePlan {
       reason: existingSet.has(buildId) ? ("revived" as const) : ("emptied" as const),
     }));
 
+  const { attach, deferred } = input.skipRuleLimit
+    ? { attach: new Set(expireIds), deferred: [] }
+    : fitRuleLimit(expireIds, currentById, current.foreign.length, input.writtenAt);
+
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
   // 另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
-  // current.own 中没进 reclaim 的条目，其 buildId 必然落在 expireIds 里，所以这里不会丢规则。
-  const nextOwn: OwnRule[] = expireIds.map((buildId) => ({
-    buildId,
-    prefix: rulePrefix(prefix, buildId),
-    expireDays,
-    enabled: true,
-  }));
-
-  const total = current.foreign.length + nextOwn.length;
-  if (total > MAX_RULES) {
-    throw new PlanError(
-      `规则总数会达到 ${total} 条，超过 R2 的 ${MAX_RULES} 条上限。` +
-        `等已有规则删完后重跑一次即可自动回收，或手动清理 bucket 上的 lifecycle 规则。`,
-    );
-  }
+  // current.own 中没进 reclaim 的条目，其 buildId 必然落在 expireIds 里、且 fitRuleLimit 不会推迟它，所以这里不会丢规则。
+  const nextOwn: OwnRule[] = expireIds
+    .filter((buildId) => attach.has(buildId))
+    .map((buildId) => ({
+      buildId,
+      prefix: rulePrefix(prefix, buildId),
+      expireDays,
+      enabled: true,
+    }));
 
   return {
     keep,
     absent,
+    deferred: deferred.map((buildId) => ({ buildId })),
     expire: nextOwn.map((rule) => ({
       buildId: rule.buildId,
       state: duplicated.has(rule.buildId) ? "updated" : expireState(currentById.get(rule.buildId), rule),
@@ -261,6 +277,43 @@ export function makePlan(input: PlanInput): PrunePlan {
       current.own.length !== nextOwn.length ||
       nextOwn.some((rule) => !sameRule(currentById.get(rule.buildId), rule)),
   };
+}
+
+/**
+ * 按 R2 的规则总数上限挑出这次挂规则的作废 build，其余推迟到之后的运行。
+ *
+ * 已经挂着规则的一律留下（哪怕要改写）：摘掉它，R2 正在进行的删除就停了，下次还得重新排队。
+ * 剩余名额 = 上限 − 外部规则（含本工具为别的前缀写的）− 留下的本工具规则，按写入时间从早到晚挂满。
+ * 推迟的 build 不挂规则也不算保留；R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。
+ *
+ * 只有外部规则自己就占满上限时才中止：那时本工具一条规则都留不下，名额永远空不出来，只能由人来清理。
+ */
+function fitRuleLimit(
+  expireIds: string[],
+  currentById: ReadonlyMap<string, OwnRule>,
+  foreign: number,
+  writtenAt: ReadonlyMap<string, Date | null> | undefined,
+): { attach: Set<string>; deferred: string[] } {
+  const ruled = expireIds.filter((id) => currentById.has(id));
+  const unruled = expireIds.filter((id) => !currentById.has(id));
+  const room = Math.max(0, MAX_RULES - foreign - ruled.length);
+  if (unruled.length <= room) return { attach: new Set(expireIds), deferred: [] };
+
+  if (foreign >= MAX_RULES) {
+    throw new PlanError(
+      `核对 lifecycle 规则名额时中止：bucket 上已有 ${foreign} 条不归当前缓存前缀管的规则（你自己的规则，` +
+        `以及本工具为别的缓存前缀写的），占满了 R2 每个 bucket ${MAX_RULES} 条的上限，` +
+        `${unruled.length} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
+        `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉，空出名额后重跑；` +
+        `本工具为别的前缀写的规则，可对那个前缀跑一次本工具，回收其中已删完的。`,
+    );
+  }
+
+  const time = (id: string) => writtenAt?.get(id)?.getTime() ?? Number.POSITIVE_INFINITY;
+  // 两边都没有时间时 Infinity - Infinity 是 NaN，同样落到按 buildId 排
+  const order = [...unruled].sort((a, b) => time(a) - time(b) || (a < b ? -1 : a > b ? 1 : 0));
+  const attach = new Set([...ruled, ...order.slice(0, room)]);
+  return { attach, deferred: unruled.filter((id) => !attach.has(id)) };
 }
 
 /** 逐字段比对，任何一项不同都意味着这条规则得重写 —— 只比条数会漏掉选项变更。 */

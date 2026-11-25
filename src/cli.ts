@@ -235,7 +235,11 @@ async function main(argv: string[]): Promise<number> {
   let code = 0;
 
   if (!planned.changed) {
-    note("\n规则已经是最新的，无需改动。");
+    note(
+      planned.deferred.length > 0
+        ? "\n规则名额已满，本次无需改动；推迟的 build 等之后的运行回收规则、空出名额后再挂。"
+        : "\n规则已经是最新的，无需改动。",
+    );
   } else if (values["dry-run"]) {
     note("\n--dry-run：未写入任何改动。");
   } else if (!values.yes && !process.stdin.isTTY) {
@@ -258,7 +262,10 @@ async function main(argv: string[]): Promise<number> {
       const updated = planned.expire.filter((b) => b.state === "updated").length;
       note(
         `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${planned.reclaim.length} 个 build 的规则。` +
-          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。`,
+          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。` +
+          (planned.deferred.length > 0
+            ? `\n另有 ${planned.deferred.length} 个作废 build 因规则名额已满没有挂规则，之后的运行空出名额后再挂。`
+            : ""),
       );
     } catch (error) {
       if (!(error instanceof PruneWriteError)) throw error;
@@ -350,6 +357,17 @@ function printPlan(plan: PrunePlanSummary): void {
     }
   }
 
+  if (plan.deferred.length > 0) {
+    console.log(
+      `\nlifecycle 规则已到 R2 每个 bucket 1000 条的上限，以下 ${plan.deferred.length} 个作废 build 这次不挂规则：`,
+    );
+    for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额已满，下次运行再挂`);
+    console.log(
+      `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完；` +
+        `想快些可以清理 bucket 上不再需要的 lifecycle 规则。`,
+    );
+  }
+
   const revived = plan.reclaim.filter((r) => r.reason === "revived");
   const emptied = plan.reclaim.filter((r) => r.reason === "emptied");
 
@@ -385,6 +403,8 @@ function toJson(plan: PrunePlanSummary) {
     keep: [...plan.keep, ...plan.absent],
     absent: plan.absent,
     expire: plan.expire,
+    // 名额已满、这次没挂规则的作废 build，不在 expire 里，也不算保留
+    deferred: plan.deferred,
     reclaim: plan.reclaim,
   };
 }

@@ -1,5 +1,5 @@
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
-import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
+import type { DeferredBuild, ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { assertLifecycleUnchanged, collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
@@ -16,7 +16,15 @@ import { ruleId } from "./xml.ts";
 export { BuildIdProbeError } from "./build-id.ts";
 export { CloudflareApiError } from "./cloudflare.ts";
 export { PlanError } from "./plan.ts";
-export type { ExpireState, ExpiringBuild, KeepReason, KeptBuild, ReclaimReason, ReclaimedRule } from "./plan.ts";
+export type {
+  DeferredBuild,
+  ExpireState,
+  ExpiringBuild,
+  KeepReason,
+  KeptBuild,
+  ReclaimReason,
+  ReclaimedRule,
+} from "./plan.ts";
 export type { OnRetry } from "./retry.ts";
 export { S3Error } from "./store.ts";
 export { XmlAssumptionError } from "./xml.ts";
@@ -104,6 +112,11 @@ export interface PrunePlanSummary {
   absent: KeptBuild[];
   /** 交给 R2 删除的 build */
   expire: ExpiringBuild[];
+  /**
+   * 已判作废、但 R2 每个 bucket 1000 条 lifecycle 规则的名额已满，这次没挂规则的 build（不算保留）。
+   * 之后的运行回收已删完的规则、空出名额后再挂，逐轮清完
+   */
+  deferred: DeferredBuild[];
   /** 要回收或摘除的已有规则 */
   reclaim: ReclaimedRule[];
 }
@@ -278,6 +291,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
     keep: plan.keep,
     absent: plan.absent,
     expire: plan.expire,
+    deferred: plan.deferred,
     reclaim: plan.reclaim,
 
     async apply() {
