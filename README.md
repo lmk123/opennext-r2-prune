@@ -149,7 +149,7 @@ bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--
 ### 作为库调用
 
 同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
-`AbortSignal`），Node 20+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
+`AbortSignal`），Node 22.12+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
 
 本包没有发布到 npm，请从 GitHub 安装，安装时 `prepare` 脚本会构建出 `dist`：
 
