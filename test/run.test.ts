@@ -132,7 +132,7 @@ describe("collectPlan", () => {
 
   it("已有规则的 build 目录清空后，规则被标记回收", async () => {
     const lifecycle = `<LifecycleConfiguration><Rule>
-      <ID>opennext-r2-prune:gone</ID><Status>Enabled</Status>
+      <ID>opennext-r2-prune:incremental-cache/gone/</ID><Status>Enabled</Status>
       <Filter><Prefix>incremental-cache/gone/</Prefix></Filter>
       <Expiration><Days>1</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
@@ -148,6 +148,183 @@ describe("collectPlan", () => {
     expect(state.plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(state.plan.nextDoc.own).toHaveLength(0);
     expect(state.plan.changed).toBe(true);
+  });
+});
+
+describe("多个站点共用一个 bucket（各用各的前缀）", () => {
+  /** 按请求的 prefix 列目录、并记住写入的 lifecycle 的假 R2 */
+  function sharedBucket(dirs: Record<string, string[]>, lifecycle?: string) {
+    const calls: string[] = [];
+    let stored = lifecycle;
+    const fetchImpl = (async (request: Request) => {
+      const url = new URL(request.url);
+      calls.push(request.method);
+      if (url.searchParams.has("lifecycle")) {
+        if (request.method === "PUT") {
+          stored = await request.text();
+          return new Response("", { status: 200 });
+        }
+        return stored === undefined
+          ? new Response("<Error><Code>NoSuchLifecycleConfiguration</Code></Error>", { status: 404 })
+          : new Response(stored);
+      }
+      const prefix = url.searchParams.get("prefix")!;
+      const prefixes = (dirs[prefix] ?? [])
+        .map((id) => `<CommonPrefixes><Prefix>${prefix}${id}/</Prefix></CommonPrefixes>`)
+        .join("");
+      return new Response(`<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`);
+    }) as unknown as typeof fetch;
+    return { calls, stored: () => stored, store: new R2Store({ ...CREDS, fetchImpl }) };
+  }
+
+  const run = async (store: R2Store, prefix: string) => {
+    const state = await collectPlan({ store, prefix, keep: ["live"] });
+    if (state.plan.changed) await writeAndVerify(store, state.plan.nextDoc, state.lifecycle, NO_WAIT);
+    return state;
+  };
+
+  it("轮流运行互不回收对方的规则；buildId 相同（确定性 build id）也不撞", async () => {
+    const bucket = sharedBucket({ "site-a/": ["live", "old1"], "site-b/": ["live", "old1", "old2"] });
+
+    await run(bucket.store, "site-a");
+    const b = await run(bucket.store, "site-b");
+    // site-a 的 old1 在 site-b/ 下列不到，旧实现会把它当成目录已空的残留回收掉
+    expect(b.plan.reclaim).toEqual([]);
+    expect(b.plan.expire.map((e) => e.buildId)).toEqual(["old1", "old2"]);
+
+    const xml = bucket.stored()!;
+    expect(xml).toContain("<ID>opennext-r2-prune:site-a/old1/</ID>");
+    expect(xml).toContain("<ID>opennext-r2-prune:site-b/old1/</ID>");
+    expect(xml).toContain("<ID>opennext-r2-prune:site-b/old2/</ID>");
+
+    // 再跑 site-a 无需任何改动，不会和 site-b 来回覆盖
+    const again = await run(bucket.store, "site-a");
+    expect(again.plan.changed).toBe(false);
+  });
+
+  it("前缀为空、而别的前缀写过规则时中止：根下的 site-a/ 会被当成作废 build，不发任何写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:site-a/old1/</ID><Status>Enabled</Status>
+      <Filter><Prefix>site-a/old1/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store, calls } = sharedBucket({ "": ["live", "old9", "site-a"] }, lifecycle);
+    await expect(collectPlan({ store, prefix: "", allowRootPrefix: true, keep: ["live"] })).rejects.toThrow(
+      /互相嵌套/,
+    );
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
+
+  it("内层前缀写过规则后，外层前缀的运行中止，不发任何写请求", async () => {
+    const bucket = sharedBucket({ "site-a/": ["live", "old1", "nested"], "site-a/nested/": ["live", "old2"] });
+    await run(bucket.store, "site-a/nested");
+    const before = bucket.calls.length;
+    await expect(collectPlan({ store: bucket.store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/互相嵌套/);
+    expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
+  });
+
+  it("外层前缀先写下规则时，内层前缀的运行同样中止，不发任何写请求", async () => {
+    const bucket = sharedBucket({ "site-a/": ["live", "old1", "nested"], "site-a/nested/": ["live", "old2"] });
+    await run(bucket.store, "site-a");
+    // 外层已把 nested 判作废，这正是要报出来的配置错误
+    expect(bucket.stored()).toContain("<ID>opennext-r2-prune:site-a/nested/</ID>");
+    const before = bucket.calls.length;
+    await expect(collectPlan({ store: bucket.store, prefix: "site-a/nested", keep: ["live"] })).rejects.toThrow(
+      /互相嵌套/,
+    );
+    expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
+  });
+
+  it("别的前缀下对整个 bucket 生效的规则也在探测前报出", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:old-cache/b1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store } = sharedBucket({ "site-a/": ["live", "old1"] }, lifecycle);
+    const seen: string[][] = [];
+    const state = await collectPlan({
+      store,
+      prefix: "site-a",
+      keep: ["live"],
+      onWholeBucketRules: (ids) => void seen.push(ids),
+    });
+    expect(seen).toEqual([["opennext-r2-prune:old-cache/b1/"]]);
+    expect(state.wholeBucketRules).toEqual(["opennext-r2-prune:old-cache/b1/"]);
+    // 不归这一趟改写，原样搬运
+    expect(state.plan.nextDoc.foreign).toHaveLength(1);
+  });
+
+  it("只依赖配置的校验在探测之前做：配置不能用时既不探测，也不发写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:site-a/nested/old1/</ID><Status>Enabled</Status>
+      <Filter><Prefix>site-a/nested/old1/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const longPrefix = `${"p".repeat(240)}/`;
+    const cases: { prefix: string; dirs: Record<string, string[]>; lifecycle: string | undefined; error: RegExp }[] = [
+      { prefix: "site-a", dirs: { "site-a/": ["live", "old1", "nested"] }, lifecycle, error: /互相嵌套/ },
+      { prefix: longPrefix, dirs: { [longPrefix]: ["live", "old1"] }, lifecycle: undefined, error: /更短的 --prefix/ },
+      { prefix: "", dirs: { "": ["live", "old1"] }, lifecycle: undefined, error: /--allow-root-prefix/ },
+    ];
+    for (const c of cases) {
+      const { store, calls } = sharedBucket(c.dirs, c.lifecycle);
+      let probes = 0;
+      const probe = (async () => {
+        probes++;
+        return new Response("<html>down</html>", { status: 503 });
+      }) as unknown as typeof fetch;
+      await expect(
+        collectPlan({ store, prefix: c.prefix, siteUrl: "https://example.com", fetchImpl: probe }),
+      ).rejects.toThrow(c.error);
+      expect(probes).toBe(0);
+      expect(calls.every((method) => method === "GET")).toBe(true);
+    }
+  });
+
+  it("规则 ID 超出长度上限时中止，不发任何写请求", async () => {
+    const prefix = `${"p".repeat(240)}/`;
+    const { store, calls } = sharedBucket({ [prefix]: ["live", "old1"] });
+    await expect(collectPlan({ store, prefix, keep: ["live"] })).rejects.toThrow(/更短的 --prefix/);
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
+
+  it("读到的配置与计划的前缀对不上时中止，不发任何写请求", async () => {
+    let puts = 0;
+    const store = {
+      listBuildIds: async () => ["live", "old1"],
+      getLifecycle: async () => ({ prefix: "site-b/", own: [], foreign: [], others: [], malformed: [] }),
+      putLifecycle: async () => void puts++,
+    } as unknown as R2Store;
+    await expect(collectPlan({ store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/内部错误/);
+    expect(puts).toBe(0);
+  });
+
+  it("本工具标记的规则 ID 格式不对时，先报出其中与别处对整个 bucket 生效的，再中止，不发任何写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:a//</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule><Rule>
+      <ID>opennext-r2-prune:incremental-cache/b2/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store, calls } = sharedBucket({ "incremental-cache/": ["live", "old1", "b2"] }, lifecycle);
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
+    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/b2/", "opennext-r2-prune:a//"]]);
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
+
+  it("格式不对的规则前缀含转义字符时，读配置不失败，照样先报出对整个 bucket 生效的规则再中止，不发任何写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:x y</ID><Status>Enabled</Status>
+      <Filter><Prefix>a&amp;b/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+    </Rule><Rule>
+      <ID>opennext-r2-prune:old-cache/b1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store, calls } = sharedBucket({ "incremental-cache/": ["live", "old1"] }, lifecycle);
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
+    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    expect(seen).toEqual([["opennext-r2-prune:old-cache/b1/"]]);
+    expect(calls.every((method) => method === "GET")).toBe(true);
   });
 });
 
@@ -636,12 +813,13 @@ function statefulR2(
 }
 
 const FOREIGN = "<ID>mine</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration>";
-const DOC = {
+const DOC: LifecycleDoc = {
+  prefix: "incremental-cache/",
   own: [{ buildId: "old1", prefix: "incremental-cache/old1/", expireDays: 1, enabled: true }],
   foreign: [FOREIGN],
 };
 /** statefulR2 里初始的配置：只有一条外部规则 */
-const BEFORE: LifecycleDoc = { own: [], foreign: [FOREIGN] };
+const BEFORE: LifecycleDoc = { prefix: "incremental-cache/", own: [], foreign: [FOREIGN] };
 const NO_WAIT = { sleep: async () => {} };
 
 /** 按脚本依次返回结果的假 store，用来覆盖 HTTP 层不好模拟的情况（超时后照样生效、读超时等） */
@@ -666,6 +844,14 @@ const dropOwnPrefix = (xml: string) =>
   xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, "");
 
 describe("writeAndVerify", () => {
+  it("规则 ID 与实际作用的前缀对不上时拒绝写入，不发任何写请求", async () => {
+    const { puts, store } = statefulR2();
+    await expect(writeAndVerify(store, { ...DOC, prefix: "site-b/" }, BEFORE, NO_WAIT)).rejects.toThrow(
+      WriteNotAppliedError,
+    );
+    expect(puts).toHaveLength(0);
+  });
+
   it("回读一致时只写一次", async () => {
     const { puts, store } = statefulR2();
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
@@ -701,7 +887,7 @@ describe("writeAndVerify", () => {
 
   it("自有规则的 ID 被改得认不出时，撤销用写入前的外部规则，不会把它当外部规则留下", async () => {
     const { puts, store } = statefulR2({
-      mangle: (xml) => dropOwnPrefix(xml).replace("<ID>opennext-r2-prune:old1</ID>", "<ID>renamed</ID>"),
+      mangle: (xml) => dropOwnPrefix(xml).replace("<ID>opennext-r2-prune:incremental-cache/old1/</ID>", "<ID>renamed</ID>"),
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.problems).toContain("规则 old1 读回来不见了");
@@ -721,7 +907,7 @@ describe("writeAndVerify", () => {
     // 撤销之后服务端仍返回带自有规则的旧配置
     const { store } = statefulR2({
       mangle: (xml, i) =>
-        i < 3 ? dropOwnPrefix(xml) : "<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        i < 3 ? dropOwnPrefix(xml) : "<LifecycleConfiguration><Rule><ID>opennext-r2-prune:incremental-cache/old1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(false);
@@ -782,7 +968,7 @@ describe("writeAndVerify", () => {
   });
 
   it("写入超时、读回来既不是新配置也不是旧配置时（生效了但被改写），照样撤销", async () => {
-    const mutated: LifecycleDoc = { own: [{ ...DOC.own[0]!, expireDays: 30 }], foreign: [FOREIGN] };
+    const mutated: LifecycleDoc = { prefix: "incremental-cache/", own: [{ ...DOC.own[0]!, expireDays: 30 }], foreign: [FOREIGN] };
     const { store, putDocs, getCount } = scriptedStore({
       puts: [new Error("网络超时"), null],
       gets: [mutated, mutated, mutated, BEFORE],
@@ -792,7 +978,7 @@ describe("writeAndVerify", () => {
     expect(result.problems.join()).toContain("过期天数");
     expect(result.rolledBack).toBe(true);
     expect(result.written).toBe(false);
-    expect(putDocs[1]).toEqual({ own: [], foreign: [FOREIGN] });
+    expect(putDocs[1]).toEqual({ prefix: "incremental-cache/", own: [], foreign: [FOREIGN] });
     // 不是明确拒绝，照常按「刚写完可能读到旧配置」重读满 3 次，撤销后再读 1 次
     expect(getCount()).toBe(4);
   });
@@ -820,6 +1006,7 @@ describe("writeAndVerify", () => {
 
   it("写入被拒、旧配置里本有整 bucket 规则、撤销也失败时，不把旧规则算成本次写入", async () => {
     const dangerous: LifecycleDoc = {
+      prefix: "incremental-cache/",
       own: [{ buildId: "old1", prefix: "", expireDays: 1, enabled: true }],
       foreign: [FOREIGN],
     };
@@ -844,7 +1031,7 @@ describe("writeAndVerify", () => {
 
 describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
   it("在探测之前回调，探测失败时也已经报过", async () => {
-    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
+    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:incremental-cache/old1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
     const { store, calls } = fakeR2({ buildIds: ["old1", "live"], lifecycle });
     const seen: string[][] = [];
     await expect(
@@ -855,12 +1042,12 @@ describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
         onWholeBucketRules: (ids) => void seen.push(ids),
       }),
     ).rejects.toThrow(PlanError);
-    expect(seen).toEqual([["old1"]]);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/old1/"]]);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("列目录失败时也先报出危险规则，再中止", async () => {
-    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:old1</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
+    const lifecycle = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:incremental-cache/old1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
     const fetchImpl = (async (request: Request) =>
       new URL(request.url).searchParams.has("lifecycle")
         ? new Response(lifecycle)
@@ -874,6 +1061,6 @@ describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
         onWholeBucketRules: (ids) => void seen.push(ids),
       }),
     ).rejects.toThrow(S3Error);
-    expect(seen).toEqual([["old1"]]);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/old1/"]]);
   });
 });

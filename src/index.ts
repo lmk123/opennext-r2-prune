@@ -3,6 +3,7 @@ import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { assertLifecycleUnchanged, collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
+import { ruleId } from "./xml.ts";
 
 /**
  * 供其它 JS 代码调用的入口。和 run.ts 一样只用 Web 标准 API，Node 与 Cloudflare Worker 里都能跑；
@@ -64,10 +65,10 @@ export interface PruneOptions {
   /** 网络请求重试时的回调 */
   onRetry?: OnRetry;
   /**
-   * 读到 bucket 上有对整个 bucket 生效的自有规则时立即回调（在探测之前）。探测或校验失败时
-   * 整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
+   * 读到 bucket 上有对整个 bucket 生效的本工具规则时立即回调（在探测之前），参数是这些规则的 ID，
+   * 含别的前缀下的、ID 格式不对的。探测或校验失败时整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
    */
-  onWholeBucketRules?: (buildIds: string[]) => void;
+  onWholeBucketRules?: (ruleIds: string[]) => void;
 }
 
 /** 计划：写入前就能确定的全部信息 */
@@ -87,7 +88,10 @@ export interface PrunePlanSummary {
    * 更早的 build 会被判作废，需要保留的请放进 keep
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
-  /** 运行前就已对整个 bucket 生效的自有规则（前缀为空）。写入成功会把它们改写 */
+  /**
+   * 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的、ID 格式不对的。只有本次前缀下的
+   * 会被写入改写，别的前缀下的得手动删除
+   */
   wholeBucketRules: string[];
   /** 与现状一致时为 false，此时无需写入 */
   changed: boolean;
@@ -246,6 +250,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
 
   const { plan } = state;
   let applied = false;
+  // 只点出本次前缀下的规则：同一个 bucket 上别的站点的规则不归这一趟管，叫人全删会误伤
+  const ownRules = `ID 形如 ${ruleId(prefix, "<buildId>")} 的规则`;
 
   return {
     bucket: opts.bucket,
@@ -292,7 +298,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
         const detail = `写入阶段意外出错，无从确认规则是否已写入：${describeError(error)}`;
         throw new PruneWriteError(
           `${detail}\n请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，` +
-            `并手动删除所有 opennext-r2-prune:* 规则，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
+            `并手动删除 ${ownRules}，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
           { detail, written: true, verified: null, rolledBack: null, warnings: [] },
           error,
         );
@@ -313,9 +319,9 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
           ? [...result.problems, `写入后读不回配置，无从核对：${describeError(result.readBackError)}`]
           : result.problems;
       const rollback = result.rolledBack
-        ? "已撤掉本工具的全部规则并回读确认（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
+        ? "已撤掉本工具在该前缀下的全部规则并回读确认（其它规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
         : `撤掉本工具的规则时失败了：${describeError(result.rollbackError)}\n` +
-          `请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，并手动删除所有 opennext-r2-prune:* 规则，` +
+          `请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，并手动删除 ${ownRules}，` +
           `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
       throw new PruneWriteError(`写入后回读核对失败：\n  ${reasons.join("\n  ")}\n${rollback}`, {
         detail: `写入后回读核对失败：${reasons.join("；")}`,

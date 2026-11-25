@@ -1,5 +1,13 @@
-import { normalizePrefix } from "./prefix.ts";
-import type { LifecycleDoc, OwnRule } from "./xml.ts";
+import { normalizePrefix, rulePrefix } from "./prefix.ts";
+import {
+  type LifecycleDoc,
+  MAX_RULE_ID_LENGTH,
+  type OwnRule,
+  type ParsedLifecycle,
+  RULE_ID_PREFIX,
+  ruleId,
+  XmlAssumptionError,
+} from "./xml.ts";
 
 /**
  * 判定哪些 build 该留、哪些该交给 R2 删，以及最终要写回的规则集。
@@ -66,7 +74,7 @@ export interface PlanInput {
   existing: string[];
   /** 要保留的 build 及其原因 */
   keep: KeptBuild[];
-  current: LifecycleDoc;
+  current: ParsedLifecycle;
   prefix: string;
   /** 规则的过期天数 */
   expireDays: number;
@@ -76,9 +84,12 @@ export interface PlanInput {
   allowRootPrefix?: boolean;
 }
 
-export function makePlan(input: PlanInput): PrunePlan {
-  const { existing, current, prefix, expireDays } = input;
-  const existingSet = new Set(existing);
+/**
+ * 只看前缀、现有配置和 bucket 里列出的目录就能做的校验。collectPlan 在探测之前先调一次：这些错误与
+ * 线上状态无关，不该被探测失败挡在后面；makePlan 再调一次，保证单独调用它时也不会漏掉。
+ */
+export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "prefix" | "allowRootPrefix">): void {
+  const { existing, current, prefix } = input;
 
   // 前缀为空时，「一级目录」就是 bucket 根下的全部目录 —— 除缓存外还堆着别的东西
   // （静态资源、备份……）的 bucket 会把它们统统当成作废 build 挂上删除规则。
@@ -90,6 +101,65 @@ export function makePlan(input: PlanInput): PrunePlan {
         "确认这个 bucket 只用来存 OpenNext 缓存，可加 --allow-root-prefix。",
     );
   }
+
+  // 规则归属按前缀划分，拿 A 前缀的配置给 B 前缀算计划会把 A 的规则全部回收掉
+  if (normalizePrefix(prefix) !== current.prefix) {
+    throw new PlanError(
+      `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止，` +
+        `没有写入任何改动。直接调用 makePlan 时请确认 current 是用同一个前缀读出的（getLifecycle(prefix)）；` +
+        `否则这是本工具的缺陷，请带上这条报错提 issue。`,
+    );
+  }
+
+  // 拆不出归属的规则不猜：它可能是任何一个站点的。对整个 bucket 生效的已由调用方先报过
+  if (current.malformed.length > 0) {
+    const listed = current.malformed
+      .map((rule) => (isWholeBucket(rule) ? `${rule.id}（没有 <Filter><Prefix>，正对整个 bucket 生效！）` : rule.id))
+      .join("、");
+    throw new XmlAssumptionError(
+      `bucket 上有规则以本工具的标记开头，却拆不出「${RULE_ID_PREFIX}<规则作用的前缀>」里的缓存前缀与 buildId：${listed}，` +
+        `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这些规则再重跑。`,
+    );
+  }
+
+  // 外层前缀的「一级目录」里就有内层前缀所在的那一段，外层那一趟会把它当成一个作废 build，
+  // 整个删掉内层站点的缓存。别的前缀写过规则就说明那里有站点在用，两个方向都中止。
+  const nested = current.others.filter(
+    (rule) => rule.scope.startsWith(current.prefix) || current.prefix.startsWith(rule.scope),
+  );
+  if (nested.length > 0) {
+    const shown = (scope: string) => (scope === "" ? "（空，即 bucket 根）" : scope);
+    const scopes = [...new Set(nested.map((rule) => rule.scope))];
+    throw new PlanError(
+      `bucket 上有本工具为缓存前缀 ${scopes.map(shown).join("、")} 写的规则，与本次的前缀 ${shown(current.prefix)} 互相嵌套：` +
+        `外层前缀的运行会把内层前缀所在的目录当成一个 build，判作废后连同另一个站点的缓存整个删掉，已中止。\n` +
+        `请给共用 bucket 的每个站点换成互不嵌套的前缀；若那些前缀已经弃用，用 npx wrangler r2 bucket lifecycle list ` +
+        `找出这些规则手动删除后重跑：${nested.map((rule) => rule.id).join("、")}。`,
+    );
+  }
+
+  // ID 带着整个缓存前缀，太长时 PUT 会被拒。按 bucket 里现有的每个目录都算一遍，不等判定出
+  // 哪些作废：今天保留的 build 迟早也会作废、要写规则，早点拦下，好说清是前缀还是目录名太长
+  const tooLong = existing.find((buildId) => ruleId(prefix, buildId).length > MAX_RULE_ID_LENGTH);
+  if (tooLong !== undefined) {
+    const id = ruleId(prefix, tooLong);
+    const prefixLength = normalizePrefix(prefix).length;
+    // 前缀为空时 ID 仍超长，只能是目录名本身太长，换前缀无济于事
+    const fix =
+      ruleId("", tooLong).length > MAX_RULE_ID_LENGTH
+        ? `目录名本身就太长，换前缀也没用：OpenNext 的 build id 不会这么长，请确认它是不是缓存目录，不是就把它移出 ${normalizePrefix(prefix) || "bucket 根"}。`
+        : `请换一个更短的 --prefix（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）；若目录名长得反常，先确认它是不是缓存目录。`;
+    throw new PlanError(
+      `目录 ${tooLong} 判作废时要写的规则 ID ${id} 长 ${id.length} 个字符（缓存前缀占 ${prefixLength}、目录名占 ${tooLong.length}），` +
+        `超过 lifecycle 规则 ID 的 ${MAX_RULE_ID_LENGTH} 字符上限，已中止。${fix}`,
+    );
+  }
+}
+
+export function makePlan(input: PlanInput): PrunePlan {
+  const { existing, current, prefix, expireDays } = input;
+  const existingSet = new Set(existing);
+  checkLayout(input);
 
   // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示；
   // 但「必须在 bucket 里」要看全部来源：--keep 了一个恰好也是历史版本的 id，填错时照样得报出来
@@ -155,7 +225,7 @@ export function makePlan(input: PlanInput): PrunePlan {
     }));
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
-  // 另一个 --prefix、另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
+  // 另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
   // current.own 中没进 reclaim 的条目，其 buildId 必然落在 expireIds 里，所以这里不会丢规则。
   const nextOwn: OwnRule[] = expireIds.map((buildId) => ({
     buildId,
@@ -180,16 +250,11 @@ export function makePlan(input: PlanInput): PrunePlan {
       state: duplicated.has(rule.buildId) ? "updated" : expireState(currentById.get(rule.buildId), rule),
     })),
     reclaim,
-    nextDoc: { own: nextOwn, foreign: current.foreign },
+    nextDoc: { prefix: current.prefix, own: nextOwn, foreign: current.foreign },
     changed:
       current.own.length !== nextOwn.length ||
       nextOwn.some((rule) => !sameRule(currentById.get(rule.buildId), rule)),
   };
-}
-
-/** 规则作用的前缀。结尾的斜杠不能省，否则某个 buildId 恰是另一个的前缀时会误删。 */
-export function rulePrefix(prefix: string, buildId: string): string {
-  return `${normalizePrefix(prefix)}${buildId}/`;
 }
 
 /** 逐字段比对，任何一项不同都意味着这条规则得重写 —— 只比条数会漏掉选项变更。 */
@@ -269,9 +334,22 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
 }
 
 /**
- * 启用中、没有 <Filter><Prefix> 的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是
- * 这样）。读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
+ * 启用中、没有 <Filter><Prefix> 的规则：它对整个 bucket 生效（被 R2 丢掉前缀后就是这样）。
+ * 读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
  */
-export function wholeBucketRules(doc: LifecycleDoc): string[] {
-  return doc.own.filter((rule) => rule.enabled && rule.prefix === "").map((rule) => rule.buildId);
+export function isWholeBucket(rule: Pick<OwnRule, "enabled" | "prefix">): boolean {
+  return rule.enabled && rule.prefix === "";
+}
+
+/**
+ * 本工具所有对整个 bucket 生效的规则的 ID（照 bucket 上的原样），别的前缀下的、格式不对的也算：
+ * 那些前缀可能已经弃用、再没有运行会报出它们，而它们删的是整个 bucket。只有当前前缀下的会被这一趟
+ * 改写，其余只能报出来让人手动删。
+ */
+export function wholeBucketRules(doc: ParsedLifecycle): string[] {
+  return [
+    ...doc.own.filter(isWholeBucket).map((rule) => rule.id ?? ruleId(doc.prefix, rule.buildId)),
+    ...doc.others.filter(isWholeBucket).map((rule) => rule.id),
+    ...doc.malformed.filter(isWholeBucket).map((rule) => rule.id),
+  ];
 }

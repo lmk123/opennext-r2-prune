@@ -17,6 +17,7 @@ import {
   XmlAssumptionError,
 } from "./index.ts";
 import { normalizePrefix } from "./prefix.ts";
+import { ruleId } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
 
@@ -44,6 +45,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --build-id-url <地址>         覆盖 BUILD_ID 的探测地址
   --endpoint <地址>             覆盖 S3 endpoint，默认按 account id 拼
   --prefix <前缀>               缓存前缀，默认 incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
+                               多个站点共用一个 bucket 时必须各用各的、互不嵌套的前缀，每趟只管自己前缀下的规则
   --expire-days <n>            规则的过期天数，默认 1
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
@@ -183,12 +185,12 @@ async function main(argv: string[]): Promise<number> {
     md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
     onRetry,
     // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
-    onWholeBucketRules: (buildIds) =>
+    onWholeBucketRules: (ruleIds) =>
       console.error(
-        `\n⚠️ 警告：bucket 上有 ${buildIds.length} 条本工具的规则没有 <Filter><Prefix> 前缀` +
-          `（缺失，或只有 R2 不认的裸 <Prefix>），会对整个 bucket 生效：` +
-          `${buildIds.map((id) => `opennext-r2-prune:${id}`).join(", ")}。\n` +
-          `R2 会按它删掉 bucket 里的全部对象。本次运行写入成功即会把它改写；若本次中止或只是 --dry-run，` +
+        `\n⚠️ 警告：bucket 上有 ${ruleIds.length} 条本工具的规则没有 <Filter><Prefix> 前缀` +
+          `（缺失，或只有 R2 不认的裸 <Prefix>），会对整个 bucket 生效：${ruleIds.join(", ")}。\n` +
+          `R2 会按它删掉 bucket 里的全部对象。本次运行写入成功只会改写当前前缀（${ruleId(prefix, "<buildId>")}）下的；` +
+          `别的前缀下的、或本次中止、只是 --dry-run 时，` +
           `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 核对并手动删除这些规则。`,
       ),
   });
@@ -362,7 +364,8 @@ function toJson(plan: PrunePlanSummary) {
     onlineBuildId: plan.onlineBuildId ?? (online.length === 1 ? online[0] : null),
     onlineBuildIds: online,
     cloudflare: plan.cloudflare,
-    // 运行前就已对整个 bucket 生效的自有规则（前缀为空），非空时需要人工确认它们已被改写
+    // 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的、ID 格式不对的。只有当前前缀下的
+    // 会在写入成功时被改写，别的前缀下的得手动删除
     wholeBucketRules: plan.wholeBucketRules,
     changed: plan.changed,
     // keep 仍是完整的保留集；其中不在 bucket 里的另见 absent

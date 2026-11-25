@@ -8,3 +8,8 @@ export function normalizePrefix(prefix: string): string {
   const trimmed = prefix.replace(/^\/+|\/+$/g, "");
   return trimmed ? `${trimmed}/` : "";
 }
+
+/** 规则作用的前缀。结尾的斜杠不能省，否则某个 buildId 恰是另一个的前缀时会误删。 */
+export function rulePrefix(prefix: string, buildId: string): string {
+  return `${normalizePrefix(prefix)}${buildId}/`;
+}

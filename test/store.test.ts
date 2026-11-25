@@ -99,7 +99,7 @@ describe("lifecycle", () => {
       ok("<Error><Code>NoSuchLifecycleConfiguration</Code></Error>", { status: 404 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    expect(await store.getLifecycle()).toEqual({ own: [], foreign: [] });
+    expect(await store.getLifecycle("incremental-cache")).toEqual({ prefix: "incremental-cache/", own: [], foreign: [], others: [], malformed: [] });
   });
 
   it("其它错误照常抛出", async () => {
@@ -107,7 +107,7 @@ describe("lifecycle", () => {
       ok("<Error><Code>AccessDenied</Code><Message>没有权限</Message></Error>", { status: 403 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    await expect(store.getLifecycle()).rejects.toThrow(S3Error);
+    await expect(store.getLifecycle("incremental-cache")).rejects.toThrow(S3Error);
   });
 
   it("读 lifecycle 被拒时说明是哪一步、缺什么权限", async () => {
@@ -115,7 +115,7 @@ describe("lifecycle", () => {
       ok("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>", { status: 403 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    const error = await store.getLifecycle().catch((e: unknown) => e);
+    const error = await store.getLifecycle("incremental-cache").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(S3Error);
     expect(error).toMatchObject({ operation: "getLifecycle", status: 403, code: "AccessDenied" });
     expect((error as S3Error).message).toContain("读取 lifecycle 规则失败（HTTP 403，AccessDenied：Access Denied）");
@@ -125,7 +125,7 @@ describe("lifecycle", () => {
   it("写 lifecycle 被拒时提示需要 Admin Read & Write", async () => {
     const { fetchImpl } = stub([ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 })]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
     expect(error.message).toContain("写入 lifecycle 规则失败（HTTP 403，AccessDenied）");
     expect(error.message).toContain("Admin Read & Write");
   });
@@ -145,7 +145,7 @@ describe("lifecycle", () => {
       () => new Response(null, { status: 204 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    await store.putLifecycle({ own: [], foreign: [] });
+    await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] });
     expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
     expect(new URL(calls[1]!.url).searchParams.has("lifecycle")).toBe(true);
   });
@@ -156,7 +156,7 @@ describe("lifecycle", () => {
       ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
     expect(error).toMatchObject({ operation: "deleteLifecycle", status: 403, code: "AccessDenied" });
     expect(error.message).toContain("清空 lifecycle 规则失败（HTTP 403，AccessDenied）");
     expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
@@ -166,7 +166,7 @@ describe("lifecycle", () => {
   it("配置不为空时 PUT 被拒就直接报错，不会退回 DELETE", async () => {
     const { calls, fetchImpl } = stub([ok("<Error><Code>MalformedXML</Code></Error>", { status: 400 })]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    await expect(store.putLifecycle({ own: [], foreign: ["<ID>mine</ID>"] })).rejects.toThrow(S3Error);
+    await expect(store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: ["<ID>mine</ID>"] })).rejects.toThrow(S3Error);
     expect(calls.map((c) => c.method)).toEqual(["PUT"]);
   });
 
@@ -179,6 +179,7 @@ describe("lifecycle", () => {
     });
 
     await store.putLifecycle({
+      prefix: "incremental-cache/",
       own: [
         {
           buildId: "b1",
@@ -197,7 +198,7 @@ describe("lifecycle", () => {
     expect(request.headers.get("content-md5")).toBe(
       createHash("md5").update(body, "utf8").digest("base64"),
     );
-    expect(body).toContain("<ID>opennext-r2-prune:b1</ID>");
+    expect(body).toContain("<ID>opennext-r2-prune:incremental-cache/b1/</ID>");
   });
 });
 
@@ -254,7 +255,7 @@ describe("重试", () => {
     }) as unknown as typeof fetch;
 
     const store = new R2Store({ ...CREDS, fetchImpl });
-    const error = (await store.putLifecycle({ own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
+    const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
     expect(error).toMatchObject({ operation: "deleteLifecycle", status: 0, code: "network" });
     expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
     expect(error.message).toContain("请确认网络与 endpoint 可达");

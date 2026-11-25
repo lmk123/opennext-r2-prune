@@ -1,6 +1,8 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
 import {
+  checkLayout,
+  isWholeBucket,
   type KeptBuild,
   makePlan,
   PlanError,
@@ -11,7 +13,7 @@ import {
 } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
-import { type LifecycleDoc, XmlAssumptionError } from "./xml.ts";
+import { type LifecycleDoc, type ParsedLifecycle, XmlAssumptionError } from "./xml.ts";
 
 /**
  * 把「探测 → 列举 → 判定」串起来。与 cli.ts 分开是为了这一层不依赖任何 Node API：
@@ -40,10 +42,11 @@ export interface RunOptions {
   /** 并发探测预览时的并发数 */
   concurrency?: number;
   /**
-   * 读到现有配置里有对整个 bucket 生效的自有规则时立即回调（在探测之前）。探测或校验失败
-   * 时整趟会中止，调用方拿不到 RunState，靠这个回调才能在中止前把危险规则报出来。
+   * 读到现有配置里有对整个 bucket 生效的本工具规则（含别的前缀下的、ID 格式不对的）时立即回调（在探测之前），
+   * 参数是这些规则的 ID。探测或校验失败时整趟会中止，调用方拿不到 RunState，靠这个回调才能在
+   * 中止前把危险规则报出来。
    */
-  onWholeBucketRules?: (buildIds: string[]) => void;
+  onWholeBucketRules?: (ruleIds: string[]) => void;
 }
 
 export interface CloudflareSource {
@@ -65,10 +68,10 @@ export interface RunState {
    * （含线上当前的；少于 --recent-builds 说明全部 deployment 已经翻完了）、有几个预览
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
-  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的自有规则的 buildId */
+  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的本工具规则的 ID，含别的前缀下的、ID 格式不对的 */
   wholeBucketRules: string[];
   /** 写入前读到的 lifecycle 配置。写入报错时要拿它判断请求到底生效没有 */
-  lifecycle: LifecycleDoc;
+  lifecycle: ParsedLifecycle;
   plan: PrunePlan;
 }
 
@@ -78,7 +81,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   // 用 allSettled 等两边都落地：列目录失败时整趟也要中止，但读到的危险规则必须先报出来
   const [listed, read] = await Promise.allSettled([
     opts.store.listBuildIds(opts.prefix),
-    opts.store.getLifecycle(),
+    opts.store.getLifecycle(opts.prefix),
   ]);
   const dangerous = read.status === "fulfilled" ? wholeBucketRules(read.value) : [];
   if (dangerous.length > 0) opts.onWholeBucketRules?.(dangerous);
@@ -86,6 +89,8 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   if (read.status === "rejected") throw read.reason;
   const existing = listed.value;
   const current = read.value;
+  // 只依赖配置的校验在探测之前做：探测失败会把它们挡在后面，修好探测重跑才发现配置本来就不能用
+  checkLayout({ existing, current, prefix: opts.prefix, allowRootPrefix: opts.allowRootPrefix });
 
   const fetchImpl = opts.fetchImpl ?? fetch;
   const probe: Probe = (url, signal) => probeBuildId(url, fetchImpl, opts.onRetry, signal);
@@ -334,7 +339,7 @@ export interface WriteResult {
    */
   writeError?: unknown;
   /**
-   * 是否撤掉了本工具的全部规则。撤规则只会让删除推迟，绝不会删到数据，所以核对不过（或无从核对）
+   * 是否撤掉了本工具在该前缀下的全部规则。撤规则只会让删除推迟，绝不会删到数据，所以核对不过（或无从核对）
    * 就先撤，等查明原因再重跑。null = 无需撤销；true = 已撤销并回读确认；false = 撤销失败或无法确认。
    */
   rolledBack: boolean | null;
@@ -374,7 +379,7 @@ async function readBack(store: R2Store, expected: LifecycleDoc, opts: VerifyOpti
     if (attempt > 0) await sleep(opts.readBackDelayMs ?? 2000);
     let actual: LifecycleDoc;
     try {
-      actual = await store.getLifecycle();
+      actual = await store.getLifecycle(expected.prefix);
     } catch (error) {
       return { error };
     }
@@ -405,8 +410,8 @@ export class WriteNotAppliedError extends Error {
  * 计划、写入报错时的「没生效」判断、撤销都会以过期的现状为准。两次都是原样读回、同样解析，所以
  * 外部规则逐字比对，不像写后核对那样只比条数。
  */
-export async function assertLifecycleUnchanged(store: R2Store, before: LifecycleDoc): Promise<void> {
-  const now = await store.getLifecycle();
+export async function assertLifecycleUnchanged(store: R2Store, before: ParsedLifecycle): Promise<void> {
+  const now = await store.getLifecycle(before.prefix);
   if (JSON.stringify(now) === JSON.stringify(before)) return;
   throw new PlanError(
     `写入前重读 lifecycle 配置，发现它在算出计划之后被改过（本工具规则 ${before.own.length} → ${now.own.length} 条，` +
@@ -466,7 +471,8 @@ export async function writeAndVerify(
       if (rejected) throw new WriteNotAppliedError(writeError);
     } else if (verifyWritten(before, check.actual).own.length === 0) {
       unchanged = true;
-      if (wholeBucketRules(check.actual).length === 0) throw new WriteNotAppliedError(writeError);
+      // 只看本前缀的：撤销只能撤掉本前缀的规则，别的前缀的危险规则撤销了也还在
+      if (!check.actual.own.some(isWholeBucket)) throw new WriteNotAppliedError(writeError);
     }
   }
 
@@ -479,7 +485,7 @@ export async function writeAndVerify(
 
   // 外部规则用写入前读到、本次原样搬运的那份，而不是回读到的：被服务端改掉 ID 的自有规则会被
   // 认成外部规则，照着回读结果写回去就等于把它留下了；回读残缺时还会把用户的规则一并弄丢。
-  const rollbackDoc: LifecycleDoc = { own: [], foreign: doc.foreign };
+  const rollbackDoc: LifecycleDoc = { prefix: doc.prefix, own: [], foreign: doc.foreign };
   try {
     await store.putLifecycle(rollbackDoc);
   } catch (rollbackError) {
