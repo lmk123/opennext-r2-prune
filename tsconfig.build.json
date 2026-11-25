@@ -1,0 +1,13 @@
+{
+  // 只编译 src 并产出 dist；类型检查仍由根 tsconfig 的 `pnpm typecheck` 负责
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    // 产出时不能开它，带 .ts 后缀的 import 由 rewriteRelativeImportExtensions 改写成 .js
+    "allowImportingTsExtensions": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true
+  },
+  "include": ["src"]
+}
