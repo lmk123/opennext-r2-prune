@@ -1,5 +1,5 @@
 import { normalizePrefix, rulePrefix } from "./prefix.ts";
-import type { LifecycleDoc, OwnRule } from "./xml.ts";
+import { type LifecycleDoc, MAX_RULE_ID_LENGTH, type OwnRule, type ParsedLifecycle, ruleId } from "./xml.ts";
 
 /**
  * 判定哪些 build 该留、哪些该交给 R2 删，以及最终要写回的规则集。
@@ -66,7 +66,7 @@ export interface PlanInput {
   existing: string[];
   /** 要保留的 build 及其原因 */
   keep: KeptBuild[];
-  current: LifecycleDoc;
+  current: ParsedLifecycle;
   prefix: string;
   /** 规则的过期天数 */
   expireDays: number;
@@ -95,6 +95,21 @@ export function makePlan(input: PlanInput): PrunePlan {
   if (normalizePrefix(prefix) !== current.prefix) {
     throw new PlanError(
       `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止。`,
+    );
+  }
+
+  // 外层前缀的「一级目录」里就有内层前缀所在的那一段，外层那一趟会把它当成一个作废 build，
+  // 整个删掉内层站点的缓存。别的前缀写过规则就说明那里有站点在用，两个方向都中止。
+  const nested = [...new Set(current.others.map((rule) => rule.scope))].filter(
+    (scope) => scope.startsWith(current.prefix) || current.prefix.startsWith(scope),
+  );
+  if (nested.length > 0) {
+    const shown = (scope: string) => (scope === "" ? "（空，即 bucket 根）" : scope);
+    throw new PlanError(
+      `bucket 上有本工具为缓存前缀 ${nested.map(shown).join("、")} 写的规则，与本次的前缀 ${shown(current.prefix)} 互相嵌套：` +
+        `外层前缀的运行会把内层前缀所在的目录当成一个 build，判作废后连同另一个站点的缓存整个删掉，已中止。\n` +
+        `请给共用 bucket 的每个站点换成互不嵌套的前缀；若那些前缀已经弃用，用 npx wrangler r2 bucket lifecycle list ` +
+        `找出 ID 形如 ${nested.map((scope) => ruleId(scope, "<buildId>")).join("、")} 的规则手动删除后重跑。`,
     );
   }
 
@@ -170,6 +185,15 @@ export function makePlan(input: PlanInput): PrunePlan {
     expireDays,
     enabled: true,
   }));
+
+  // ID 带着整个缓存前缀，前缀太长时 PUT 会被拒；在这里拦下，好说清是哪个前缀太长
+  const tooLong = nextOwn.map((rule) => ruleId(prefix, rule.buildId)).find((id) => id.length > MAX_RULE_ID_LENGTH);
+  if (tooLong !== undefined) {
+    throw new PlanError(
+      `规则 ID ${tooLong} 长 ${tooLong.length} 个字符，超过 lifecycle 规则 ID 的 ${MAX_RULE_ID_LENGTH} 字符上限。` +
+        `ID 里带着整个缓存前缀，请换一个更短的 --prefix（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）。`,
+    );
+  }
 
   const total = current.foreign.length + nextOwn.length;
   if (total > MAX_RULES) {
@@ -271,10 +295,20 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
 }
 
 /**
- * 只看当前前缀下的规则：别的前缀的规则在这里是外部规则，由那个前缀的运行报出、改写。
- * 启用中、没有 <Filter><Prefix> 的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是
- * 这样）。读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
+ * 启用中、没有 <Filter><Prefix> 的规则：它对整个 bucket 生效（被 R2 丢掉前缀后就是这样）。
+ * 读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
  */
-export function wholeBucketRules(doc: LifecycleDoc): string[] {
-  return doc.own.filter((rule) => rule.enabled && rule.prefix === "").map((rule) => rule.buildId);
+export function isWholeBucket(rule: OwnRule): boolean {
+  return rule.enabled && rule.prefix === "";
+}
+
+/**
+ * 本工具所有对整个 bucket 生效的规则的 ID，别的前缀下的也算：那些前缀可能已经弃用、再没有运行会
+ * 报出它们，而它们删的是整个 bucket。只有当前前缀下的会被这一趟改写，其余只能报出来让人手动删。
+ */
+export function wholeBucketRules(doc: ParsedLifecycle): string[] {
+  return [
+    ...doc.own.filter(isWholeBucket).map((rule) => ruleId(doc.prefix, rule.buildId)),
+    ...doc.others.filter(isWholeBucket).map((rule) => ruleId(rule.scope, rule.buildId)),
+  ];
 }

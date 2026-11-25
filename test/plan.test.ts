@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { makePlan, MAX_RULES, PlanError, type PlanInput, verifyWritten, wholeBucketRules } from "../src/plan.ts";
 import { rulePrefix } from "../src/prefix.ts";
-import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
+import type { OwnRule, ParsedLifecycle } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
     existing: ["online1", "old1", "old2"],
     keep: [{ buildId: "online1", reason: "online" }],
-    current: { prefix: "incremental-cache/", own: [], foreign: [] },
+    current: { prefix: "incremental-cache/", own: [], foreign: [], others: [] },
     prefix: "incremental-cache",
     expireDays: 1,
     ...overrides,
@@ -86,15 +86,16 @@ describe("安全校验", () => {
 
   it("外部规则也计入上限", () => {
     const foreign = Array.from({ length: MAX_RULES - 1 }, () => "<ID>x</ID>");
-    expect(() => makePlan(input({ current: { prefix: "incremental-cache/", own: [], foreign } }))).toThrow(/上限/);
+    expect(() => makePlan(input({ current: { prefix: "incremental-cache/", own: [], foreign, others: [] } }))).toThrow(/上限/);
   });
 });
 
 describe("规则合并与回收", () => {
-  const withRules = (own: LifecycleDoc["own"], foreign: string[] = []): LifecycleDoc => ({
+  const withRules = (own: OwnRule[], foreign: string[] = []): ParsedLifecycle => ({
     prefix: "incremental-cache/",
     own,
     foreign,
+    others: [],
   });
 
   it("已经空掉的目录，其规则被回收", () => {
@@ -221,7 +222,7 @@ describe("规则合并与回收", () => {
     // 多一个前导斜杠，规则就作用在一个不存在的 key 空间上，一个对象都删不掉
     expect(rulePrefix("", "abc")).toBe("abc/");
     expect(rulePrefix("/", "abc")).toBe("abc/");
-    const plan = makePlan(input({ prefix: "", allowRootPrefix: true, current: { prefix: "", own: [], foreign: [] } }));
+    const plan = makePlan(input({ prefix: "", allowRootPrefix: true, current: { prefix: "", own: [], foreign: [], others: [] } }));
     expect(plan.nextDoc.own.map((r) => r.prefix)).toEqual(["old1/", "old2/"]);
   });
 
@@ -274,7 +275,7 @@ describe("多来源保留集", () => {
           { buildId: "online1", reason: "online" },
           { buildId: "gone", reason: "preview" },
         ],
-        current: { prefix: "incremental-cache/", own: [ownRule("gone")], foreign: [] },
+        current: { prefix: "incremental-cache/", own: [ownRule("gone")], foreign: [], others: [] },
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
@@ -349,21 +350,82 @@ describe("verifyWritten", () => {
 describe("verifyWritten 报出裸 Prefix", () => {
   it("读回来只有裸 <Prefix> 时如实写出原值，并仍按整个 bucket 对待", () => {
     const doc = { prefix: "incremental-cache/", own: [ownRule("old1")], foreign: [] };
-    const actual = { prefix: "incremental-cache/", own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })], foreign: [] };
+    const actual = {
+      prefix: "incremental-cache/",
+      own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })],
+      foreign: [],
+      others: [],
+    };
     expect(verifyWritten(doc, actual).own).toEqual([
       "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
     ]);
-    expect(wholeBucketRules(actual)).toEqual(["old1"]);
+    expect(wholeBucketRules(actual)).toEqual(["opennext-r2-prune:incremental-cache/old1/"]);
   });
 });
 
 describe("wholeBucketRules", () => {
-  it("只挑出启用中、前缀为空的自有规则", () => {
+  it("只挑出启用中、前缀为空的规则，按 ID 列出", () => {
     const doc = {
       prefix: "incremental-cache/",
       own: [ownRule("ok"), ownRule("bad", { prefix: "" }), ownRule("off", { prefix: "", enabled: false })],
       foreign: [],
+      others: [],
     };
-    expect(wholeBucketRules(doc)).toEqual(["bad"]);
+    expect(wholeBucketRules(doc)).toEqual(["opennext-r2-prune:incremental-cache/bad/"]);
+  });
+
+  it("别的前缀下的也报出来：那个前缀可能已经弃用，再没有运行会报它", () => {
+    const doc = {
+      prefix: "incremental-cache/",
+      own: [],
+      foreign: [],
+      others: [
+        { ...ownRule("b1", { prefix: "" }), scope: "old-cache/" },
+        { ...ownRule("b2", { prefix: "old-cache/b2/" }), scope: "old-cache/" },
+      ],
+    };
+    expect(wholeBucketRules(doc)).toEqual(["opennext-r2-prune:old-cache/b1/"]);
+  });
+});
+
+describe("多个前缀共用 bucket", () => {
+  const other = (scope: string) => ({ ...ownRule("x", { prefix: `${scope}x/` }), scope });
+  const withOthers = (prefix: string, ...scopes: string[]): ParsedLifecycle => ({
+    prefix,
+    own: [],
+    foreign: scopes.map(() => "<ID>placeholder</ID>"),
+    others: scopes.map(other),
+  });
+
+  it("别的前缀与本前缀互不嵌套时照常计算", () => {
+    const plan = makePlan(input({ current: withOthers("incremental-cache/", "site-b/", "incremental-cache-2/") }));
+    expect(plan.expire.map((e) => e.buildId)).toEqual(["old1", "old2"]);
+  });
+
+  it("别的前缀在本前缀之下时中止：本前缀的一级目录里就有那个站点", () => {
+    expect(() => makePlan(input({ current: withOthers("incremental-cache/", "incremental-cache/nested/") }))).toThrow(
+      /互相嵌套/,
+    );
+  });
+
+  it("本前缀在别的前缀之下时同样中止", () => {
+    expect(() =>
+      makePlan(input({ prefix: "site-a/nested", current: withOthers("site-a/nested/", "site-a/") })),
+    ).toThrow(/互相嵌套/);
+  });
+
+  it("前缀为空、而 bucket 上有别的前缀的规则时中止", () => {
+    expect(() =>
+      makePlan(input({ prefix: "", allowRootPrefix: true, current: withOthers("", "site-a/") })),
+    ).toThrow(/互相嵌套/);
+  });
+
+  it("规则 ID 超出长度上限时中止，说明是前缀太长", () => {
+    const prefix = `${"p".repeat(240)}/`;
+    expect(() => makePlan(input({ prefix, current: withOthers(prefix) }))).toThrow(/更短的 --prefix/);
+  });
+
+  it("计划用的前缀与配置分拣时的前缀不一致时中止", () => {
+    expect(() => makePlan(input({ current: withOthers("site-b/") }))).toThrow(/内部错误/);
   });
 });

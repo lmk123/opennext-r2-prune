@@ -3,6 +3,7 @@ import { normalizePrefix } from "./prefix.ts";
 import { type OnRetry, withRetry } from "./retry.ts";
 import {
   type LifecycleDoc,
+  type ParsedLifecycle,
   parseErrorMessage,
   parseLifecycle,
   parseListObjects,
@@ -166,14 +167,14 @@ export class R2Store {
   }
 
   /** 读出 lifecycle 配置，并从缓存前缀 prefix 的视角分拣出本工具的规则 */
-  async getLifecycle(prefix: string): Promise<LifecycleDoc> {
+  async getLifecycle(prefix: string): Promise<ParsedLifecycle> {
     try {
       const response = await this.#request("getLifecycle", `${this.#base}?lifecycle`);
       return parseLifecycle(await response.text(), prefix);
     } catch (error) {
       // 从未配过规则的 bucket 会返回 404 NoSuchLifecycleConfiguration，那是空配置不是错误
       if (error instanceof S3Error && (error.status === 404 || error.code === "NoSuchLifecycleConfiguration")) {
-        return { prefix: normalizePrefix(prefix), own: [], foreign: [] };
+        return { prefix: normalizePrefix(prefix), own: [], foreign: [], others: [] };
       }
       throw error;
     }

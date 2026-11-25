@@ -65,10 +65,10 @@ export interface PruneOptions {
   /** 网络请求重试时的回调 */
   onRetry?: OnRetry;
   /**
-   * 读到 bucket 上有对整个 bucket 生效的自有规则时立即回调（在探测之前）。探测或校验失败时
-   * 整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
+   * 读到 bucket 上有对整个 bucket 生效的本工具规则时立即回调（在探测之前），参数是这些规则的 ID，
+   * 含别的前缀下的。探测或校验失败时整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
    */
-  onWholeBucketRules?: (buildIds: string[]) => void;
+  onWholeBucketRules?: (ruleIds: string[]) => void;
 }
 
 /** 计划：写入前就能确定的全部信息 */
@@ -88,7 +88,10 @@ export interface PrunePlanSummary {
    * 更早的 build 会被判作废，需要保留的请放进 keep
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
-  /** 运行前就已对整个 bucket 生效的自有规则（前缀为空）。写入成功会把它们改写 */
+  /**
+   * 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的。只有本次前缀下的
+   * 会被写入改写，别的前缀下的得手动删除
+   */
   wholeBucketRules: string[];
   /** 与现状一致时为 false，此时无需写入 */
   changed: boolean;

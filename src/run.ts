@@ -1,6 +1,7 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
 import {
+  isWholeBucket,
   type KeptBuild,
   makePlan,
   PlanError,
@@ -11,7 +12,7 @@ import {
 } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
-import { type LifecycleDoc, XmlAssumptionError } from "./xml.ts";
+import { type LifecycleDoc, type ParsedLifecycle, XmlAssumptionError } from "./xml.ts";
 
 /**
  * 把「探测 → 列举 → 判定」串起来。与 cli.ts 分开是为了这一层不依赖任何 Node API：
@@ -40,10 +41,11 @@ export interface RunOptions {
   /** 并发探测预览时的并发数 */
   concurrency?: number;
   /**
-   * 读到现有配置里有对整个 bucket 生效的自有规则时立即回调（在探测之前）。探测或校验失败
-   * 时整趟会中止，调用方拿不到 RunState，靠这个回调才能在中止前把危险规则报出来。
+   * 读到现有配置里有对整个 bucket 生效的本工具规则（含别的前缀下的）时立即回调（在探测之前），
+   * 参数是这些规则的 ID。探测或校验失败时整趟会中止，调用方拿不到 RunState，靠这个回调才能在
+   * 中止前把危险规则报出来。
    */
-  onWholeBucketRules?: (buildIds: string[]) => void;
+  onWholeBucketRules?: (ruleIds: string[]) => void;
 }
 
 export interface CloudflareSource {
@@ -65,10 +67,10 @@ export interface RunState {
    * （含线上当前的；少于 --recent-builds 说明全部 deployment 已经翻完了）、有几个预览
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
-  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的自有规则的 buildId */
+  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的本工具规则的 ID，含别的前缀下的 */
   wholeBucketRules: string[];
   /** 写入前读到的 lifecycle 配置。写入报错时要拿它判断请求到底生效没有 */
-  lifecycle: LifecycleDoc;
+  lifecycle: ParsedLifecycle;
   plan: PrunePlan;
 }
 
@@ -405,7 +407,7 @@ export class WriteNotAppliedError extends Error {
  * 计划、写入报错时的「没生效」判断、撤销都会以过期的现状为准。两次都是原样读回、同样解析，所以
  * 外部规则逐字比对，不像写后核对那样只比条数。
  */
-export async function assertLifecycleUnchanged(store: R2Store, before: LifecycleDoc): Promise<void> {
+export async function assertLifecycleUnchanged(store: R2Store, before: ParsedLifecycle): Promise<void> {
   const now = await store.getLifecycle(before.prefix);
   if (JSON.stringify(now) === JSON.stringify(before)) return;
   throw new PlanError(
@@ -466,7 +468,8 @@ export async function writeAndVerify(
       if (rejected) throw new WriteNotAppliedError(writeError);
     } else if (verifyWritten(before, check.actual).own.length === 0) {
       unchanged = true;
-      if (wholeBucketRules(check.actual).length === 0) throw new WriteNotAppliedError(writeError);
+      // 只看本前缀的：撤销只能撤掉本前缀的规则，别的前缀的危险规则撤销了也还在
+      if (!check.actual.own.some(isWholeBucket)) throw new WriteNotAppliedError(writeError);
     }
   }
 

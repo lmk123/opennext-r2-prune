@@ -157,6 +157,11 @@ describe("parseLifecycle 按缓存前缀认领规则", () => {
     expect(parseLifecycle(doc, "site-a/nested/").own.map((r) => r.buildId)).toEqual(["b2"]);
     expect(parseLifecycle(doc, "").own.map((r) => r.buildId)).toEqual(["b3"]);
     expect(parseLifecycle(doc, "site-a").foreign).toHaveLength(2);
+    // 别的前缀的规则另外解析出来、标明所属前缀，供嵌套与整 bucket 检查用
+    expect(parseLifecycle(doc, "site-a").others.map((r) => [r.scope, r.buildId])).toEqual([
+      ["site-a/nested/", "b2"],
+      ["", "b3"],
+    ]);
   });
 
   it("前缀取自 ID：R2 丢掉 Filter 前缀的规则仍认得出是谁的", () => {

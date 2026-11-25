@@ -224,8 +224,10 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 
 - **前缀必须各不相同**。两个站点共用同一个前缀时，每趟的保留集只有本站点的 build，另一个站点的线上
   build 会被判作废、挂上删除规则 —— 工具识别不出这种配置。
-- **任何一个站点都不能用空前缀**：前缀为空时 bucket 根下的每个一级目录都被当成 build，别的站点的整个前缀
-  目录会被挂上删除规则。
+- **前缀不能互相嵌套，任何一个站点都不能用空前缀**。外层前缀（比如 `site-a`）的一级目录里就有内层前缀
+  （`site-a/nested`）那一段，外层那一趟会把它当成一个作废 build，连同另一个站点的缓存整个删掉；空前缀
+  是所有前缀的外层。只要 bucket 上已有本工具为嵌套前缀写的规则，两边的运行都会中止；但内层站点还一条
+  规则都没写过时，外层那一趟识别不出来。
 - **依次运行，不要并发**。几趟运行写的是同一份 lifecycle 配置，写入前的重读只能拦住大部分冲突，挡不住
   两趟几乎同时写入。
 
@@ -273,7 +275,9 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - **已在生效的整 bucket 规则会被醒目报出**。读到本工具的规则没有 `<Filter><Prefix>`（比如旧版
   `--lifecycle-style bare` 写下的；读回来若带着裸 `<Prefix>`，R2 也不认，同样按整个 bucket 对待，报错里
   会写出它的原值）时，在探测之前就向 stderr 打出警告，所以即便本次因列目录或探测失败中止、或只是 `--dry-run`，你也
-  能看到它；`--json` 里的 `wholeBucketRules` 列出这些规则。写入成功时它们会被改写成正确的前缀。
+  能看到它；`--json` 里的 `wholeBucketRules` 列出这些规则的 ID。别的前缀下的也会报出（那个前缀可能已经
+  弃用，再没有运行会报它），但只有当前前缀下的会在写入成功时被改写成正确的前缀，别的得手动删除。
+- 规则 ID 带着整个缓存前缀，超过 255 个字符（S3 规范的上限）时在写入前中止，请换一个更短的前缀。
 - 一条规则都不剩时要清空配置。S3 规范不允许不含 `<Rule>` 的配置，R2 文档也没把
   DeleteBucketLifecycle 列为已支持，所以先 PUT 空配置，被当作格式错误（400）拒掉再退回
   `DELETE ?lifecycle`（DELETE 也失败时，报错里会一并写明 PUT 被拒的原因），生效与否由回读核对确认。**这两条路径在 R2 上的实际表现尚未实测。**
@@ -283,7 +287,9 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - **删除不是即时的**，R2 通常在 24 小时内完成。跑完当场去看 bucket 还是满的，属正常。
 - lifecycle 规则上限 1000 条，所有前缀共用。工具每次运行会自动回收自己前缀下已经删完的规则，正常使用不会触顶。
 - **改了 `--prefix` 之后，旧前缀下的规则就不再归这一趟管**，会一直留在 bucket 上占名额。旧目录删完后，
-  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 以 `opennext-r2-prune:<旧前缀>/` 开头的规则手动删除。
+  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/` 的规则手动删除。
+  新旧前缀互相嵌套（比如改成空前缀，或从 `incremental-cache` 改成 `incremental-cache/v2`）时，删掉这些规则之前
+  运行会一直中止。
 - Next.js 16.2+ 的 build ID 是确定性的，**回滚到一个已被判定作废的 build 后，应立即手动
   跑一次本工具** —— 它会摘掉那条仍在生效的规则。摘除前 R2 可能已删掉部分缓存，那些页面会
   在下次访问时回源重新渲染。

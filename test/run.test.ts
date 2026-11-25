@@ -202,16 +202,72 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     expect(again.plan.changed).toBe(false);
   });
 
-  it("前缀为空的站点不认领其它前缀下的规则", async () => {
+  it("前缀为空、而别的前缀写过规则时中止：根下的 site-a/ 会被当成作废 build，不发任何写请求", async () => {
     const lifecycle = `<LifecycleConfiguration><Rule>
       <ID>opennext-r2-prune:site-a/old1/</ID><Status>Enabled</Status>
       <Filter><Prefix>site-a/old1/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    const { store } = sharedBucket({ "": ["live", "old9"] }, lifecycle);
-    const state = await collectPlan({ store, prefix: "", allowRootPrefix: true, keep: ["live"] });
-    expect(state.lifecycle.own).toEqual([]);
-    expect(state.plan.reclaim).toEqual([]);
+    const { store, calls } = sharedBucket({ "": ["live", "old9", "site-a"] }, lifecycle);
+    await expect(collectPlan({ store, prefix: "", allowRootPrefix: true, keep: ["live"] })).rejects.toThrow(
+      /互相嵌套/,
+    );
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
+
+  it("内层前缀写过规则后，外层前缀的运行中止，不发任何写请求", async () => {
+    const bucket = sharedBucket({ "site-a/": ["live", "old1", "nested"], "site-a/nested/": ["live", "old2"] });
+    await run(bucket.store, "site-a/nested");
+    const before = bucket.calls.length;
+    await expect(collectPlan({ store: bucket.store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/互相嵌套/);
+    expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
+  });
+
+  it("外层前缀先写下规则时，内层前缀的运行同样中止，不发任何写请求", async () => {
+    const bucket = sharedBucket({ "site-a/": ["live", "old1", "nested"], "site-a/nested/": ["live", "old2"] });
+    await run(bucket.store, "site-a");
+    // 外层已把 nested 判作废，这正是要报出来的配置错误
+    expect(bucket.stored()).toContain("<ID>opennext-r2-prune:site-a/nested/</ID>");
+    const before = bucket.calls.length;
+    await expect(collectPlan({ store: bucket.store, prefix: "site-a/nested", keep: ["live"] })).rejects.toThrow(
+      /互相嵌套/,
+    );
+    expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
+  });
+
+  it("别的前缀下对整个 bucket 生效的规则也在探测前报出", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:old-cache/b1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store } = sharedBucket({ "site-a/": ["live", "old1"] }, lifecycle);
+    const seen: string[][] = [];
+    const state = await collectPlan({
+      store,
+      prefix: "site-a",
+      keep: ["live"],
+      onWholeBucketRules: (ids) => void seen.push(ids),
+    });
+    expect(seen).toEqual([["opennext-r2-prune:old-cache/b1/"]]);
+    expect(state.wholeBucketRules).toEqual(["opennext-r2-prune:old-cache/b1/"]);
+    // 不归这一趟改写，原样搬运
     expect(state.plan.nextDoc.foreign).toHaveLength(1);
+  });
+
+  it("规则 ID 超出长度上限时中止，不发任何写请求", async () => {
+    const prefix = `${"p".repeat(240)}/`;
+    const { store, calls } = sharedBucket({ [prefix]: ["live", "old1"] });
+    await expect(collectPlan({ store, prefix, keep: ["live"] })).rejects.toThrow(/更短的 --prefix/);
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
+
+  it("读到的配置与计划的前缀对不上时中止，不发任何写请求", async () => {
+    let puts = 0;
+    const store = {
+      listBuildIds: async () => ["live", "old1"],
+      getLifecycle: async () => ({ prefix: "site-b/", own: [], foreign: [], others: [] }),
+      putLifecycle: async () => void puts++,
+    } as unknown as R2Store;
+    await expect(collectPlan({ store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/内部错误/);
+    expect(puts).toBe(0);
   });
 
   it("本工具标记的规则 ID 格式不对时中止，不发任何写请求", async () => {
@@ -743,6 +799,14 @@ const dropOwnPrefix = (xml: string) =>
   xml.replace(/<Filter><Prefix>incremental-cache\/[^<]*<\/Prefix><\/Filter>/g, "");
 
 describe("writeAndVerify", () => {
+  it("规则 ID 与实际作用的前缀对不上时拒绝写入，不发任何写请求", async () => {
+    const { puts, store } = statefulR2();
+    await expect(writeAndVerify(store, { ...DOC, prefix: "site-b/" }, BEFORE, NO_WAIT)).rejects.toThrow(
+      WriteNotAppliedError,
+    );
+    expect(puts).toHaveLength(0);
+  });
+
   it("回读一致时只写一次", async () => {
     const { puts, store } = statefulR2();
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
@@ -933,7 +997,7 @@ describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
         onWholeBucketRules: (ids) => void seen.push(ids),
       }),
     ).rejects.toThrow(PlanError);
-    expect(seen).toEqual([["old1"]]);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/old1/"]]);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
@@ -952,6 +1016,6 @@ describe("collectPlan 报出对整个 bucket 生效的现有规则", () => {
         onWholeBucketRules: (ids) => void seen.push(ids),
       }),
     ).rejects.toThrow(S3Error);
-    expect(seen).toEqual([["old1"]]);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/old1/"]]);
   });
 });

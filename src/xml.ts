@@ -102,7 +102,24 @@ export interface LifecycleDoc {
   foreign: string[];
 }
 
+/** 本工具为别的缓存前缀写的规则。scope 是它所属的缓存前缀（已归一化） */
+export interface OtherScopeRule extends OwnRule {
+  scope: string;
+}
+
+/** 从 bucket 读出的配置 */
+export interface ParsedLifecycle extends LifecycleDoc {
+  /**
+   * 本工具为别的缓存前缀写的规则，原始片段已在 foreign 里照常搬运；这里另行解析出来，
+   * 只供安全检查用（前缀互相嵌套、对整个 bucket 生效），这一趟从不改写它们
+   */
+  others: OtherScopeRule[];
+}
+
 export const RULE_ID_PREFIX = "opennext-r2-prune:";
+
+/** S3 规范里 lifecycle 规则 ID 的长度上限（R2 未实测，按规范来） */
+export const MAX_RULE_ID_LENGTH = 255;
 
 /**
  * 规则 ID 是标记加上规则作用的前缀，形如 `opennext-r2-prune:incremental-cache/<buildId>/`。
@@ -117,12 +134,14 @@ export function ruleId(prefix: string, buildId: string): string {
 /**
  * 从 lifecycle 配置 XML 中分拣出「本工具为 prefix 写的规则」与「其余规则」。
  * 归属只看 <ID>：以 RULE_ID_PREFIX 开头、且其后的前缀部分恰好等于 prefix。前缀取自 ID 而不是
- * <Filter><Prefix>，这样被 R2 丢掉前缀的规则仍能认回来、改写掉。别的前缀的规则与外部规则一样原样搬运。
+ * <Filter><Prefix>，这样被 R2 丢掉前缀的规则仍能认回来、改写掉。别的前缀的规则与外部规则一样原样搬运，
+ * 另外解析进 others 供安全检查用。
  */
-export function parseLifecycle(xml: string, prefix: string): LifecycleDoc {
+export function parseLifecycle(xml: string, prefix: string): ParsedLifecycle {
   const scope = normalizePrefix(prefix);
   const own: OwnRule[] = [];
   const foreign: string[] = [];
+  const others: OtherScopeRule[] = [];
 
   for (const block of blocks(xml, "Rule")) {
     const id = text(block, "ID")?.trim();
@@ -140,27 +159,33 @@ export function parseLifecycle(xml: string, prefix: string): LifecycleDoc {
           `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这条规则再重跑。`,
       );
     }
-    if (path.slice(0, path.length - buildId.length) !== scope) {
+    const ruleScope = path.slice(0, path.length - buildId.length);
+    if (ruleScope !== scope) {
       foreign.push(block);
+      others.push({ ...parseRuleBody(block, buildId), scope: ruleScope });
       continue;
     }
-    // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
-    // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
-    const filter = text(block, "Filter");
-    const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
-    // Filter 里没有 Prefix 时，块里能找到的 <Prefix> 只可能直接挂在 <Rule> 下
-    const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
-    const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
-    own.push({
-      buildId,
-      prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
-      expireDays: Number.isInteger(days) && days > 0 ? days : 0,
-      enabled: text(block, "Status")?.trim() === "Enabled",
-      ...(barePrefix ? { barePrefix: assertLiteral(barePrefix, "规则中的裸 Prefix") } : {}),
-    });
+    own.push(parseRuleBody(block, buildId));
   }
 
-  return { prefix: scope, own, foreign };
+  return { prefix: scope, own, foreign, others };
+}
+
+function parseRuleBody(block: string, buildId: string): OwnRule {
+  // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
+  // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
+  const filter = text(block, "Filter");
+  const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
+  // Filter 里没有 Prefix 时，块里能找到的 <Prefix> 只可能直接挂在 <Rule> 下
+  const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
+  const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
+  return {
+    buildId,
+    prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
+    expireDays: Number.isInteger(days) && days > 0 ? days : 0,
+    enabled: text(block, "Status")?.trim() === "Enabled",
+    ...(barePrefix ? { barePrefix: assertLiteral(barePrefix, "规则中的裸 Prefix") } : {}),
+  };
 }
 
 /**
