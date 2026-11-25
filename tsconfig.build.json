@@ -1,0 +1,15 @@
+{
+  // 只编译 src 并产出 dist；类型检查仍由根 tsconfig 的 `pnpm typecheck` 负责
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    // 产出时不能开它。rewriteRelativeImportExtensions 只把 .js 里的 .ts 后缀改写成 .js，
+    // .d.ts 里保留 .ts 后缀，下游 TS 会解析到同名 .d.ts
+    "allowImportingTsExtensions": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    // tsc 给每个模块都产出 .d.ts；cli.d.ts 没有用处，由 build 脚本删掉，并给 cli.js 加上执行权限
+    "declaration": true
+  },
+  "include": ["src"]
+}

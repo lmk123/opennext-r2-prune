@@ -3,7 +3,7 @@
 ## 命令
 
 ```bash
-pnpm typecheck                              # tsc --noEmit（tsup 不做类型检查）
+pnpm typecheck                              # tsc --noEmit；`pnpm build` 用 tsconfig.build.json 只编译 src
 pnpm start --help                           # 直接跑源码；不要写 `pnpm start -- …`，`--` 会被原样传入导致 parseArgs 报错
 pnpm test:e2e                               # 真实 R2 实测，自动读 .env（变量见 .env.example；worktree 里读主仓库根的）
 ```
