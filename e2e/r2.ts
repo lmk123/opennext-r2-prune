@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
 import { AwsClient } from "aws4fetch";
+import { withRetry } from "../src/retry.ts";
 
 /**
  * 真实 R2 实测用的工具函数。这里刻意不复用 src 里的解析与请求代码：
  * 核对结果的一方和被测的一方用同一套代码，被测代码错了核对也跟着错，测不出来。
+ * 只借用 withRetry 扛网络抖动，它不碰请求内容与解析。
  */
 
 /** 实测用到的全部对象都放在这个目录下，开跑前、跑完后整个清掉 */
 export const E2E_ROOT = "e2e";
+
+/** 实测写进 bucket 的规则：外部规则一律以 e2e- 开头，本工具的规则都落在 E2E_ROOT 之下 */
+export const isE2eRuleId = (id: string) => id.startsWith("e2e-") || id.startsWith(`opennext-r2-prune:${E2E_ROOT}/`);
 
 export interface E2eEnv {
   bucket: string;
@@ -107,7 +112,8 @@ export class RawR2 {
   }
 
   async #send(url: string, init: RequestInit = {}, ok: (status: number) => boolean = (s) => s < 300) {
-    const response = await this.#client.fetch(url, init);
+    // 请求都是幂等的 GET / PUT / DELETE，可以放心重试；还原 lifecycle 也靠它扛住一次网络抖动
+    const response = await withRetry(async (signal) => fetch(await this.#client.sign(url, init), { signal }));
     const body = await response.text();
     if (!ok(response.status)) {
       throw new Error(`${init.method ?? "GET"} ${url} 失败：HTTP ${response.status} ${body.slice(0, 500)}`);
@@ -167,10 +173,6 @@ export class RawR2 {
     const headers: Record<string, string> = { "Content-Type": "application/xml" };
     if (contentMd5 !== null) headers["Content-MD5"] = contentMd5;
     return this.#send(`${this.#base}?lifecycle`, { method: "PUT", body: xml, headers });
-  }
-
-  deleteLifecycle() {
-    return this.#send(`${this.#base}?lifecycle`, { method: "DELETE" });
   }
 
   /** 写入配置并等到读回来的规则 ID 与之一致（刚写完可能短暂读到旧配置；R2 读回时按 ID 排序，不比顺序） */

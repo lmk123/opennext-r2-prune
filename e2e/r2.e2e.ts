@@ -6,6 +6,7 @@ import {
   BASELINE_RULES,
   E2E_ROOT,
   eventually,
+  isE2eRuleId,
   lifecycleXml,
   loadEnv,
   md5Base64,
@@ -26,7 +27,8 @@ const r2 = new RawR2(env);
 const SITE_A = `${E2E_ROOT}/site-a`;
 const SITE_B = `${E2E_ROOT}/site-b`;
 
-let snapshot: string | null = null;
+/** 开跑前读到的 lifecycle 原文：null 是原本没有任何配置，undefined 是没读到（beforeAll 中止了），此时不能动 lifecycle */
+let snapshot: string | null | undefined;
 
 const ownId = (prefix: string, buildId: string) => `opennext-r2-prune:${prefix}/${buildId}/`;
 
@@ -62,21 +64,35 @@ function options(prefix: string, extra: Partial<PruneRunOptions> = {}) {
 const ids = (builds: { buildId: string }[]) => builds.map((b) => b.buildId).sort();
 
 beforeAll(async () => {
-  snapshot = (await r2.getLifecycle()).xml;
-  console.info(`实测 bucket：${env.bucket}，原有 lifecycle 规则 ${snapshot === null ? 0 : parseRules(snapshot).length} 条，跑完会原样写回`);
+  const { xml } = await r2.getLifecycle();
+  // 上次中途被打断时 bucket 上还留着实测的规则，照常跑会把这份残留当成原配置记下、跑完照样写回，真正的原配置就丢了
+  const leftovers = xml === null ? [] : parseRules(xml).map((rule) => rule.id).filter(isE2eRuleId);
+  if (leftovers.length > 0) {
+    throw new Error(
+      `bucket ${env.bucket} 上还留着实测写的规则：${leftovers.join("、")}，多半是上次中途被打断、没来得及写回，已中止。` +
+        `请照上次开跑时打在 stderr 上的原配置手动写回（或删掉这些规则）后再跑。`,
+    );
+  }
+  snapshot = xml;
+  // 先打出原配置：中途被打断（Ctrl-C、超时）时 afterAll 来不及写回，只能照这份手动恢复
+  console.error(
+    `实测 bucket：${env.bucket}，跑完会写回下面这份原配置；中途被打断时请照它手动写回：\n${xml ?? "（原本没有任何配置）"}`,
+  );
 });
 
 afterAll(async () => {
-  await r2.deleteUnder(`${E2E_ROOT}/`);
+  if (snapshot === undefined) return;
+  // 先还原 lifecycle 再清对象：清对象失败不能连累还原
   try {
-    if (snapshot === null) await r2.deleteLifecycle();
-    else await r2.setLifecycle(snapshot);
+    // 原本没有任何配置时写回一份空配置：实测 R2 接受空配置的 PUT，DELETE ?lifecycle 在 R2 上没实测过
+    await r2.setLifecycle(snapshot ?? lifecycleXml([]));
   } catch (error) {
-    // 还原失败时 bucket 上留着实测写的规则，把原配置打出来供手动恢复
     console.error(
       `还原 bucket ${env.bucket} 的 lifecycle 配置失败，请手动写回下面这份原配置：\n${snapshot ?? "（原本没有任何配置）"}`,
     );
     throw error;
+  } finally {
+    await r2.deleteUnder(`${E2E_ROOT}/`);
   }
 });
 
@@ -170,12 +186,13 @@ describe("基本流程", () => {
     expect(result.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(result).toMatchObject({ written: true, verified: true });
     await expectRules([]);
-    // R2 对空配置的态度没有文档：记下这次实际走的是 PUT 空配置还是退回了 DELETE
-    console.info(`清空配置实际发出的写请求：${run.spy.writes().map((c) => c.method).join(" → ")}`);
+    // R2 对空配置的态度没有文档，README 记下的实测结论：接受空配置的 PUT（不退回 DELETE），之后读到 200 和一份空配置
+    expect(run.spy.writes().map((c) => c.method)).toEqual(["PUT"]);
     const after = await r2.getLifecycle();
-    console.info(`清空后 GET ?lifecycle：HTTP ${after.status}${after.xml === null ? "" : `，${after.xml}`}`);
+    expect(after.status).toBe(200);
+    expect(after.xml).not.toBeNull();
 
-    // 清空之后的配置（不论读到 404 还是空配置）要能照常读，并判为无需改动
+    // 清空之后的配置要能照常读，并判为无需改动
     const rerun = options(SITE_A, { keep: ["build-a"] });
     expect((await prune(rerun.opts)).changed).toBe(false);
     expect(rerun.spy.writes()).toEqual([]);
@@ -276,10 +293,19 @@ describe("README 里记下的 R2 实测特性", () => {
     expect(rule).toEqual({ id: "e2e-bare-prefix", enabled: true, days: 3650 });
   });
 
-  it("R2 不校验 Content-MD5：带错误摘要的写入照样成功", async () => {
+  it("R2 不校验 Content-MD5：带错误摘要、不带摘要的写入都照样成功", async () => {
     const xml = lifecycleXml(BASELINE_RULES);
-    const { status } = await r2.putLifecycle(xml, md5Base64("故意给错的摘要"));
-    expect(status).toBe(200);
+    expect((await r2.putLifecycle(xml, md5Base64("故意给错的摘要"))).status).toBe(200);
+    expect((await r2.putLifecycle(xml, null)).status).toBe(200);
+  });
+
+  it("读回的规则按 ID 排序，不保持写入顺序", async () => {
+    const rule = (id: string) =>
+      `<Rule><ID>${id}</ID><Status>Enabled</Status><Filter><Prefix>${E2E_ROOT}/${id}/</Prefix></Filter>` +
+      `<Expiration><Days>3650</Days></Expiration></Rule>`;
+    const written = ["e2e-order-c", "e2e-order-a", "e2e-order-b"];
+    await r2.setLifecycle(lifecycleXml(written.map(rule)));
+    expect((await r2.rules()).map((r) => r.id)).toEqual([...written].sort());
   });
 });
 

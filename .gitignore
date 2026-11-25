@@ -7,3 +7,5 @@ dist/
 .env
 .env.*
 !.env.example
+# 旧约定的凭证目录，改用 .env 后仍保持忽略，免得本地留着的旧凭证被误提交
+.secrets/
