@@ -171,7 +171,7 @@ export function parseLifecycle(xml: string, prefix: string): ParsedLifecycle {
     }
     const target = id.slice(RULE_ID_PREFIX.length);
     // buildId 是一级目录名，不含斜杠，所以最后一段就是 buildId，之前的部分就是缓存前缀。
-    // 结尾斜杠可有可无：带 / 的 ID 在 R2 上未实测，被服务端去掉结尾斜杠时仍认得回来
+    // 结尾斜杠可有可无：实测 R2 原样保留带 / 的 ID，被别的实现去掉结尾斜杠时仍认得回来
     const path = target.endsWith("/") ? target.slice(0, -1) : target;
     const buildId = path.slice(path.lastIndexOf("/") + 1);
     if (buildId === "" || !LITERAL_SAFE.test(target)) {

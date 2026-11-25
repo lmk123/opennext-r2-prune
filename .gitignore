@@ -3,5 +3,7 @@ dist/
 .idea/
 *.log
 
-# 本地实测用的临时凭证，绝不提交
-.secrets/
+# 本地开发、实测用的真实凭证，绝不提交；变量说明见 .env.example
+.env
+.env.*
+!.env.example

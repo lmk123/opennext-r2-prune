@@ -282,7 +282,8 @@ if (planned.changed && (await askSomeone(planned.expire))) {
   报错会分别写出前缀和目录名各占多少字符：前缀太长就换一个更短的，目录名本身就太长时它多半不是 build 缓存目录。
 - 一条规则都不剩时要清空配置。S3 规范不允许不含 `<Rule>` 的配置，R2 文档也没把
   DeleteBucketLifecycle 列为已支持，所以先 PUT 空配置，被当作格式错误（400）拒掉再退回
-  `DELETE ?lifecycle`（DELETE 也失败时，报错里会一并写明 PUT 被拒的原因），生效与否由回读核对确认。**这两条路径在 R2 上的实际表现尚未实测。**
+  `DELETE ?lifecycle`（DELETE 也失败时，报错里会一并写明 PUT 被拒的原因），生效与否由回读核对确认。实测 R2 接受
+  空配置的 PUT，读回来是一份不含 `<Rule>` 的配置；退回 DELETE 那条路径在 R2 上走不到，未实测。
 
 ## 已知限制
 
@@ -319,7 +320,28 @@ pnpm test
 pnpm build
 ```
 
-以下 R2 的具体行为已在真实 bucket 上实测确认（2026-11）：
+### 真实 R2 实测
+
+`pnpm test` 只跑假 R2；`pnpm test:e2e`（`e2e/` 目录）在真实 bucket 上把整个流程跑一遍：布置 build 目录与
+lifecycle 配置，调用库和 CLI，再绕开被测代码直接读回 lifecycle 逐条核对。覆盖挂规则、幂等、回收、摘除、
+改过期天数、多前缀共存、清空配置、各项安全校验的中止（且没有写请求）、整 bucket 规则的报出与改写、
+CLI 的 `--dry-run` / `--yes`，以及下文列出的 R2 特性。改动行为后跑一遍即可。
+
+```bash
+cp .env.example .env   # 照注释填好凭证
+pnpm test:e2e
+```
+
+- 用到的环境变量都在 `.env.example` 里说明。`pnpm test:e2e` 会自动读 `.env`，shell 里已设的同名变量优先；
+  在 git worktree 里没有 `.env` 时读主仓库根下的。
+- **用一个专用的测试 bucket**：实测会整份改写它的 lifecycle 配置（开跑前记下、跑完原样写回），并清空
+  `e2e/` 下的对象。bucket 名不带 `test` 时拒绝运行，防止 `.env` 或 shell 里留着线上凭证时误跑。
+- 另外填了 `WORKER_NAME` 与 `CLOUDFLARE_API_TOKEN` 时，会多跑一组：探测该 Worker 此刻的线上、近期与预览
+  build，布置进测试 bucket，核对它们被保留、其余被判作废。Cloudflare 那边只发读请求。
+- 中途被打断、来不及写回时，原配置会打在 stderr 上，照它手动写回。R2 真正删除对象要等最长 24 小时，
+  实测只核对规则，不等删除。
+
+以下 R2 的具体行为已在真实 bucket 上实测确认（2026-11），除权限一条外都由 `pnpm test:e2e` 反复核对：
 
 - **`<Filter><Prefix>` 式样**：R2 照单全收，读回来也原样是 `<Filter><Prefix>`。
 - **⚠️ R2 不认裸 `<Prefix>`**（直接挂在 `<Rule>` 下、不包 `<Filter>` 的老式写法）。它不报错，却会
@@ -332,6 +354,8 @@ pnpm build
 - **新建的 bucket 自带一条 `Default Multipart Abort Rule`**，工具会把它当作外部规则原样保留（已实测）。
   所以「bucket 没有任何规则时 GET 返回 404 / `NoSuchLifecycleConfiguration`」这条路径在 R2 上很难
   走到，未实测；工具对它的处理是当作空配置。
+- **规则 ID 带结尾斜杠**（`opennext-r2-prune:<前缀>/<buildId>/`）R2 原样保留；读回的规则按 ID 排序，不保持写入顺序。
+- **空配置**：R2 接受不含 `<Rule>` 的 lifecycle PUT，之后 GET 返回 200 和一份空配置，而不是 404。
 - **权限**：lifecycle 只有 Admin 级 R2 token 能读写，Object 级 token（只读或读写）一律 403，见上文。
 
 写入后可用 `npx wrangler r2 bucket lifecycle list <BUCKET>` 核对规则是否如实写进去了，重点看每条
