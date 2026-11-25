@@ -193,6 +193,19 @@ describe("parseLifecycle 按缓存前缀认领规则", () => {
     }
   });
 
+  it("别的前缀的、格式不对的规则，前缀含转义字符也不抛错：只供检查，从不写回", () => {
+    const xml = `<LifecycleConfiguration>${rule("opennext-r2-prune:a b/", "a&amp;b/")}${rule("opennext-r2-prune:site-b/b1/", "x&amp;y/")}</LifecycleConfiguration>`;
+    const parsed = parseLifecycle(xml, "incremental-cache");
+    expect(parsed.malformed.map((r) => r.prefix)).toEqual(["a&amp;b/"]);
+    expect(parsed.others.map((r) => r.prefix)).toEqual(["x&amp;y/"]);
+    expect(parsed.foreign).toHaveLength(2);
+  });
+
+  it("本前缀的规则前缀含转义字符时照旧中止", () => {
+    const xml = `<LifecycleConfiguration>${rule("opennext-r2-prune:incremental-cache/b1/", "a&amp;b/")}</LifecycleConfiguration>`;
+    expect(() => parseLifecycle(xml, "incremental-cache")).toThrow(XmlAssumptionError);
+  });
+
   it("写入时 ID 由前缀与 buildId 拼成，与 Filter 前缀对不上的规则拒绝写入", () => {
     const own = [{ buildId: "b1", prefix: "site-a/b1/", expireDays: 1, enabled: true }];
     expect(renderLifecycle({ prefix: "site-a/", own, foreign: [] })).toContain("<ID>opennext-r2-prune:site-a/b1/</ID>");

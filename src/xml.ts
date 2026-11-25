@@ -76,7 +76,7 @@ export function parseListObjects(xml: string): ListObjectsResult {
  * 一条由本工具管理的规则。用户自有规则不会被解析成这个形状。
  *
  * 字段是完整的：判定层要拿它与「期望的样子」逐字段比对，才能发现选项变了
- * （比如换了 --prefix 或 --expire-days）需要重写。
+ * （比如换了 --expire-days）需要重写。换了 --prefix 的旧规则不归这一趟管，进的是 others。
  */
 export interface OwnRule {
   buildId: string;
@@ -176,34 +176,41 @@ export function parseLifecycle(xml: string, prefix: string): ParsedLifecycle {
     const buildId = path.slice(path.lastIndexOf("/") + 1);
     if (buildId === "" || !LITERAL_SAFE.test(target)) {
       foreign.push(block);
-      malformed.push({ ...parseRuleBody(block), id });
+      malformed.push({ ...parseRuleBody(block, false), id });
       continue;
     }
     const ruleScope = path.slice(0, path.length - buildId.length);
     if (ruleScope !== scope) {
       foreign.push(block);
-      others.push({ buildId, ...parseRuleBody(block), id, scope: ruleScope });
+      others.push({ buildId, ...parseRuleBody(block, false), id, scope: ruleScope });
       continue;
     }
-    own.push({ buildId, ...parseRuleBody(block), id });
+    own.push({ buildId, ...parseRuleBody(block, true), id });
   }
 
   return { prefix: scope, own, foreign, others, malformed };
 }
 
-function parseRuleBody(block: string): RuleBody {
+/**
+ * strict 只给本前缀的规则：它们会被比对、改写，前缀里有转义字符就得中止。别的前缀的、格式不对的
+ * 只用来判断是否对整个 bucket 生效，从不写回，前缀原样留着不断言 —— 在这里抛错会让 getLifecycle
+ * 整个失败，调用方就来不及报出其余对整个 bucket 生效的规则。
+ */
+function parseRuleBody(block: string, strict: boolean): RuleBody {
+  const literal = (value: string, what: string) => (strict ? assertLiteral(value, what) : value);
   // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
-  // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
+  // 作用于整个 bucket。读不到 Filter 里的前缀就记为空：本前缀的规则会因前缀不符被判定层改写掉，
+  // 其余的只会被报出来。
   const filter = text(block, "Filter");
   const filterPrefix = filter === undefined ? undefined : text(filter, "Prefix");
   // Filter 里没有 Prefix 时，块里能找到的 <Prefix> 只可能直接挂在 <Rule> 下
   const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
   const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
   return {
-    prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
+    prefix: literal(filterPrefix ?? "", "规则中的 Prefix"),
     expireDays: Number.isInteger(days) && days > 0 ? days : 0,
     enabled: text(block, "Status")?.trim() === "Enabled",
-    ...(barePrefix ? { barePrefix: assertLiteral(barePrefix, "规则中的裸 Prefix") } : {}),
+    ...(barePrefix ? { barePrefix: literal(barePrefix, "规则中的裸 Prefix") } : {}),
   };
 }
 

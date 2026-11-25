@@ -310,6 +310,22 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     expect(seen).toEqual([["opennext-r2-prune:incremental-cache/b2/", "opennext-r2-prune:a//"]]);
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
+
+  it("格式不对的规则前缀含转义字符时，读配置不失败，照样先报出对整个 bucket 生效的规则再中止，不发任何写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:x y</ID><Status>Enabled</Status>
+      <Filter><Prefix>a&amp;b/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+    </Rule><Rule>
+      <ID>opennext-r2-prune:old-cache/b1/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const { store, calls } = sharedBucket({ "incremental-cache/": ["live", "old1"] }, lifecycle);
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
+    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    expect(seen).toEqual([["opennext-r2-prune:old-cache/b1/"]]);
+    expect(calls.every((method) => method === "GET")).toBe(true);
+  });
 });
 
 /**
