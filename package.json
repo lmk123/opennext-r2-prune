@@ -44,7 +44,7 @@
   },
   "types": "./dist/index.d.ts",
   "bin": {
-    "opennext-r2-prune": "./dist/cli.js"
+    "opennext-r2-prune": "dist/cli.js"
   },
   "files": [
     "dist"
