@@ -109,13 +109,14 @@ export class R2Store {
     this.#base = `${opts.endpoint.replace(/\/+$/, "")}/${opts.bucket}`;
   }
 
-  async #request(operation: S3Operation, url: string, init?: RequestInit): Promise<Response> {
+  async #request(operation: S3Operation, url: string, init?: RequestInit, signal?: AbortSignal): Promise<Response> {
     const doFetch = this.#opts.fetchImpl ?? fetch;
     let response: Response;
     try {
       response = await withRetry(
         async (signal) => doFetch(await this.#client.sign(url, init), { signal }),
         this.#opts.onRetry,
+        signal,
       );
     } catch (error) {
       // 重试耗尽的网络层失败也归成 S3Error（status 为 0），和 cloudflare.ts 一致：库的调用方按文档列出的
@@ -171,14 +172,15 @@ export class R2Store {
   /**
    * build 目录里按 key 排第一的对象的写入时间，目录已空时为 null。只取一个对象，不论目录多大都是一个请求。
    * 正在写入的 build 每个对象都是新的，取哪个都一样；老 build 被 ISR 改写过的对象可能偏新，那只会让它晚几天判作废。
+   * signal 中止时不再重试，免得整趟已经失败，还在退避的请求把进程拖住。
    */
-  async buildWrittenAt(prefix: string, buildId: string): Promise<Date | null> {
+  async buildWrittenAt(prefix: string, buildId: string, signal?: AbortSignal): Promise<Date | null> {
     const url = new URL(this.#base);
     url.searchParams.set("list-type", "2");
     url.searchParams.set("prefix", `${normalizePrefix(prefix)}${buildId}/`);
     url.searchParams.set("max-keys", "1");
 
-    const result = parseListObjects(await (await this.#request("writtenAt", url.toString())).text());
+    const result = parseListObjects(await (await this.#request("writtenAt", url.toString(), undefined, signal)).text());
     if (result.lastModified.length === 0) return null;
     const raw = result.lastModified[0];
     const time = raw === undefined ? Number.NaN : Date.parse(raw);

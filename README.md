@@ -47,7 +47,8 @@ DELETE。
 5. **看看要新挂规则的 build 是不是刚写进来的。** OpenNext 部署时先把新 build 的缓存写进 R2，
    再上传版本、切流量；正赶上部署时，新 build 已经在 bucket 里，却既不是线上也不在任何
    deployment 里。所以对每个这次要新挂规则的 build，取它目录里的一个对象看写入时间，不满
-   `--grace-hours`（默认 24 小时）的先不判，下次运行再看。读不到时间就退出。
+   `--grace-hours`（默认 24 小时）的先不判，下次运行再看。读取失败或时间解析不出就退出；目录在这期间
+   已被删空的照常挂规则，下次运行会回收。
 
 6. **把计划打给你看，确认后写回去。** 写入是整份 lifecycle 配置的全量覆盖：你自己的规则
    原样搬回，本工具的规则按上一步的结论重新生成。写完立刻把配置读回来逐条核对，确认每条规则
@@ -230,6 +231,8 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - 重复调用同一个 `apply()` 是用法错误，抛普通 `Error`，不发任何请求；要再写入请重新调用 `planPrune`。
 
 返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
+每项的 `reason` 是 `online`（线上）、`recent`（近期线上）、`preview`（预览）、`explicit`（`keep` 传入）
+或 `fresh`（写入不满 `graceHours` 小时、暂不判作废，`source` 是写入时间）之一，同一个 build 有多个来源时取靠前的；
 `cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
 
 ### 多个站点共用一个 bucket

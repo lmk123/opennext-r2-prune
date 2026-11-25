@@ -86,6 +86,11 @@ export interface PlanInput {
   force?: boolean;
   /** 承认「前缀为空、缓存直接放在 bucket 根下」这种布局 */
   allowRootPrefix?: boolean;
+  /**
+   * 跳过「规则总数不超过上限」这条校验。只给 collectPlan 挑候选用：那一遍还没排除刚写入的 build，
+   * 会把它们也算成要挂规则的，拿它判上限会在接近上限时误中止。最终计划必须带着这条校验再算一遍
+   */
+  skipRuleLimit?: boolean;
 }
 
 /**
@@ -241,7 +246,7 @@ export function makePlan(input: PlanInput): PrunePlan {
   }));
 
   const total = current.foreign.length + nextOwn.length;
-  if (total > MAX_RULES) {
+  if (!input.skipRuleLimit && total > MAX_RULES) {
     throw new PlanError(
       `规则总数会达到 ${total} 条，超过 R2 的 ${MAX_RULES} 条上限。` +
         `等已有规则删完后重跑一次即可自动回收，或手动清理 bucket 上的 lifecycle 规则。`,

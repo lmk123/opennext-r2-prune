@@ -134,18 +134,24 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     force: opts.force,
     allowRootPrefix: opts.allowRootPrefix,
   };
-  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间
-  let plan = makePlan({ ...planInput, keep: keeps });
+  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间。这一遍还没排除刚写入的
+  // build，会把它们算成要挂规则的，所以不判规则上限，留给下面的最终计划
+  const first = makePlan({ ...planInput, keep: keeps, skipRuleLimit: true });
 
   // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长
-  const candidates = plan.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  const candidates = first.expire.filter((b) => b.state === "new").map((b) => b.buildId);
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
+  const fresh: KeptBuild[] = [];
   if (graceMs > 0 && candidates.length > 0) {
     const now = (opts.now ?? Date.now)();
-    const writtenAt = await mapWithConcurrency(candidates, concurrency, signal, (buildId) =>
-      opts.store.buildWrittenAt(opts.prefix, buildId),
+    // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
+    const reading = new AbortController();
+    const writtenAt = await mapWithConcurrency(candidates, concurrency, reading.signal, (buildId) =>
+      opts.store.buildWrittenAt(opts.prefix, buildId, reading.signal).catch((error: unknown) => {
+        reading.abort();
+        throw error;
+      }),
     );
-    const fresh: KeptBuild[] = [];
     candidates.forEach((buildId, i) => {
       const time = writtenAt[i];
       // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
@@ -153,8 +159,8 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         fresh.push({ buildId, reason: "fresh", source: `写入于 ${time.toISOString()}` });
       }
     });
-    if (fresh.length > 0) plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
   }
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
 
   return {
     onlineBuildId,

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify, WriteNotAppliedError } from "../src/run.ts";
-import { PlanError } from "../src/plan.ts";
+import { MAX_RULES, PlanError } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
 
@@ -178,6 +178,68 @@ describe("collectPlan", () => {
     const { store, calls } = fakeR2({ buildIds: ["live", "old1"], failWrittenAt: true });
     await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(S3Error);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("写入时间解析不出时中止，没有写请求", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], writtenAt: { old1: "昨天" } });
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(
+      XmlAssumptionError,
+    );
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("一个写入时间读失败时，中止其余在途的读取", async () => {
+    let slowAborted = false;
+    const fetchImpl = (async (request: Request, init?: RequestInit) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("lifecycle")) {
+        return new Response("<Error><Code>NoSuchLifecycleConfiguration</Code></Error>", { status: 404 });
+      }
+      if (url.searchParams.get("max-keys") === "1") {
+        if (url.searchParams.get("prefix") === "incremental-cache/denied/") {
+          return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
+        }
+        // 一直挂着，直到被中止
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            slowAborted = true;
+            reject(init.signal!.reason);
+          });
+        });
+      }
+      const prefixes = ["live", "slow", "denied"]
+        .map((id) => `<CommonPrefixes><Prefix>incremental-cache/${id}/</Prefix></CommonPrefixes>`)
+        .join("");
+      return new Response(`<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`);
+    }) as unknown as typeof fetch;
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(
+      /读取 build 目录的写入时间失败/,
+    );
+    expect(slowAborted).toBe(true);
+  });
+
+  it("规则上限按排除刚写入的 build 之后的计划判", async () => {
+    // 用户规则占到只剩一个名额：两个候选里有一个刚写入，实际只需挂一条
+    const foreign = Array.from(
+      { length: MAX_RULES - 1 },
+      (_, i) =>
+        `<Rule><ID>user-${i}</ID><Status>Enabled</Status><Filter><Prefix>logs/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
+    ).join("");
+    const lifecycle = `<LifecycleConfiguration>${foreign}</LifecycleConfiguration>`;
+    const now = Date.parse("2026-11-25T12:00:00.000Z");
+
+    const fits = fakeR2({ buildIds: ["live", "deploying", "old1"], lifecycle, writtenAt: { deploying: "2026-11-25T11:30:00.000Z" } });
+    const state = await collectPlan({ store: fits.store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+
+    // 都不是刚写入的，最终计划确实超限，照样拒绝
+    const over = fakeR2({ buildIds: ["live", "deploying", "old1"], lifecycle });
+    await expect(collectPlan({ store: over.store, prefix: "incremental-cache", keep: ["live"], now: () => now })).rejects.toThrow(
+      /上限/,
+    );
+    expect(over.calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
   it("目录名不符合布局假设时中止，不猜也不降级", async () => {

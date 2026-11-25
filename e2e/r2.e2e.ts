@@ -152,20 +152,18 @@ describe("基本流程", () => {
     expect(again.spy.writes()).toEqual([]);
   });
 
-  it("刚写入的 build 不判作废：真实 R2 的 LastModified 能解析，且不能替保留集充数", async () => {
+  it("刚写入的 build 不判作废：真实 R2 的 LastModified 能解析", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
 
-    const planned = await planPrune(options(SITE_A, { keep: ["build-a"], graceHours: 24 }).opts);
+    // fresh 不能替保留集充数由 plan.test 直接测 makePlan：经过 collectPlan 时，保留集填错在读写入时间之前就已中止
+    const { opts, spy } = options(SITE_A, { keep: ["build-a"], graceHours: 24 });
+    const planned = await planPrune(opts);
     expect(planned.keep).toEqual([
       { buildId: "build-a", reason: "explicit" },
       { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
     ]);
     expect(planned.expire).toEqual([]);
     expect(planned.changed).toBe(false);
-
-    // 保留集填错时，刚写入的 build 不能让「有交集」这条校验蒙混过去
-    const { opts, spy } = options(SITE_A, { keep: ["bogus"], force: true, graceHours: 24 });
-    await expect(planPrune(opts)).rejects.toThrow(/没有交集/);
     expect(spy.writes()).toEqual([]);
     await expectRules(BASELINE_EXPECTED);
   });
