@@ -13,6 +13,7 @@ import {
   parseRules,
   RawR2,
   type RawRule,
+  SNAPSHOT_KEY,
   spyFetch,
 } from "./r2.ts";
 
@@ -64,8 +65,17 @@ function options(prefix: string, extra: Partial<PruneRunOptions> = {}) {
 const ids = (builds: { buildId: string }[]) => builds.map((b) => b.buildId).sort();
 
 beforeAll(async () => {
+  // 只看残留规则不够：上次若在清空配置的用例前后被打断，bucket 上是一份一条规则都没有的配置，认不出是残留
+  const saved = await r2.getObject(SNAPSHOT_KEY);
+  if (saved !== null) {
+    throw new Error(
+      `bucket ${env.bucket} 上有 ${SNAPSHOT_KEY}：另一趟实测正在跑，或上次中途被打断、没来得及写回原配置，已中止。` +
+        `确认没有别的实测在跑后，把其中记下的原配置写回 lifecycle（xml 为 null 表示原本没有任何配置），` +
+        `再删掉这个对象后重跑：\n${saved}`,
+    );
+  }
   const { xml } = await r2.getLifecycle();
-  // 上次中途被打断时 bucket 上还留着实测的规则，照常跑会把这份残留当成原配置记下、跑完照样写回，真正的原配置就丢了
+  // 更早的版本没有快照对象，被打断后只留下实测的规则：照常跑会把这份残留当成原配置记下、跑完照样写回
   const leftovers = xml === null ? [] : parseRules(xml).map((rule) => rule.id).filter(isE2eRuleId);
   if (leftovers.length > 0) {
     throw new Error(
@@ -73,10 +83,13 @@ beforeAll(async () => {
         `请照上次开跑时打在 stderr 上的原配置手动写回（或删掉这些规则）后再跑。`,
     );
   }
+  // 快照存进 bucket 之后才算开跑：存失败时 snapshot 仍是 undefined，afterAll 不会动 lifecycle
+  await r2.putObject(SNAPSHOT_KEY, JSON.stringify({ bucket: env.bucket, xml }));
   snapshot = xml;
-  // 先打出原配置：中途被打断（Ctrl-C、超时）时 afterAll 来不及写回，只能照这份手动恢复
+  // 先打出原配置：中途被打断（Ctrl-C、超时）时 afterAll 来不及写回，只能照这份（或 SNAPSHOT_KEY 里的）手动恢复
   console.error(
-    `实测 bucket：${env.bucket}，跑完会写回下面这份原配置；中途被打断时请照它手动写回：\n${xml ?? "（原本没有任何配置）"}`,
+    `实测 bucket：${env.bucket}，跑完会写回下面这份原配置（${SNAPSHOT_KEY} 里也存着一份）；中途被打断时请照它手动写回：\n` +
+      `${xml ?? "（原本没有任何配置）"}`,
   );
 });
 
@@ -88,12 +101,18 @@ afterAll(async () => {
     await r2.setLifecycle(snapshot ?? lifecycleXml([]));
   } catch (error) {
     console.error(
-      `还原 bucket ${env.bucket} 的 lifecycle 配置失败，请手动写回下面这份原配置：\n${snapshot ?? "（原本没有任何配置）"}`,
+      `还原 bucket ${env.bucket} 的 lifecycle 配置失败，请手动写回下面这份原配置，再删掉 ${SNAPSHOT_KEY}：\n` +
+        `${snapshot ?? "（原本没有任何配置）"}`,
     );
+    // 清对象只是顺手：它再出错也不能盖掉还原失败这个更要紧的错误
+    await r2
+      .deleteUnder(`${E2E_ROOT}/`)
+      .catch((cleanupError: unknown) => console.error(`清理 ${E2E_ROOT}/ 下的对象也失败了：${cleanupError}`));
     throw error;
-  } finally {
-    await r2.deleteUnder(`${E2E_ROOT}/`);
   }
+  // 原配置写回之后才撤掉快照：撤早了，这之间被打断，下一趟就认不出原配置没写回
+  await r2.deleteObject(SNAPSHOT_KEY);
+  await r2.deleteUnder(`${E2E_ROOT}/`);
 });
 
 beforeEach(async () => {

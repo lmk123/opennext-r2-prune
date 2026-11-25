@@ -11,6 +11,12 @@ import { withRetry } from "../src/retry.ts";
 /** 实测用到的全部对象都放在这个目录下，开跑前、跑完后整个清掉 */
 export const E2E_ROOT = "e2e";
 
+/**
+ * 开跑时把原配置存进这个对象，原配置写回之后才删。它还在，说明另一趟实测正在跑，或上次没写回就被打断了。
+ * 放在 E2E_ROOT 之外，每个用例前清 e2e/ 时才不会把它一起删掉
+ */
+export const SNAPSHOT_KEY = "e2e-lifecycle-snapshot.json";
+
 /** 实测写进 bucket 的规则：外部规则一律以 e2e- 开头，本工具的规则都落在 E2E_ROOT 之下 */
 export const isE2eRuleId = (id: string) => id.startsWith("e2e-") || id.startsWith(`opennext-r2-prune:${E2E_ROOT}/`);
 
@@ -24,8 +30,9 @@ export interface E2eEnv {
 }
 
 /**
- * 读实测用的凭证。实测会整份改写 bucket 的 lifecycle 配置，所以 bucket 名里必须带 test，
- * 防止 .env 或 shell 里留着线上凭证时误跑到线上 bucket 上。
+ * 读实测用的凭证。实测会整份改写 bucket 的 lifecycle 配置，所以 bucket 名里必须有一段是 test，
+ * 防止 .env 或 shell 里留着线上凭证时误跑到线上 bucket 上。按连字符分段比：只看子串的话，
+ * latest、contest 这类线上 bucket 名也会被放过。
  */
 export function loadEnv(): E2eEnv {
   const env = process.env;
@@ -44,10 +51,11 @@ export function loadEnv(): E2eEnv {
         `请照 .env.example 填好 .env（或在 shell 里设好这些变量）再跑 pnpm test:e2e。`,
     );
   }
-  if (!/test/i.test(bucket!)) {
+  if (!/(^|-)test(-|$)/i.test(bucket!)) {
     throw new Error(
-      `实测会整份改写 bucket「${bucket}」的 lifecycle 配置，只允许在名字带 test 的专用测试 bucket 上跑，已中止。` +
-        `请检查 .env 与 shell 里的 R2_BUCKET，确认它指向专用的测试 bucket。`,
+      `实测会整份改写 bucket「${bucket}」的 lifecycle 配置，只允许在名字里有一段是 test 的专用测试 bucket` +
+        `（以连字符分隔，如 opennext-r2-prune-test）上跑，已中止。` +
+        `请检查 .env 与 shell 里的 R2_BUCKET（shell 里的优先），确认它指向专用的测试 bucket。`,
     );
   }
   const worker =
@@ -100,8 +108,10 @@ export function parseRules(xml: string): RawRule[] {
 export class RawR2 {
   readonly #client: AwsClient;
   readonly #base: string;
+  readonly #bucket: string;
 
   constructor(env: E2eEnv) {
+    this.#bucket = env.bucket;
     this.#client = new AwsClient({
       accessKeyId: env.accessKeyId,
       secretAccessKey: env.secretAccessKey,
@@ -121,12 +131,35 @@ export class RawR2 {
     return { status: response.status, body };
   }
 
+  /**
+   * GET 一个可能不存在的资源：只有 404 且错误码是 missingCode 时返回 null。别的 404 多半是 bucket 不存在
+   * （NoSuchBucket），当成「没有」会让后面的写入报出看不出原因的 404，这里直接报明
+   */
+  async #getOptional(url: string, missingCode: string): Promise<{ status: number; body: string | null }> {
+    const { status, body } = await this.#send(url, {}, (s) => s < 300 || s === 404);
+    if (status !== 404) return { status, body };
+    if (inner(body, "Code") === missingCode) return { status, body: null };
+    throw new Error(
+      `GET ${url} 失败：HTTP 404 ${body.slice(0, 500)}。多半是 bucket「${this.#bucket}」不存在，` +
+        `请核对 .env 与 shell 里的 R2_BUCKET、CLOUDFLARE_ACCOUNT_ID。`,
+    );
+  }
+
   #key(key: string) {
     return `${this.#base}/${key.split("/").map(encodeURIComponent).join("/")}`;
   }
 
   putObject(key: string, body = "{}") {
     return this.#send(this.#key(key), { method: "PUT", body, headers: { "Content-Type": "application/json" } });
+  }
+
+  /** 读对象内容；对象不存在时返回 null */
+  async getObject(key: string): Promise<string | null> {
+    return (await this.#getOptional(this.#key(key), "NoSuchKey")).body;
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await this.#send(this.#key(key), { method: "DELETE" });
   }
 
   /** 列出 prefix 下的全部对象 key（不折叠目录） */
@@ -147,9 +180,7 @@ export class RawR2 {
 
   /** 删掉 prefix 下的全部对象 */
   async deleteUnder(prefix: string): Promise<void> {
-    for (const key of await this.listKeys(prefix)) {
-      await this.#send(this.#key(key), { method: "DELETE" });
-    }
+    for (const key of await this.listKeys(prefix)) await this.deleteObject(key);
   }
 
   /** 每个 build 目录放一个对象，build 目录才会出现在列举结果里 */
@@ -157,10 +188,10 @@ export class RawR2 {
     await Promise.all(buildIds.map((id) => this.putObject(`${prefix}/${id}/cache.json`)));
   }
 
-  /** 读 lifecycle 原文；没有任何配置时 xml 为 null */
+  /** 读 lifecycle 原文；没有任何配置（404 NoSuchLifecycleConfiguration）时 xml 为 null */
   async getLifecycle(): Promise<{ status: number; xml: string | null }> {
-    const { status, body } = await this.#send(`${this.#base}?lifecycle`, {}, (s) => s < 300 || s === 404);
-    return { status, xml: status === 404 ? null : body };
+    const { status, body } = await this.#getOptional(`${this.#base}?lifecycle`, "NoSuchLifecycleConfiguration");
+    return { status, xml: body };
   }
 
   async rules(): Promise<RawRule[]> {

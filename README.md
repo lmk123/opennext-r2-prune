@@ -336,12 +336,14 @@ pnpm test:e2e
 - 用到的环境变量都在 `.env.example` 里说明。`pnpm test:e2e` 会自动读 `.env`，shell 里已设的同名变量优先；
   在 git worktree 里没有 `.env` 时读主仓库根下的。
 - **用一个专用的测试 bucket**：实测会整份改写它的 lifecycle 配置（开跑前记下、跑完原样写回；原本没有任何
-  配置时写回一份空配置），并清空 `e2e/` 下的对象。bucket 名不带 `test` 时拒绝运行，防止 `.env` 或 shell
-  里留着线上凭证时误跑。
+  配置时写回一份空配置），并清空 `e2e/` 下的对象。bucket 名里没有一段是 `test`（以连字符分隔，如
+  `opennext-r2-prune-test`；`latest` 这类只是含有 test 的不算）时拒绝运行，防止 `.env` 或 shell 里留着线上凭证时误跑。
 - 另外填了 `WORKER_NAME` 与 `CLOUDFLARE_API_TOKEN` 时，会多跑一组：探测该 Worker 此刻的线上、近期与预览
   build，布置进测试 bucket，核对它们被保留、其余被判作废。Cloudflare 那边只发读请求。
-- 开跑时先把原配置打在 stderr 上：中途被打断、来不及写回时，照它手动写回。bucket 上还留着上次实测的规则
-  （ID 以 `e2e-` 或 `opennext-r2-prune:e2e/` 开头）时拒绝运行，免得把残留当成原配置记下、跑完照样写回。
+- 开跑时先把原配置打在 stderr 上，并存进 bucket 根下的 `e2e-lifecycle-snapshot.json`，原配置写回之后才删掉它：
+  中途被打断、来不及写回时，照其中一份手动写回，再删掉这个对象。这个对象还在（另一趟实测正在跑，或上次被打断）、
+  或者 bucket 上还留着上次实测的规则（ID 以 `e2e-` 或 `opennext-r2-prune:e2e/` 开头）时拒绝运行，免得把残留
+  当成原配置记下、跑完照样写回。
 - R2 真正删除对象要等最长 24 小时，实测只核对规则，不等删除。
 
 以下 R2 的具体行为已在真实 bucket 上实测确认（2026-11），除新建 bucket 自带规则、权限两条外都由 `pnpm test:e2e` 反复核对：
