@@ -89,10 +89,13 @@ Admin Read & Write（Object 级 token 读写不了 lifecycle）。
 配的规则列在一起：
 
 ```
-https://dash.cloudflare.com/<账号ID>/r2/default/buckets/<bucket 名>/settings#object-lifecycle-rules
+https://dash.cloudflare.com/<账号ID>/r2/<jurisdiction>/buckets/<bucket 名>/settings#object-lifecycle-rules
 ```
 
-也可以用命令行：
+`<jurisdiction>` 通常是 `default`；bucket 建在 EU 等 jurisdiction 下（`--endpoint` 形如
+`https://<账号ID>.eu.r2.cloudflarestorage.com`）时换成对应的值，比如 `eu`。
+
+也可以用命令行（非 default jurisdiction 加 `--jurisdiction eu` 之类）：
 
 ```bash
 npx wrangler r2 bucket lifecycle list <bucket 名>
@@ -233,7 +236,7 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 
 返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
 每项的 `reason` 是 `online`（线上）、`recent`（近期线上）、`preview`（预览）、`explicit`（`keep` 传入）
-或 `fresh`（写入不满 `graceHours` 小时、暂不判作废，`source` 是写入时间）之一，同一个 build 有多个来源时取靠前的；
+或 `fresh`（写入不满 `graceHours` 小时、暂不判作废，`source` 是写入时间；0.2.0 新增，按 `KeepReason` 穷举的代码升级时要补上）之一，同一个 build 有多个来源时取靠前的；
 `cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
 
 ### 多个站点共用一个 bucket

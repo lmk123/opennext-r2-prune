@@ -276,6 +276,42 @@ describe("collectPlan", () => {
     expect(over.calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
+  it("候选全算刚写入也超上限时，不读写入时间直接中止", async () => {
+    // 用户规则 999 条，加上两条已挂好的本工具规则已到 1001：new1 刚不刚写入都救不回来
+    const foreign = Array.from(
+      { length: MAX_RULES - 1 },
+      (_, i) =>
+        `<Rule><ID>user-${i}</ID><Status>Enabled</Status><Filter><Prefix>logs/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
+    ).join("");
+    const own = ["old1", "old2"]
+      .map(
+        (id) => `<Rule><ID>opennext-r2-prune:incremental-cache/${id}/</ID><Status>Enabled</Status>
+          <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
+      )
+      .join("");
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "new1", "old1", "old2"],
+      lifecycle: `<LifecycleConfiguration>${foreign}${own}</LifecycleConfiguration>`,
+    });
+
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(/上限/);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("保留集填错时，刚写入的 build 撑不起「有交集」，也不读写入时间、不写入", async () => {
+    // makePlan 里 fresh 不计入保留集的校验，经过 collectPlan 时由第一遍计划先拦下
+    const { store, calls } = fakeR2({
+      buildIds: ["deploying", "old1"],
+      writtenAt: { deploying: new Date().toISOString() },
+    });
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["bogus"], force: true }),
+    ).rejects.toThrow(/没有交集/);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
   it("目录名不符合布局假设时中止，不猜也不降级", async () => {
     // 这些值会被拿去拼删除规则，含 XML 转义字符就说明这个 bucket 不长 OpenNext 的样，
     // 那是别再往下写规则的信号

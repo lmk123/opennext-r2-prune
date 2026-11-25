@@ -143,6 +143,12 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
   if (graceMs > 0 && candidates.length > 0) {
+    // 候选全算刚写入时规则最少；这样仍超上限就不必再为每个候选发读请求，直接按上限中止
+    makePlan({
+      ...planInput,
+      keep: [...keeps, ...candidates.map((buildId) => ({ buildId, reason: "fresh" as const }))],
+    });
+
     const now = (opts.now ?? Date.now)();
     // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
     const reading = new AbortController();

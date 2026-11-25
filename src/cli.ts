@@ -149,17 +149,18 @@ async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // 只认纯数字：Number() 会把 "0x3"、"1e1"、" 3 " 都当成合法整数；位数太多会变成不精确的数或 Infinity，
+  // 漏到库的校验就会按选项名 graceHours / recentBuilds 报错
   const graceHoursRaw = values["grace-hours"] ?? "24";
-  if (!/^\d+$/.test(graceHoursRaw)) {
+  const graceHours = Number(graceHoursRaw);
+  if (!/^\d+$/.test(graceHoursRaw) || !Number.isSafeInteger(graceHours)) {
     console.error("--grace-hours 必须是不小于 0 的整数");
     return 1;
   }
-  const graceHours = Number(graceHoursRaw);
 
-  // 只认纯数字：Number() 会把 "0x3"、"1e1"、" 3 " 都当成合法整数
   const recentBuildsRaw = values["recent-builds"] ?? "3";
   const recentBuilds = Number(recentBuildsRaw);
-  if (!/^\d+$/.test(recentBuildsRaw) || recentBuilds < 1) {
+  if (!/^\d+$/.test(recentBuildsRaw) || !Number.isSafeInteger(recentBuilds) || recentBuilds < 1) {
     console.error("--recent-builds 必须是不小于 1 的整数");
     return 1;
   }
