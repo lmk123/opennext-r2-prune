@@ -199,7 +199,9 @@ export function renderLifecycle(doc: LifecycleDoc): string {
     // ID 与实际作用的前缀不一致的规则写下去，下一趟会按 ID 认领它，删的却是别处
     if (rule.prefix !== rulePrefix(doc.prefix, rule.buildId)) {
       throw new XmlAssumptionError(
-        `待写入规则 ${rule.buildId} 的 Prefix 是 ${rule.prefix}，与缓存前缀「${doc.prefix}」对不上，已中止写入。`,
+        `待写入规则 ${rule.buildId} 的 Prefix 是 ${rule.prefix}，与缓存前缀「${doc.prefix}」对不上，已中止写入，` +
+          `没有发出写请求。直接调用 renderLifecycle / putLifecycle 时请让每条规则的 Prefix 等于 <缓存前缀><buildId>/；` +
+          `否则这是本工具的缺陷，请带上这条报错提 issue。`,
       );
     }
     if (!Number.isInteger(rule.expireDays) || rule.expireDays < 1) {

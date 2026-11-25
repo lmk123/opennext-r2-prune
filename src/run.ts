@@ -1,6 +1,7 @@
 import { BuildIdProbeError, buildIdUrlFor, probeBuildId } from "./build-id.ts";
 import type { CloudflareApi, Deployment } from "./cloudflare.ts";
 import {
+  checkLayout,
   isWholeBucket,
   type KeptBuild,
   makePlan,
@@ -88,6 +89,8 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   if (read.status === "rejected") throw read.reason;
   const existing = listed.value;
   const current = read.value;
+  // 只依赖配置的校验在探测之前做：探测失败会把它们挡在后面，修好探测重跑才发现配置本来就不能用
+  checkLayout({ existing, current, prefix: opts.prefix, allowRootPrefix: opts.allowRootPrefix });
 
   const fetchImpl = opts.fetchImpl ?? fetch;
   const probe: Probe = (url, signal) => probeBuildId(url, fetchImpl, opts.onRetry, signal);

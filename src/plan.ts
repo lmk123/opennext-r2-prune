@@ -76,9 +76,12 @@ export interface PlanInput {
   allowRootPrefix?: boolean;
 }
 
-export function makePlan(input: PlanInput): PrunePlan {
-  const { existing, current, prefix, expireDays } = input;
-  const existingSet = new Set(existing);
+/**
+ * 只看前缀、现有配置和 bucket 里列出的目录就能做的校验。collectPlan 在探测之前先调一次：这些错误与
+ * 线上状态无关，不该被探测失败挡在后面；makePlan 再调一次，保证单独调用它时也不会漏掉。
+ */
+export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "prefix" | "allowRootPrefix">): void {
+  const { existing, current, prefix } = input;
 
   // 前缀为空时，「一级目录」就是 bucket 根下的全部目录 —— 除缓存外还堆着别的东西
   // （静态资源、备份……）的 bucket 会把它们统统当成作废 build 挂上删除规则。
@@ -94,7 +97,9 @@ export function makePlan(input: PlanInput): PrunePlan {
   // 规则归属按前缀划分，拿 A 前缀的配置给 B 前缀算计划会把 A 的规则全部回收掉
   if (normalizePrefix(prefix) !== current.prefix) {
     throw new PlanError(
-      `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止。`,
+      `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止，` +
+        `没有写入任何改动。直接调用 makePlan 时请确认 current 是用同一个前缀读出的（getLifecycle(prefix)）；` +
+        `否则这是本工具的缺陷，请带上这条报错提 issue。`,
     );
   }
 
@@ -112,6 +117,23 @@ export function makePlan(input: PlanInput): PrunePlan {
         `找出 ID 形如 ${nested.map((scope) => ruleId(scope, "<buildId>")).join("、")} 的规则手动删除后重跑。`,
     );
   }
+
+  // ID 带着整个缓存前缀，前缀太长时 PUT 会被拒。按 bucket 里现有的每个 build 都算一遍，不等判定出
+  // 哪些作废：今天保留的 build 迟早也会作废、要写规则，早点拦下，好说清是哪个前缀太长
+  const tooLong = existing.map((buildId) => ruleId(prefix, buildId)).find((id) => id.length > MAX_RULE_ID_LENGTH);
+  if (tooLong !== undefined) {
+    throw new PlanError(
+      `build 判作废时要写的规则 ID ${tooLong} 长 ${tooLong.length} 个字符，超过 lifecycle 规则 ID 的 ` +
+        `${MAX_RULE_ID_LENGTH} 字符上限，已中止。ID 里带着整个缓存前缀，请换一个更短的 --prefix` +
+        `（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）。`,
+    );
+  }
+}
+
+export function makePlan(input: PlanInput): PrunePlan {
+  const { existing, current, prefix, expireDays } = input;
+  const existingSet = new Set(existing);
+  checkLayout(input);
 
   // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示；
   // 但「必须在 bucket 里」要看全部来源：--keep 了一个恰好也是历史版本的 id，填错时照样得报出来
@@ -185,15 +207,6 @@ export function makePlan(input: PlanInput): PrunePlan {
     expireDays,
     enabled: true,
   }));
-
-  // ID 带着整个缓存前缀，前缀太长时 PUT 会被拒；在这里拦下，好说清是哪个前缀太长
-  const tooLong = nextOwn.map((rule) => ruleId(prefix, rule.buildId)).find((id) => id.length > MAX_RULE_ID_LENGTH);
-  if (tooLong !== undefined) {
-    throw new PlanError(
-      `规则 ID ${tooLong} 长 ${tooLong.length} 个字符，超过 lifecycle 规则 ID 的 ${MAX_RULE_ID_LENGTH} 字符上限。` +
-        `ID 里带着整个缓存前缀，请换一个更短的 --prefix（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）。`,
-    );
-  }
 
   const total = current.foreign.length + nextOwn.length;
   if (total > MAX_RULES) {

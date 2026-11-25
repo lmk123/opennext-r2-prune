@@ -252,6 +252,32 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     expect(state.plan.nextDoc.foreign).toHaveLength(1);
   });
 
+  it("只依赖配置的校验在探测之前做：配置不能用时既不探测，也不发写请求", async () => {
+    const lifecycle = `<LifecycleConfiguration><Rule>
+      <ID>opennext-r2-prune:site-a/nested/old1/</ID><Status>Enabled</Status>
+      <Filter><Prefix>site-a/nested/old1/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>`;
+    const longPrefix = `${"p".repeat(240)}/`;
+    const cases: { prefix: string; dirs: Record<string, string[]>; lifecycle: string | undefined; error: RegExp }[] = [
+      { prefix: "site-a", dirs: { "site-a/": ["live", "old1", "nested"] }, lifecycle, error: /互相嵌套/ },
+      { prefix: longPrefix, dirs: { [longPrefix]: ["live", "old1"] }, lifecycle: undefined, error: /更短的 --prefix/ },
+      { prefix: "", dirs: { "": ["live", "old1"] }, lifecycle: undefined, error: /--allow-root-prefix/ },
+    ];
+    for (const c of cases) {
+      const { store, calls } = sharedBucket(c.dirs, c.lifecycle);
+      let probes = 0;
+      const probe = (async () => {
+        probes++;
+        return new Response("<html>down</html>", { status: 503 });
+      }) as unknown as typeof fetch;
+      await expect(
+        collectPlan({ store, prefix: c.prefix, siteUrl: "https://example.com", fetchImpl: probe }),
+      ).rejects.toThrow(c.error);
+      expect(probes).toBe(0);
+      expect(calls.every((method) => method === "GET")).toBe(true);
+    }
+  });
+
   it("规则 ID 超出长度上限时中止，不发任何写请求", async () => {
     const prefix = `${"p".repeat(240)}/`;
     const { store, calls } = sharedBucket({ [prefix]: ["live", "old1"] });
