@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PlanError, planPrune, prune, type PruneRunOptions, XmlAssumptionError } from "../src/index.ts";
+import { R2Store } from "../src/store.ts";
 import {
   BASELINE_EXPECTED,
   BASELINE_RULES,
@@ -57,6 +58,8 @@ function options(prefix: string, extra: Partial<PruneRunOptions> = {}) {
     prefix,
     md5Base64,
     fetch: spy.impl,
+    // 用例里的 build 都是现场布置的，按默认的 24 小时全都算刚写入；只有专门测它的用例才打开
+    graceHours: 0,
     ...extra,
   };
   return { opts, spy };
@@ -148,6 +151,33 @@ describe("基本流程", () => {
     expect(second.changed).toBe(false);
     expect(second.expire.map((b) => b.state)).toEqual(["pending", "pending"]);
     expect(again.spy.writes()).toEqual([]);
+  });
+
+  it("刚写入的 build 不判作废：真实 R2 的 LastModified 能解析", async () => {
+    await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
+
+    // fresh 不能替保留集充数由 plan.test 直接测 makePlan：经过 collectPlan 时，保留集填错在读写入时间之前就已中止
+    const { opts, spy } = options(SITE_A, { keep: ["build-a"], graceHours: 24 });
+    const planned = await planPrune(opts);
+    expect(planned.keep).toEqual([
+      { buildId: "build-a", reason: "explicit" },
+      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
+    ]);
+    expect(planned.expire).toEqual([]);
+
+    // 写入了多久按 R2 响应的 Date 头算；真实 R2 不带它时会悄悄退回本机时钟
+    const store = new R2Store({
+      endpoint: `https://${env.accountId}.r2.cloudflarestorage.com`,
+      bucket: env.bucket,
+      accessKeyId: env.accessKeyId,
+      secretAccessKey: env.secretAccessKey,
+    });
+    const read = await store.buildWrittenAt(SITE_A, "build-b");
+    expect(read?.serverTime).toBeInstanceOf(Date);
+    expect(Math.abs(read!.serverTime!.getTime() - read!.writtenAt.getTime())).toBeLessThan(3_600_000);
+    expect(planned.changed).toBe(false);
+    expect(spy.writes()).toEqual([]);
+    await expectRules(BASELINE_EXPECTED);
   });
 
   it("目录删空后回收规则，回滚的 build 摘掉规则，改了过期天数就改写规则", async () => {
@@ -334,7 +364,8 @@ describe("CLI", () => {
   function cli(args: string[]) {
     const result = spawnSync(
       process.execPath,
-      ["--experimental-strip-types", "--no-warnings", "src/cli.ts", ...args],
+      // 同 options()：现场布置的 build 都算刚写入。同一开关传两次时以后面的为准，用例可以覆盖
+      ["--experimental-strip-types", "--no-warnings", "src/cli.ts", "--grace-hours", "0", ...args],
       {
         encoding: "utf8",
         timeout: 120_000,

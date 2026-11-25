@@ -36,6 +36,13 @@ export interface RunOptions {
   allowRootPrefix?: boolean;
   /** 规则的过期天数，默认 1 */
   expireDays?: number;
+  /**
+   * 目录写入不满这么多小时的 build 不判作废，默认 24；0 关闭这项检查。OpenNext 部署时先把缓存写进 R2，
+   * 再上传 version、切流量，这段时间里新 build 既不是线上也不在任何 deployment 里，不这样等一等就会被当成作废的删掉
+   */
+  graceHours?: number;
+  /** 当前时间（毫秒），R2 响应没带 Date 头时才用；测试注入用 */
+  now?: () => number;
   fetchImpl?: typeof fetch;
   /** 读 BUILD_ID 重试时的回调 */
   onRetry?: OnRetry;
@@ -119,6 +126,50 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     ...(previews ?? []),
     ...(opts.keep ?? []).map((buildId) => ({ buildId, reason: "explicit" as const })),
   ];
+  const planInput = {
+    existing,
+    current,
+    prefix: opts.prefix,
+    expireDays: opts.expireDays ?? 1,
+    force: opts.force,
+    allowRootPrefix: opts.allowRootPrefix,
+  };
+  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间。这一遍还没排除刚写入的
+  // build，会把它们算成要挂规则的，所以不判规则上限，留给下面的最终计划
+  const first = makePlan({ ...planInput, keep: keeps, skipRuleLimit: true });
+
+  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长
+  const candidates = first.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  const graceMs = (opts.graceHours ?? 24) * 3_600_000;
+  const fresh: KeptBuild[] = [];
+  if (graceMs > 0 && candidates.length > 0) {
+    // 候选全算刚写入时规则最少；这样仍超上限就不必再为每个候选发读请求，直接按上限中止
+    makePlan({
+      ...planInput,
+      keep: [...keeps, ...candidates.map((buildId) => ({ buildId, reason: "fresh" as const }))],
+    });
+
+    const now = (opts.now ?? Date.now)();
+    // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
+    const reading = new AbortController();
+    const writtenAt = await mapWithConcurrency(candidates, concurrency, reading.signal, (buildId) =>
+      opts.store.buildWrittenAt(opts.prefix, buildId, reading.signal).catch((error: unknown) => {
+        reading.abort();
+        throw error;
+      }),
+    );
+    candidates.forEach((buildId, i) => {
+      const read = writtenAt[i];
+      // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
+      if (!read) return;
+      // 用 R2 自己的时钟比：本机时钟走快时拿 Date.now() 比，会把正在部署的 build 算成老的
+      const reference = read.serverTime?.getTime() ?? now;
+      if (reference - read.writtenAt.getTime() < graceMs) {
+        fresh.push({ buildId, reason: "fresh", source: `写入于 ${read.writtenAt.toISOString()}` });
+      }
+    });
+  }
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
 
   return {
     onlineBuildId,
@@ -129,15 +180,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         : null,
     wholeBucketRules: dangerous,
     lifecycle: current,
-    plan: makePlan({
-      existing,
-      keep: keeps,
-      current,
-      prefix: opts.prefix,
-      expireDays: opts.expireDays ?? 1,
-      force: opts.force,
-      allowRootPrefix: opts.allowRootPrefix,
-    }),
+    plan,
   };
 }
 

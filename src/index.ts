@@ -49,6 +49,8 @@ export interface PruneOptions {
   prefix?: string;
   /** 规则的过期天数，默认 1 */
   expireDays?: number;
+  /** 目录写入不满这么多小时的 build 不判作废（可能是还没上线的新部署），默认 24；0 关闭 */
+  graceHours?: number;
   /** 跳过「保留的 build 必须存在于 bucket」这项检查 */
   force?: boolean;
   /** 承认前缀为空（缓存直接放在 bucket 根下） */
@@ -76,6 +78,7 @@ export interface PrunePlanSummary {
   bucket: string;
   prefix: string;
   expireDays: number;
+  graceHours: number;
   /** 想保留的近期线上 build 个数；没给 worker 时为 null */
   recentBuilds: number | null;
   /** siteUrl / buildIdUrl 探测到的线上 build，与 probedFrom 成对 */
@@ -191,6 +194,10 @@ function validate(opts: PruneOptions): void {
   if (!Number.isInteger(expireDays) || expireDays < 1) {
     throw new PruneOptionsError(`expireDays 必须是不小于 1 的整数，收到 ${expireDays}`);
   }
+  const graceHours = opts.graceHours ?? 24;
+  if (!Number.isInteger(graceHours) || graceHours < 0) {
+    throw new PruneOptionsError(`graceHours 必须是不小于 0 的整数，收到 ${graceHours}`);
+  }
   if (opts.recentBuilds !== undefined) {
     if (!Number.isInteger(opts.recentBuilds) || opts.recentBuilds < 1) {
       throw new PruneOptionsError(`recentBuilds 必须是不小于 1 的整数，收到 ${opts.recentBuilds}`);
@@ -208,6 +215,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
   validate(opts);
   const prefix = opts.prefix ?? "incremental-cache";
   const expireDays = opts.expireDays ?? 1;
+  const graceHours = opts.graceHours ?? 24;
   const recentBuilds = opts.worker ? (opts.recentBuilds ?? 3) : null;
 
   const store = new R2Store({
@@ -243,6 +251,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
     force: opts.force,
     allowRootPrefix: opts.allowRootPrefix,
     expireDays,
+    graceHours,
     fetchImpl: opts.fetch,
     onRetry: opts.onRetry,
     onWholeBucketRules: opts.onWholeBucketRules,
@@ -257,6 +266,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
     bucket: opts.bucket,
     prefix,
     expireDays,
+    graceHours,
     recentBuilds,
     onlineBuildId: state.onlineBuildId,
     probedFrom: state.probedFrom,

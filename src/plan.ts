@@ -19,11 +19,15 @@ export const MAX_RULES = 1000;
 
 /**
  * online = 此刻承载线上流量；recent = 近期上过线；preview = 某个 Preview 当前的 build；
- * explicit = --keep 传入。同一个 build 有多个来源时按这个顺序取第一个展示。
+ * explicit = --keep 传入；fresh = 目录刚写入不久，可能是还没上线的新部署。
+ * 同一个 build 有多个来源时按这个顺序取第一个展示。
+ *
+ * fresh 不是对线上状态的判断，只是「暂且不判」：它不算进「保留集不能为空」「保留集必须与现存 build
+ * 有交集」这两条校验，否则一个刚写进 bucket 的 build 就能让填错的前缀或站点蒙混过关。
  */
-export type KeepReason = "online" | "recent" | "preview" | "explicit";
+export type KeepReason = "online" | "recent" | "preview" | "explicit" | "fresh";
 
-const KEEP_PRIORITY: KeepReason[] = ["online", "recent", "preview", "explicit"];
+const KEEP_PRIORITY: KeepReason[] = ["online", "recent", "preview", "explicit", "fresh"];
 
 /**
  * 这两类来源不在 bucket 里是正常的：旧 build 早已删完，预览可能绑了别的 bucket 或还没写缓存。
@@ -37,7 +41,7 @@ export type ExpireState = "new" | "updated" | "pending";
 export interface KeptBuild {
   buildId: string;
   reason: KeepReason;
-  /** 来源细节：预览名、version id 前缀等 */
+  /** 来源细节：预览名、version id 前缀、写入时间等 */
   source?: string;
 }
 
@@ -82,6 +86,11 @@ export interface PlanInput {
   force?: boolean;
   /** 承认「前缀为空、缓存直接放在 bucket 根下」这种布局 */
   allowRootPrefix?: boolean;
+  /**
+   * 跳过「规则总数不超过上限」这条校验。只给 collectPlan 挑候选用：那一遍还没排除刚写入的 build，
+   * 会把它们也算成要挂规则的，拿它判上限会在接近上限时误中止。最终计划必须带着这条校验再算一遍
+   */
+  skipRuleLimit?: boolean;
 }
 
 /**
@@ -173,7 +182,9 @@ export function makePlan(input: PlanInput): PrunePlan {
     if (!MAY_BE_ABSENT.has(build.reason)) mustExist.add(build.buildId);
   }
 
-  if (keepMap.size === 0) {
+  // fresh 只是暂且不判，不能拿它充当保留集，见 KeepReason
+  const judged = new Set(input.keep.filter((b) => b.reason !== "fresh").map((b) => b.buildId));
+  if (judged.size === 0) {
     throw new PlanError("保留集为空，拒绝继续 —— 那会把所有 build 缓存都标记为删除。");
   }
 
@@ -197,7 +208,7 @@ export function makePlan(input: PlanInput): PrunePlan {
   }
 
   const expireIds = existing.filter((id) => !keepMap.has(id));
-  if (expireIds.length > 0 && expireIds.length === existing.length) {
+  if (expireIds.length > 0 && !existing.some((id) => judged.has(id))) {
     throw new PlanError(
       "保留集与 bucket 里现存的 build 没有交集，拒绝把全部 build 缓存标记为删除。",
     );
@@ -235,7 +246,7 @@ export function makePlan(input: PlanInput): PrunePlan {
   }));
 
   const total = current.foreign.length + nextOwn.length;
-  if (total > MAX_RULES) {
+  if (!input.skipRuleLimit && total > MAX_RULES) {
     throw new PlanError(
       `规则总数会达到 ${total} 条，超过 R2 的 ${MAX_RULES} 条上限。` +
         `等已有规则删完后重跑一次即可自动回收，或手动清理 bucket 上的 lifecycle 规则。`,

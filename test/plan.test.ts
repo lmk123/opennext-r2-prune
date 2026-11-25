@@ -77,6 +77,35 @@ describe("安全校验", () => {
     ).toThrow(/没有交集/);
   });
 
+  it("刚写入的 build 不能充当保留集", () => {
+    // 只剩 fresh 时等于什么都没探测到；它也不能替填错的 --keep 撑起「有交集」
+    expect(() => makePlan(input({ keep: [{ buildId: "old1", reason: "fresh" }] }))).toThrow(/保留集为空/);
+    expect(() =>
+      makePlan(
+        input({
+          keep: [
+            { buildId: "bogus", reason: "explicit" },
+            { buildId: "old1", reason: "fresh" },
+          ],
+          force: true,
+        }),
+      ),
+    ).toThrow(/没有交集/);
+  });
+
+  it("刚写入的 build 照常保留，不挂规则", () => {
+    const plan = makePlan(
+      input({
+        keep: [
+          { buildId: "online1", reason: "online" },
+          { buildId: "old1", reason: "fresh" },
+        ],
+      }),
+    );
+    expect(plan.keep.map((b) => b.buildId)).toEqual(["online1", "old1"]);
+    expect(plan.expire.map((b) => b.buildId)).toEqual(["old2"]);
+  });
+
   it("规则总数超过上限时拒绝继续", () => {
     const existing = Array.from({ length: MAX_RULES + 2 }, (_, i) => `b${i}`);
     expect(() =>
