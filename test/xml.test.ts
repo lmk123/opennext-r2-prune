@@ -65,7 +65,7 @@ describe("parseLifecycle", () => {
     <Expiration><Days>30</Days></Expiration>
   </Rule>
   <Rule>
-    <ID>opennext-r2-prune:oldbuild1</ID>
+    <ID>opennext-r2-prune:incremental-cache/oldbuild1/</ID>
     <Status>Enabled</Status>
     <Filter><Prefix>incremental-cache/oldbuild1/</Prefix></Filter>
     <Expiration><Days>1</Days></Expiration>
@@ -73,7 +73,7 @@ describe("parseLifecycle", () => {
 </LifecycleConfiguration>`;
 
   it("按 ID 前缀分拣自有规则与外部规则", () => {
-    const parsed = parseLifecycle(doc);
+    const parsed = parseLifecycle(doc, "incremental-cache");
     expect(parsed.own).toEqual([
       {
         buildId: "oldbuild1",
@@ -87,12 +87,12 @@ describe("parseLifecycle", () => {
   });
 
   it("写回时原样保留外部规则", () => {
-    const parsed = parseLifecycle(doc);
+    const parsed = parseLifecycle(doc, "incremental-cache");
     const xml = renderLifecycle(parsed);
     expect(xml).toContain("<ID>keep-user-logs</ID>");
     expect(xml).toContain("<Prefix>logs/</Prefix>");
     expect(xml).toContain("<Days>30</Days>");
-    expect(xml).toContain("<ID>opennext-r2-prune:oldbuild1</ID>");
+    expect(xml).toContain("<ID>opennext-r2-prune:incremental-cache/oldbuild1/</ID>");
   });
 
   it("外部规则含转义字符也不受影响 —— 它整块原样搬运，不被解析", () => {
@@ -100,17 +100,17 @@ describe("parseLifecycle", () => {
       <ID>tmp &amp; scratch</ID><Status>Enabled</Status>
       <Filter><Prefix>tmp/</Prefix></Filter><Expiration><Days>7</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    const parsed = parseLifecycle(withEntity);
+    const parsed = parseLifecycle(withEntity, "incremental-cache");
     expect(parsed.own).toHaveLength(0);
     expect(renderLifecycle(parsed)).toContain("tmp &amp; scratch");
   });
 
   it("Prefix 直接挂在 Rule 下时记为空前缀 —— R2 不认这种写法，规则实际作用于整个 bucket", () => {
     const bare = `<LifecycleConfiguration><Rule>
-      <ID>opennext-r2-prune:b2</ID><Status>Enabled</Status>
+      <ID>opennext-r2-prune:incremental-cache/b2/</ID><Status>Enabled</Status>
       <Prefix>incremental-cache/b2/</Prefix><Expiration><Days>1</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    expect(parseLifecycle(bare).own).toEqual([
+    expect(parseLifecycle(bare, "incremental-cache").own).toEqual([
       {
         buildId: "b2",
         prefix: "",
@@ -124,22 +124,61 @@ describe("parseLifecycle", () => {
 
   it("没有 Filter 也没有 Prefix 的自有规则，同样记为空前缀", () => {
     const none = `<LifecycleConfiguration><Rule>
-      <ID>opennext-r2-prune:b4</ID><Status>Enabled</Status><Expiration><Days>2</Days></Expiration>
+      <ID>opennext-r2-prune:incremental-cache/b4/</ID><Status>Enabled</Status><Expiration><Days>2</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    expect(parseLifecycle(none).own[0]!.prefix).toBe("");
+    expect(parseLifecycle(none, "incremental-cache").own[0]!.prefix).toBe("");
   });
 
   it("解析出过期天数与状态，好让判定层发现选项变了", () => {
     const doc7 = `<LifecycleConfiguration><Rule>
-      <ID>opennext-r2-prune:b3</ID><Status>Disabled</Status>
+      <ID>opennext-r2-prune:incremental-cache/b3/</ID><Status>Disabled</Status>
       <Filter><Prefix>incremental-cache/b3/</Prefix></Filter><Expiration><Days>7</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    expect(parseLifecycle(doc7).own[0]).toEqual({
+    expect(parseLifecycle(doc7, "incremental-cache").own[0]).toEqual({
       buildId: "b3",
       prefix: "incremental-cache/b3/",
       expireDays: 7,
       enabled: false,
     });
+  });
+});
+
+describe("parseLifecycle 按缓存前缀认领规则", () => {
+  const rule = (id: string, prefix: string) =>
+    `<Rule><ID>${id}</ID><Status>Enabled</Status><Filter><Prefix>${prefix}</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`;
+  const doc = `<LifecycleConfiguration>${[
+    rule("opennext-r2-prune:site-a/b1/", "site-a/b1/"),
+    rule("opennext-r2-prune:site-a/nested/b2/", "site-a/nested/b2/"),
+    rule("opennext-r2-prune:b3/", "b3/"),
+  ].join("")}</LifecycleConfiguration>`;
+
+  it("只认领前缀完全相同的规则，嵌套前缀与根前缀的都算别人的", () => {
+    expect(parseLifecycle(doc, "site-a").own.map((r) => r.buildId)).toEqual(["b1"]);
+    expect(parseLifecycle(doc, "site-a/nested/").own.map((r) => r.buildId)).toEqual(["b2"]);
+    expect(parseLifecycle(doc, "").own.map((r) => r.buildId)).toEqual(["b3"]);
+    expect(parseLifecycle(doc, "site-a").foreign).toHaveLength(2);
+  });
+
+  it("前缀取自 ID：R2 丢掉 Filter 前缀的规则仍认得出是谁的", () => {
+    const dropped = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:site-a/b1/</ID><Status>Enabled</Status>
+      <Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
+    expect(parseLifecycle(dropped, "site-a").own).toEqual([
+      { buildId: "b1", prefix: "", expireDays: 1, enabled: true },
+    ]);
+    expect(parseLifecycle(dropped, "site-b").own).toEqual([]);
+  });
+
+  it("带本工具标记、格式却不对的 ID 直接报错，不猜它属于谁", () => {
+    for (const id of ["opennext-r2-prune:b1", "opennext-r2-prune:", "opennext-r2-prune:/"]) {
+      const xml = `<LifecycleConfiguration>${rule(id, "x/")}</LifecycleConfiguration>`;
+      expect(() => parseLifecycle(xml, "incremental-cache")).toThrow(XmlAssumptionError);
+    }
+  });
+
+  it("写入时 ID 由前缀与 buildId 拼成，与 Filter 前缀对不上的规则拒绝写入", () => {
+    const own = [{ buildId: "b1", prefix: "site-a/b1/", expireDays: 1, enabled: true }];
+    expect(renderLifecycle({ prefix: "site-a/", own, foreign: [] })).toContain("<ID>opennext-r2-prune:site-a/b1/</ID>");
+    expect(() => renderLifecycle({ prefix: "site-b/", own, foreign: [] })).toThrow(XmlAssumptionError);
   });
 });
 
@@ -153,20 +192,20 @@ describe("renderLifecycle", () => {
   });
 
   it("Prefix 一律包在 <Filter> 里，绝不生成裸 <Prefix>", () => {
-    const xml = renderLifecycle({ own: [rule({ expireDays: 2 })], foreign: [] });
+    const xml = renderLifecycle({ prefix: "incremental-cache/", own: [rule({ expireDays: 2 })], foreign: [] });
     expect(xml).toContain("<Filter><Prefix>incremental-cache/b1/</Prefix></Filter>");
     expect(xml.replace(/<Filter><Prefix>[^<]*<\/Prefix><\/Filter>/g, "")).not.toContain("<Prefix>");
     expect(xml).toContain("<Days>2</Days>");
   });
 
   it("拒绝把带可疑字符的 buildId 写进规则", () => {
-    expect(() => renderLifecycle({ own: [rule({ buildId: "b<1" })], foreign: [] })).toThrow(
+    expect(() => renderLifecycle({ prefix: "incremental-cache/", own: [rule({ buildId: "b<1" })], foreign: [] })).toThrow(
       XmlAssumptionError,
     );
   });
 
   it("过期天数不合法时拒绝写入", () => {
-    expect(() => renderLifecycle({ own: [rule({ expireDays: 0 })], foreign: [] })).toThrow(
+    expect(() => renderLifecycle({ prefix: "incremental-cache/", own: [rule({ expireDays: 0 })], foreign: [] })).toThrow(
       XmlAssumptionError,
     );
   });

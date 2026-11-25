@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { makePlan, MAX_RULES, PlanError, type PlanInput, rulePrefix, verifyWritten, wholeBucketRules } from "../src/plan.ts";
+import { makePlan, MAX_RULES, PlanError, type PlanInput, verifyWritten, wholeBucketRules } from "../src/plan.ts";
+import { rulePrefix } from "../src/prefix.ts";
 import type { LifecycleDoc, OwnRule } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
     existing: ["online1", "old1", "old2"],
     keep: [{ buildId: "online1", reason: "online" }],
-    current: { own: [], foreign: [] },
+    current: { prefix: "incremental-cache/", own: [], foreign: [] },
     prefix: "incremental-cache",
     expireDays: 1,
     ...overrides,
@@ -85,12 +86,13 @@ describe("安全校验", () => {
 
   it("外部规则也计入上限", () => {
     const foreign = Array.from({ length: MAX_RULES - 1 }, () => "<ID>x</ID>");
-    expect(() => makePlan(input({ current: { own: [], foreign } }))).toThrow(/上限/);
+    expect(() => makePlan(input({ current: { prefix: "incremental-cache/", own: [], foreign } }))).toThrow(/上限/);
   });
 });
 
 describe("规则合并与回收", () => {
   const withRules = (own: LifecycleDoc["own"], foreign: string[] = []): LifecycleDoc => ({
+    prefix: "incremental-cache/",
     own,
     foreign,
   });
@@ -219,7 +221,7 @@ describe("规则合并与回收", () => {
     // 多一个前导斜杠，规则就作用在一个不存在的 key 空间上，一个对象都删不掉
     expect(rulePrefix("", "abc")).toBe("abc/");
     expect(rulePrefix("/", "abc")).toBe("abc/");
-    const plan = makePlan(input({ prefix: "", allowRootPrefix: true }));
+    const plan = makePlan(input({ prefix: "", allowRootPrefix: true, current: { prefix: "", own: [], foreign: [] } }));
     expect(plan.nextDoc.own.map((r) => r.prefix)).toEqual(["old1/", "old2/"]);
   });
 
@@ -272,7 +274,7 @@ describe("多来源保留集", () => {
           { buildId: "online1", reason: "online" },
           { buildId: "gone", reason: "preview" },
         ],
-        current: { own: [ownRule("gone")], foreign: [] },
+        current: { prefix: "incremental-cache/", own: [ownRule("gone")], foreign: [] },
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
@@ -303,7 +305,7 @@ describe("多来源保留集", () => {
 });
 
 describe("verifyWritten", () => {
-  const doc = { own: [ownRule("old1"), ownRule("old2")], foreign: ["<ID>mine</ID>"] };
+  const doc = { prefix: "incremental-cache/", own: [ownRule("old1"), ownRule("old2")], foreign: ["<ID>mine</ID>"] };
 
   it("读回来一致时没有问题", () => {
     expect(verifyWritten(doc, structuredClone(doc))).toEqual({ own: [], foreign: [] });
@@ -311,6 +313,7 @@ describe("verifyWritten", () => {
 
   it("前缀被丢掉、天数或状态不符、规则缺失或多出，都记为本工具规则的问题；外部规则条数单独列出", () => {
     const actual = {
+      prefix: "incremental-cache/",
       own: [ownRule("old1", { prefix: "", expireDays: 2, enabled: false }), ownRule("extra")],
       foreign: [],
     };
@@ -328,6 +331,7 @@ describe("verifyWritten", () => {
 
   it("同一个 buildId 读回来多条时逐条核对，危险的那条不会被正确的那条盖住", () => {
     const actual = {
+      prefix: "incremental-cache/",
       own: [ownRule("old1", { prefix: "" }), ownRule("old1"), ownRule("old2")],
       foreign: ["<ID>mine</ID>"],
     };
@@ -344,8 +348,8 @@ describe("verifyWritten", () => {
 
 describe("verifyWritten 报出裸 Prefix", () => {
   it("读回来只有裸 <Prefix> 时如实写出原值，并仍按整个 bucket 对待", () => {
-    const doc = { own: [ownRule("old1")], foreign: [] };
-    const actual = { own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })], foreign: [] };
+    const doc = { prefix: "incremental-cache/", own: [ownRule("old1")], foreign: [] };
+    const actual = { prefix: "incremental-cache/", own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })], foreign: [] };
     expect(verifyWritten(doc, actual).own).toEqual([
       "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
     ]);
@@ -356,6 +360,7 @@ describe("verifyWritten 报出裸 Prefix", () => {
 describe("wholeBucketRules", () => {
   it("只挑出启用中、前缀为空的自有规则", () => {
     const doc = {
+      prefix: "incremental-cache/",
       own: [ownRule("ok"), ownRule("bad", { prefix: "" }), ownRule("off", { prefix: "", enabled: false })],
       foreign: [],
     };

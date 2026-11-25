@@ -1,3 +1,5 @@
+import { normalizePrefix, rulePrefix } from "./prefix.ts";
+
 /**
  * 极简 XML 读写，只覆盖本工具用到的两种响应：ListObjectsV2 与 lifecycle 配置。
  *
@@ -91,23 +93,34 @@ export interface OwnRule {
   barePrefix?: string;
 }
 
+/** 从某个缓存前缀的视角分拣出的 lifecycle 配置 */
 export interface LifecycleDoc {
+  /** 分拣时用的缓存前缀（已归一化），own 里的规则都属于它 */
+  prefix: string;
   own: OwnRule[];
-  /** 用户自己配的规则，保留原始 XML 片段，写回时原样放回去 */
+  /** 用户自己配的规则、以及本工具为别的缓存前缀写的规则，保留原始 XML 片段，写回时原样放回去 */
   foreign: string[];
 }
 
 export const RULE_ID_PREFIX = "opennext-r2-prune:";
 
-function ruleId(buildId: string): string {
-  return `${RULE_ID_PREFIX}${buildId}`;
+/**
+ * 规则 ID 是标记加上规则作用的前缀，形如 `opennext-r2-prune:incremental-cache/<buildId>/`。
+ * 必须带上缓存前缀：多个站点共用一个 bucket（各用各的前缀）时，每趟运行只能认领自己前缀下的规则，
+ * 否则会把别家的规则当成目录已空的残留回收掉；两个站点的 buildId 也可能相同（确定性 build id），
+ * 只用 buildId 当 ID 会撞。
+ */
+export function ruleId(prefix: string, buildId: string): string {
+  return `${RULE_ID_PREFIX}${rulePrefix(prefix, buildId)}`;
 }
 
 /**
- * 从 lifecycle 配置 XML 中分拣出「本工具的规则」与「别人的规则」。
- * 归属判定只看 <ID> 是否以 RULE_ID_PREFIX 开头，因此不会误伤任何外部规则。
+ * 从 lifecycle 配置 XML 中分拣出「本工具为 prefix 写的规则」与「其余规则」。
+ * 归属只看 <ID>：以 RULE_ID_PREFIX 开头、且其后的前缀部分恰好等于 prefix。前缀取自 ID 而不是
+ * <Filter><Prefix>，这样被 R2 丢掉前缀的规则仍能认回来、改写掉。别的前缀的规则与外部规则一样原样搬运。
  */
-export function parseLifecycle(xml: string): LifecycleDoc {
+export function parseLifecycle(xml: string, prefix: string): LifecycleDoc {
+  const scope = normalizePrefix(prefix);
   const own: OwnRule[] = [];
   const foreign: string[] = [];
 
@@ -117,7 +130,20 @@ export function parseLifecycle(xml: string): LifecycleDoc {
       foreign.push(block);
       continue;
     }
-    const buildId = assertLiteral(id.slice(RULE_ID_PREFIX.length), "规则 ID 中的 buildId");
+    const target = assertLiteral(id.slice(RULE_ID_PREFIX.length), "规则 ID 中的前缀");
+    // buildId 是一级目录名，不含斜杠，所以最后一段就是 buildId，之前的部分就是缓存前缀
+    const path = target.endsWith("/") ? target.slice(0, -1) : "";
+    const buildId = path.slice(path.lastIndexOf("/") + 1);
+    if (buildId === "") {
+      throw new XmlAssumptionError(
+        `bucket 上有一条规则的 ID 是 ${id}，以本工具的标记开头，却不是「${RULE_ID_PREFIX}<前缀>/<buildId>/」的格式，` +
+          `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这条规则再重跑。`,
+      );
+    }
+    if (path.slice(0, path.length - buildId.length) !== scope) {
+      foreign.push(block);
+      continue;
+    }
     // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
     // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
     const filter = text(block, "Filter");
@@ -134,7 +160,7 @@ export function parseLifecycle(xml: string): LifecycleDoc {
     });
   }
 
-  return { own, foreign };
+  return { prefix: scope, own, foreign };
 }
 
 /**
@@ -145,6 +171,12 @@ export function renderLifecycle(doc: LifecycleDoc): string {
   const rules = doc.own.map((rule) => {
     assertLiteral(rule.buildId, "待写入规则的 buildId");
     assertLiteral(rule.prefix, "待写入规则的 Prefix");
+    // ID 与实际作用的前缀不一致的规则写下去，下一趟会按 ID 认领它，删的却是别处
+    if (rule.prefix !== rulePrefix(doc.prefix, rule.buildId)) {
+      throw new XmlAssumptionError(
+        `待写入规则 ${rule.buildId} 的 Prefix 是 ${rule.prefix}，与缓存前缀「${doc.prefix}」对不上，已中止写入。`,
+      );
+    }
     if (!Number.isInteger(rule.expireDays) || rule.expireDays < 1) {
       throw new XmlAssumptionError(
         `待写入规则 ${rule.buildId} 的过期天数不合法：${rule.expireDays}，S3 要求至少 1 天。`,
@@ -152,7 +184,7 @@ export function renderLifecycle(doc: LifecycleDoc): string {
     }
     return (
       `<Rule>` +
-      `<ID>${ruleId(rule.buildId)}</ID>` +
+      `<ID>${ruleId(doc.prefix, rule.buildId)}</ID>` +
       `<Status>${rule.enabled ? "Enabled" : "Disabled"}</Status>` +
       // 必须包在 <Filter> 里：R2 不认裸 <Prefix>，会悄悄把它丢掉，规则就变成删除整个 bucket
       `<Filter><Prefix>${rule.prefix}</Prefix></Filter>` +

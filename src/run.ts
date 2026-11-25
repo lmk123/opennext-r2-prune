@@ -78,7 +78,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   // 用 allSettled 等两边都落地：列目录失败时整趟也要中止，但读到的危险规则必须先报出来
   const [listed, read] = await Promise.allSettled([
     opts.store.listBuildIds(opts.prefix),
-    opts.store.getLifecycle(),
+    opts.store.getLifecycle(opts.prefix),
   ]);
   const dangerous = read.status === "fulfilled" ? wholeBucketRules(read.value) : [];
   if (dangerous.length > 0) opts.onWholeBucketRules?.(dangerous);
@@ -334,7 +334,7 @@ export interface WriteResult {
    */
   writeError?: unknown;
   /**
-   * 是否撤掉了本工具的全部规则。撤规则只会让删除推迟，绝不会删到数据，所以核对不过（或无从核对）
+   * 是否撤掉了本工具在该前缀下的全部规则。撤规则只会让删除推迟，绝不会删到数据，所以核对不过（或无从核对）
    * 就先撤，等查明原因再重跑。null = 无需撤销；true = 已撤销并回读确认；false = 撤销失败或无法确认。
    */
   rolledBack: boolean | null;
@@ -374,7 +374,7 @@ async function readBack(store: R2Store, expected: LifecycleDoc, opts: VerifyOpti
     if (attempt > 0) await sleep(opts.readBackDelayMs ?? 2000);
     let actual: LifecycleDoc;
     try {
-      actual = await store.getLifecycle();
+      actual = await store.getLifecycle(expected.prefix);
     } catch (error) {
       return { error };
     }
@@ -406,7 +406,7 @@ export class WriteNotAppliedError extends Error {
  * 外部规则逐字比对，不像写后核对那样只比条数。
  */
 export async function assertLifecycleUnchanged(store: R2Store, before: LifecycleDoc): Promise<void> {
-  const now = await store.getLifecycle();
+  const now = await store.getLifecycle(before.prefix);
   if (JSON.stringify(now) === JSON.stringify(before)) return;
   throw new PlanError(
     `写入前重读 lifecycle 配置，发现它在算出计划之后被改过（本工具规则 ${before.own.length} → ${now.own.length} 条，` +
@@ -479,7 +479,7 @@ export async function writeAndVerify(
 
   // 外部规则用写入前读到、本次原样搬运的那份，而不是回读到的：被服务端改掉 ID 的自有规则会被
   // 认成外部规则，照着回读结果写回去就等于把它留下了；回读残缺时还会把用户的规则一并弄丢。
-  const rollbackDoc: LifecycleDoc = { own: [], foreign: doc.foreign };
+  const rollbackDoc: LifecycleDoc = { prefix: doc.prefix, own: [], foreign: doc.foreign };
   try {
     await store.putLifecycle(rollbackDoc);
   } catch (rollbackError) {

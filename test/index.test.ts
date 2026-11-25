@@ -147,7 +147,7 @@ describe("prune", () => {
     const error = await prune({ ...CREDS, ...SITE, fetch: world.fetch }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PruneWriteError);
     expect(error).toMatchObject({ written: false, verified: false, rolledBack: true });
-    expect((error as PruneWriteError).message).toMatch(/已撤掉本工具的全部规则/);
+    expect((error as PruneWriteError).message).toMatch(/已撤掉本工具在该前缀下的全部规则/);
     expect(world.puts()).toHaveLength(2);
   });
 
@@ -156,7 +156,7 @@ describe("prune", () => {
     const error = await prune({ ...CREDS, ...SITE, fetch: world.fetch }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PruneWriteError);
     expect(error).toMatchObject({ written: true, verified: false, rolledBack: false });
-    expect((error as PruneWriteError).message).toMatch(/撤掉本工具的规则时失败了[\s\S]*opennext-r2-prune:\*/);
+    expect((error as PruneWriteError).message).toMatch(/撤掉本工具的规则时失败了[\s\S]*ID 形如 opennext-r2-prune:incremental-cache\/<buildId>\/ 的规则/);
   });
 
   it("endpoint 为空串时按 accountId 拼默认地址", async () => {
@@ -187,7 +187,7 @@ describe("planPrune", () => {
       const error = await planned.apply().catch((e: unknown) => e);
       expect(error).toBeInstanceOf(PruneWriteError);
       expect(error).toMatchObject({ written: true, verified: null, rolledBack: null });
-      expect((error as PruneWriteError).message).toMatch(/无从确认规则是否已写入[\s\S]*opennext-r2-prune:\*/);
+      expect((error as PruneWriteError).message).toMatch(/无从确认规则是否已写入[\s\S]*ID 形如 opennext-r2-prune:incremental-cache\/<buildId>\/ 的规则/);
     } finally {
       hooks.writeAndVerifyThrows = undefined;
     }

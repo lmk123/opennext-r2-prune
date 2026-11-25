@@ -215,6 +215,20 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
 `cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
 
+### 多个站点共用一个 bucket
+
+给每个站点配一个不同的缓存前缀（OpenNext 的 `NEXT_INC_CACHE_R2_PREFIX`），然后对每个站点各跑一次，
+`--prefix` 与 `--worker` / `--url` 一一对应地传；作为库调用时就对每个站点各调一次 `prune` / `planPrune`。
+规则 ID 里带着前缀（`opennext-r2-prune:<前缀>/<buildId>/`），每趟只认领、改写、回收自己前缀下的规则，
+别的前缀的规则和你自己配的规则一样原样保留，两个站点的 build id 相同也不会撞。
+
+- **前缀必须各不相同**。两个站点共用同一个前缀时，每趟的保留集只有本站点的 build，另一个站点的线上
+  build 会被判作废、挂上删除规则 —— 工具识别不出这种配置。
+- **任何一个站点都不能用空前缀**：前缀为空时 bucket 根下的每个一级目录都被当成 build，别的站点的整个前缀
+  目录会被挂上删除规则。
+- **依次运行，不要并发**。几趟运行写的是同一份 lifecycle 配置，写入前的重读只能拦住大部分冲突，挡不住
+  两趟几乎同时写入。
+
 ## 安全设计
 
 删除不可逆，所以这几条是硬性的：
@@ -225,13 +239,14 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - 保留集为空、或保留集与 bucket 里现存的 build 没有交集，都拒绝继续。
 - 要保留的 build 不在 bucket 里时报错退出 —— 通常意味着 bucket、`--prefix` 或域名填错了。
   确认无误可用 `--force` 跳过。
-- **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:<buildId>`，你在 bucket 上配的
-  其它 lifecycle 规则会原样保留。
+- **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:<前缀>/<buildId>/`，每趟运行只认领当前
+  `--prefix` 下的规则；你在 bucket 上配的其它 lifecycle 规则、以及别的前缀下本工具的规则都原样保留。
+  带本工具标记、格式却不对的 ID 会让运行中止，不猜它属于谁。
 - 探测每个 `/BUILD_ID` 时都带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
   把线上正在服务的 build 判成作废 —— 这是它能造成的最坏后果，所以必须绕开缓存。
 - **前缀为空默认拒绝运行**。那意味着把 bucket 根下的每个一级目录都当成 build 缓存，`assets/`、
   `backups/` 这类非缓存目录会一并被挂上删除规则 —— 这是本工具唯一能删到非缓存数据的路径。
-  bucket 确实只用来存 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
+  bucket 确实只用来存一个站点的 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
 - 列出来的 build 目录名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
   降级成警告 —— 那些值会被用来拼删除规则。
 - **写入前重读配置**。确认环节可能隔了很久，写入前再读一次 lifecycle，与算计划时读到的不一致（有人改了规则、
@@ -266,7 +281,9 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 ## 已知限制
 
 - **删除不是即时的**，R2 通常在 24 小时内完成。跑完当场去看 bucket 还是满的，属正常。
-- lifecycle 规则上限 1000 条。工具每次运行会自动回收已经删完的规则，正常使用不会触顶。
+- lifecycle 规则上限 1000 条，所有前缀共用。工具每次运行会自动回收自己前缀下已经删完的规则，正常使用不会触顶。
+- **改了 `--prefix` 之后，旧前缀下的规则就不再归这一趟管**，会一直留在 bucket 上占名额。旧目录删完后，
+  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 以 `opennext-r2-prune:<旧前缀>/` 开头的规则手动删除。
 - Next.js 16.2+ 的 build ID 是确定性的，**回滚到一个已被判定作废的 build 后，应立即手动
   跑一次本工具** —— 它会摘掉那条仍在生效的规则。摘除前 R2 可能已删掉部分缓存，那些页面会
   在下次访问时回源重新渲染。
@@ -310,4 +327,4 @@ pnpm build
 - **权限**：lifecycle 只有 Admin 级 R2 token 能读写，Object 级 token（只读或读写）一律 403，见上文。
 
 写入后可用 `npx wrangler r2 bucket lifecycle list <BUCKET>` 核对规则是否如实写进去了，重点看每条
-`opennext-r2-prune:*` 规则的 `prefix` 是否是 `incremental-cache/<buildId>/`，而不是 `(all prefixes)`。
+`opennext-r2-prune:incremental-cache/<buildId>/` 规则的 `prefix` 是否与 ID 里的路径一致，而不是 `(all prefixes)`。

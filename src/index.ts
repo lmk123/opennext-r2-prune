@@ -3,6 +3,7 @@ import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { assertLifecycleUnchanged, collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
+import { ruleId } from "./xml.ts";
 
 /**
  * 供其它 JS 代码调用的入口。和 run.ts 一样只用 Web 标准 API，Node 与 Cloudflare Worker 里都能跑；
@@ -246,6 +247,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
 
   const { plan } = state;
   let applied = false;
+  // 只点出本次前缀下的规则：同一个 bucket 上别的站点的规则不归这一趟管，叫人全删会误伤
+  const ownRules = `ID 形如 ${ruleId(prefix, "<buildId>")} 的规则`;
 
   return {
     bucket: opts.bucket,
@@ -292,7 +295,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
         const detail = `写入阶段意外出错，无从确认规则是否已写入：${describeError(error)}`;
         throw new PruneWriteError(
           `${detail}\n请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，` +
-            `并手动删除所有 opennext-r2-prune:* 规则，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
+            `并手动删除 ${ownRules}，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
           { detail, written: true, verified: null, rolledBack: null, warnings: [] },
           error,
         );
@@ -313,9 +316,9 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
           ? [...result.problems, `写入后读不回配置，无从核对：${describeError(result.readBackError)}`]
           : result.problems;
       const rollback = result.rolledBack
-        ? "已撤掉本工具的全部规则并回读确认（你自己的规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
+        ? "已撤掉本工具在该前缀下的全部规则并回读确认（其它规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
         : `撤掉本工具的规则时失败了：${describeError(result.rollbackError)}\n` +
-          `请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，并手动删除所有 opennext-r2-prune:* 规则，` +
+          `请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，并手动删除 ${ownRules}，` +
           `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
       throw new PruneWriteError(`写入后回读核对失败：\n  ${reasons.join("\n  ")}\n${rollback}`, {
         detail: `写入后回读核对失败：${reasons.join("；")}`,

@@ -1,4 +1,4 @@
-import { normalizePrefix } from "./prefix.ts";
+import { normalizePrefix, rulePrefix } from "./prefix.ts";
 import type { LifecycleDoc, OwnRule } from "./xml.ts";
 
 /**
@@ -91,6 +91,13 @@ export function makePlan(input: PlanInput): PrunePlan {
     );
   }
 
+  // 规则归属按前缀划分，拿 A 前缀的配置给 B 前缀算计划会把 A 的规则全部回收掉
+  if (normalizePrefix(prefix) !== current.prefix) {
+    throw new PlanError(
+      `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止。`,
+    );
+  }
+
   // 同一个 buildId 可能来自多个来源（既在线上又是某个预览、又被 --keep 传入），按优先级展示；
   // 但「必须在 bucket 里」要看全部来源：--keep 了一个恰好也是历史版本的 id，填错时照样得报出来
   const keepMap = new Map<string, KeptBuild>();
@@ -155,7 +162,7 @@ export function makePlan(input: PlanInput): PrunePlan {
     }));
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
-  // 另一个 --prefix、另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
+  // 另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
   // current.own 中没进 reclaim 的条目，其 buildId 必然落在 expireIds 里，所以这里不会丢规则。
   const nextOwn: OwnRule[] = expireIds.map((buildId) => ({
     buildId,
@@ -180,16 +187,11 @@ export function makePlan(input: PlanInput): PrunePlan {
       state: duplicated.has(rule.buildId) ? "updated" : expireState(currentById.get(rule.buildId), rule),
     })),
     reclaim,
-    nextDoc: { own: nextOwn, foreign: current.foreign },
+    nextDoc: { prefix: current.prefix, own: nextOwn, foreign: current.foreign },
     changed:
       current.own.length !== nextOwn.length ||
       nextOwn.some((rule) => !sameRule(currentById.get(rule.buildId), rule)),
   };
-}
-
-/** 规则作用的前缀。结尾的斜杠不能省，否则某个 buildId 恰是另一个的前缀时会误删。 */
-export function rulePrefix(prefix: string, buildId: string): string {
-  return `${normalizePrefix(prefix)}${buildId}/`;
 }
 
 /** 逐字段比对，任何一项不同都意味着这条规则得重写 —— 只比条数会漏掉选项变更。 */
@@ -269,6 +271,7 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
 }
 
 /**
+ * 只看当前前缀下的规则：别的前缀的规则在这里是外部规则，由那个前缀的运行报出、改写。
  * 启用中、没有 <Filter><Prefix> 的自有规则：它对整个 bucket 生效（旧版 bare 式样被 R2 丢掉前缀后就是
  * 这样）。读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
  */
