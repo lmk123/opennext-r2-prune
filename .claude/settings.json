@@ -9,5 +9,11 @@
   },
   "enabledPlugins": {
     "context-keeper@lmk123": true
+  },
+  "permissions": {
+    "deny": [
+      "Read(//**/.env)",
+      "Edit(//**/.env)"
+    ]
   }
 }
