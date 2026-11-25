@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   makePlan,
   MAX_RULES,
+  otherRuleDir,
   PlanError,
   type PlanInput,
   RESERVED_RULES,
@@ -273,17 +274,32 @@ describe("规则总数上限", () => {
     expect(plan.nextDoc.own.length + plan.nextDoc.foreign.length).toBe(MAX_RULES - RESERVED_RULES);
   });
 
-  it("弃用前缀（下面已经没有对象）的规则加上用户的规则占满名额时中止，并列出那些前缀", () => {
+  it("别的前缀下目录已删空、却没被回收的规则加上用户的规则占满名额时中止，并列出那些前缀", () => {
     const others = otherSite(MAX_RULES - 500);
     expect(() =>
       makePlan(
         input({
           existing: ["online1", "new1"],
           current: { ...lifecycle([], [...foreign(500), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
-          emptyScopes: new Set(["site-b/"]),
+          emptyRuleDirs: new Set(others.map(otherRuleDir)),
         }),
       ),
     ).toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\/[\s\S]*wrangler r2 bucket lifecycle list/);
+  });
+
+  it("别的前缀的规则只按目录已删空的那几条算永久占用，没占满时只推迟、不中止", () => {
+    const others = otherSite(MAX_RULES - 500);
+    const plan = makePlan(
+      input({
+        existing: ["online1", "new1"],
+        current: { ...lifecycle([], [...foreign(500), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
+        // 有一条的目录还没删完：那个前缀的运行删完后会回收它，名额不是永远空不出来
+        emptyRuleDirs: new Set(others.slice(1).map(otherRuleDir)),
+      }),
+    );
+    expect(plan.expire).toEqual([]);
+    expect(plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(plan.changed).toBe(false);
   });
 
   it("名额永远空不出来、但还有回收要写时先照常写入，不中止", () => {
@@ -295,7 +311,7 @@ describe("规则总数上限", () => {
           ...lifecycle([ownRule("online1")], [...foreign(500), ...others.map((rule) => `<ID>${rule.id}</ID>`)]),
           others,
         },
-        emptyScopes: new Set(["site-b/"]),
+        emptyRuleDirs: new Set(others.map(otherRuleDir)),
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "online1", reason: "revived" }]);
@@ -310,7 +326,7 @@ describe("规则总数上限", () => {
       input({
         existing: ["online1", "new1"],
         current: { ...lifecycle([], [...foreign(985), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
-        emptyScopes: new Set(["site-b/"]),
+        emptyRuleDirs: new Set(others.map(otherRuleDir)),
       }),
     );
     expect(plan.expire).toEqual([{ buildId: "new1", state: "new" }]);

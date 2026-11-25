@@ -44,7 +44,7 @@ export type S3Operation = "list" | "writtenAt" | "scopeEmpty" | "getLifecycle" |
 const OPERATION_LABEL: Record<S3Operation, string> = {
   list: "列出 build 目录",
   writtenAt: "读取 build 目录的写入时间",
-  scopeEmpty: "查看别的缓存前缀下还有没有对象",
+  scopeEmpty: "查看别的缓存前缀下挂了规则的目录是否已经删空",
   getLifecycle: "读取 lifecycle 规则",
   putLifecycle: "写入 lifecycle 规则",
   deleteLifecycle: "清空 lifecycle 规则",
@@ -180,12 +180,13 @@ export class R2Store {
   }
 
   /** prefix（原样使用，不再规范化）下一个对象都没有时为 true。只取一个对象，一个请求 */
-  async isEmptyUnder(prefix: string): Promise<boolean> {
+  async isEmptyUnder(prefix: string, signal?: AbortSignal): Promise<boolean> {
     const url = new URL(this.#base);
     url.searchParams.set("list-type", "2");
     url.searchParams.set("prefix", prefix);
     url.searchParams.set("max-keys", "1");
-    const result = parseListObjects(await (await this.#request("scopeEmpty", url.toString())).text());
+    const response = await this.#request("scopeEmpty", url.toString(), undefined, signal);
+    const result = parseListObjects(await response.text());
     return result.lastModified.length === 0 && result.commonPrefixes.length === 0;
   }
 

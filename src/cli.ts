@@ -365,7 +365,7 @@ function printPlan(plan: PrunePlanSummary): void {
   if (plan.deferred.length > 0) {
     console.log(
       `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条；本工具挂规则时一般给你自己的规则留 ${RESERVED_RULES} 条余量，` +
-        `你自己的规则加上弃用前缀下的规则已经挤进这段余量时才挂满 ${MAX_RULES} 条），` +
+        `你自己的规则加上别的前缀下目录已删空、却没被回收的规则已经挤进这段余量时才挂满 ${MAX_RULES} 条），` +
         `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时可能没读写入时间，刚写入的也可能列在这里）：`,
     );
     for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);

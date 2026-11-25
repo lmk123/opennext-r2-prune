@@ -114,10 +114,11 @@ export interface PlanInput {
    */
   skipRuleLimit?: boolean;
   /**
-   * 一个对象都没有的别的缓存前缀（与 others[].scope 同形）。在用的站点前缀下至少有线上 build 的缓存，
-   * 所以这些前缀下本工具写的规则不会有哪一趟去回收，算名额时和用户自己的规则一样当成永久占用
+   * 本工具为别的前缀写的规则里，目录眼下一个对象都没有的那些（键见 otherRuleDir）。目录删完了规则还在，
+   * 说明那个前缀的运行还没回收、也可能再也不会回收（改 --prefix 前的旧前缀），算名额时和用户自己的规则
+   * 一样当成永久占用
    */
-  emptyScopes?: ReadonlySet<string>;
+  emptyRuleDirs?: ReadonlySet<string>;
 }
 
 /**
@@ -264,7 +265,7 @@ export function makePlan(input: PlanInput): PrunePlan {
 
   const { attach, deferred, budget } = input.skipRuleLimit
     ? { attach: new Set(expireIds), deferred: [], budget: undefined }
-    : fitRuleLimit(expireIds, currentById, current, input.writtenAt, input.emptyScopes);
+    : fitRuleLimit(expireIds, currentById, current, input.writtenAt, input.emptyRuleDirs);
 
   // 该删的 build 一律按当前选项重新生成规则，而不是沿用已有的那条：已有规则可能是用
   // 另一个 --expire-days 写下的，或前缀已被服务端丢掉，沿用就等于永远修不好它。
@@ -310,10 +311,15 @@ export interface RuleBudget {
   cap: number;
   /** 用户自己的规则条数 */
   users: number;
-  /** 本工具为已经没有对象的前缀写的规则，眼下看不出有哪一趟会回收 */
+  /** 本工具为别的前缀写的、目录已经删空却还没被回收的规则，眼下看不出有哪一趟会回收 */
   stale: OtherScopeRule[];
   /** 用户的规则加上 stale 就占满了 MAX_RULES：名额永远空不出来 */
   exhausted: boolean;
+}
+
+/** 别的前缀下一条规则作用的 build 目录，即 emptyRuleDirs 的键 */
+export function otherRuleDir(rule: OtherScopeRule): string {
+  return `${rule.scope}${rule.buildId}/`;
 }
 
 /**
@@ -321,12 +327,14 @@ export interface RuleBudget {
  *
  * 总数只挂到上限减去 RESERVED_RULES，给用户自己的规则留余量；永久占用（用户的规则加上 stale）已经挤进
  * 这段余量时让给本工具，否则每轮一条都挂不上。两者要合起来算：只看用户的规则，stale 再占掉几条就会在
- * 还有空位时中止。本工具为别的在用前缀写的规则会被那个前缀的运行回收，不算永久占用。
+ * 还有空位时中止。本工具为别的前缀写的、目录还没删完的规则，R2 删完后那个前缀的运行会回收，不算永久占用。
+ *
+ * stale 按条看目录，不看整个前缀空不空：改 --prefix 前的旧前缀里通常还留着切换时保留的 build（从没挂过规则），
+ * 前缀永远不空，按前缀看就永远认不出它弃用了，推迟会无声地一直持续下去。
  */
-export function ruleBudget(current: ParsedLifecycle, ruled: number, emptyScopes?: ReadonlySet<string>): RuleBudget {
-  // foreign 里也装着本工具为别的前缀写的、以及拆不开的规则的原文，扣掉才是用户自己的
-  const users = current.foreign.length - current.others.length - current.malformed.length;
-  const stale = emptyScopes ? current.others.filter((rule) => emptyScopes.has(rule.scope)) : [];
+export function ruleBudget(current: ParsedLifecycle, ruled: number, emptyRuleDirs?: ReadonlySet<string>): RuleBudget {
+  const users = userRuleCount(current);
+  const stale = emptyRuleDirs ? current.others.filter((rule) => emptyRuleDirs.has(otherRuleDir(rule))) : [];
   const permanent = users + stale.length;
   const cap = permanent >= MAX_RULES - RESERVED_RULES ? MAX_RULES : MAX_RULES - RESERVED_RULES;
   return {
@@ -338,18 +346,31 @@ export function ruleBudget(current: ParsedLifecycle, ruled: number, emptyScopes?
   };
 }
 
+/** 用户自己的规则条数：foreign 里也装着本工具为别的前缀写的、以及拆不开的规则的原文，扣掉才是用户自己的 */
+function userRuleCount(current: ParsedLifecycle): number {
+  return current.foreign.length - current.others.length - current.malformed.length;
+}
+
+/**
+ * 别的前缀的规则全算永久占用时，能不能让名额放宽或永远空不出来（见 ruleBudget）。不能的话，
+ * 去探查它们的目录空不空也改变不了结果，不必发那些请求
+ */
+export function othersCanMatter(current: ParsedLifecycle): boolean {
+  return current.others.length > 0 && userRuleCount(current) + current.others.length >= MAX_RULES - RESERVED_RULES;
+}
+
 function exhaustedMessage(budget: RuleBudget, deferred: number): string {
   const scopes = [...new Set(budget.stale.map((rule) => rule.scope))];
-  // 前缀下没有对象只说明眼下没有：在用的站点也可能恰好所有目录都删空了，所以两种补救都给
+  // 目录删空了规则还在，可能是旧前缀没人回收，也可能是在用的站点还没跑到回收那一趟，所以两种补救都给
   const staleNote =
     budget.stale.length > 0
-      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则还有 ${budget.stale.length} 条——这些前缀下眼下一个对象都没有，` +
+      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则里还有 ${budget.stale.length} 条，作用的目录已经删空却没被回收——` +
         `多半是改 --prefix 前的旧前缀，不会有哪一趟运行回收它们`
       : "";
   const staleFix =
     budget.stale.length > 0
       ? `。那些前缀若其实还有站点在用，让那个站点先跑一趟，它会回收自己已删完的规则；确认已经弃用就手动删掉` +
-        `（规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/，前缀下没有对象，删掉不会误删任何东西）`
+        `（规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/；目录已经删空的那些，删掉不会误删任何东西）`
       : "";
   return (
     `核对 lifecycle 规则名额时中止：R2 每个 bucket 最多 ${MAX_RULES} 条 lifecycle 规则，bucket 上你自己的规则有 ` +
@@ -365,19 +386,19 @@ function exhaustedMessage(budget: RuleBudget, deferred: number): string {
  * 名额（见 ruleBudget）够就全挂，不够时按写入时间从早到晚挂满。推迟的 build 不挂规则也不算保留；
  * R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。
  *
- * 本工具为别的在用前缀写的规则占着名额时只推迟不中止：那个前缀的运行删完会自己回收，中止会让共用 bucket
- * 的另一个站点每趟都失败。名额永远空不出来时由 makePlan 中止。
+ * 本工具为别的前缀写的、目录还没删完的规则占着名额时只推迟不中止：R2 删完后那个前缀的运行会自己回收，
+ * 中止会让共用 bucket 的另一个站点在对方清积压期间每趟都失败。名额永远空不出来时由 makePlan 中止。
  */
 function fitRuleLimit(
   expireIds: string[],
   currentById: ReadonlyMap<string, OwnRule>,
   current: ParsedLifecycle,
   writtenAt: ReadonlyMap<string, Date | null> | undefined,
-  emptyScopes: ReadonlySet<string> | undefined,
+  emptyRuleDirs: ReadonlySet<string> | undefined,
 ): { attach: Set<string>; deferred: string[]; budget: RuleBudget } {
   const ruled = expireIds.filter((id) => currentById.has(id));
   const unruled = expireIds.filter((id) => !currentById.has(id));
-  const budget = ruleBudget(current, ruled.length, emptyScopes);
+  const budget = ruleBudget(current, ruled.length, emptyRuleDirs);
   if (unruled.length <= budget.room) return { attach: new Set(expireIds), deferred: [], budget };
 
   const time = (id: string) => writtenAt?.get(id)?.getTime() ?? Number.POSITIVE_INFINITY;

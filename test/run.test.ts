@@ -24,8 +24,8 @@ function fakeR2(opts: {
   lifecycle?: string;
   writtenAt?: Record<string, string>;
   failWrittenAt?: boolean;
-  /** 下面一个对象都没有的前缀 */
-  emptyScopes?: string[];
+  /** 这些前缀（按前缀匹配）下一个对象都没有 */
+  emptyUnder?: string[];
   /** 读写入时间时响应的 Date 头，即 R2 那边的「此刻」；不给就不带这个头 */
   serverDate?: string;
 }) {
@@ -45,7 +45,7 @@ function fakeR2(opts: {
     // 读写入时间：只要一个对象
     if (url.searchParams.get("max-keys") === "1") {
       if (opts.failWrittenAt) return new Response("<Error><Code>InternalError</Code></Error>", { status: 400 });
-      if (opts.emptyScopes?.includes(url.searchParams.get("prefix")!)) {
+      if (opts.emptyUnder?.some((prefix) => url.searchParams.get("prefix")!.startsWith(prefix))) {
         return new Response("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
       }
       const buildId = url.searchParams.get("prefix")!.split("/")[1]!;
@@ -402,11 +402,12 @@ describe("collectPlan 与规则总数上限", () => {
       ).join("")}</LifecycleConfiguration>`,
     );
 
-  it("名额被弃用前缀（下面已经没有对象）的规则占满时中止，不发任何写请求", async () => {
+  it("名额被旧前缀下目录已删空的规则占满时中止，哪怕旧前缀里还留着没挂规则的 build，不发任何写请求", async () => {
+    // 只有规则作用的目录是空的；site-b/ 本身还有切换前缀时保留下来的 build，按前缀看永远不空
     const { store, calls } = fakeR2({
       buildIds: ["live", "old1"],
       lifecycle: withOtherSite(500, MAX_RULES - 500),
-      emptyScopes: ["site-b/"],
+      emptyUnder: Array.from({ length: MAX_RULES - 500 }, (_, i) => `site-b/b${i}/`),
     });
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
@@ -422,20 +423,67 @@ describe("collectPlan 与规则总数上限", () => {
     const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
     expect(state.plan.deferred).toEqual([{ buildId: "old1" }]);
     expect(state.plan.changed).toBe(false);
-    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix") === "site-b/")).toBe(true);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix")?.startsWith("site-b/"))).toBe(true);
+  });
+
+  it("别的前缀的规则全算上也挤不进余量时，不去看它们的目录", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 501),
+    });
+    // 用户的规则 500 + 别的前缀 489 = 989，留着一个名额给 old1；就算那 489 条都没人回收，也不会让名额放宽或永远空不出来
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix")?.startsWith("site-b/"))).toBe(false);
+  });
+
+  it("一个规则目录读失败时，中止其余在途的探查", async () => {
+    let slowAborted = false;
+    const methods: string[] = [];
+    const lifecycle = withOtherSite(500, MAX_RULES - RESERVED_RULES - 500);
+    const fetchImpl = (async (request: Request, init?: RequestInit) => {
+      methods.push(request.method);
+      const url = new URL(request.url);
+      if (url.searchParams.has("lifecycle")) return new Response(lifecycle);
+      if (url.searchParams.get("max-keys") === "1") {
+        // 失败的排在第一批并发的最后：前面几个请求已经发出、挂着，才看得出它们有没有被中止
+        if (url.searchParams.get("prefix") === "site-b/b7/") {
+          return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
+        }
+        // 一直挂着，直到被中止
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            slowAborted = true;
+            reject(init.signal!.reason);
+          });
+        });
+      }
+      const prefixes = ["live", "old1"]
+        .map((id) => `<CommonPrefixes><Prefix>incremental-cache/${id}/</Prefix></CommonPrefixes>`)
+        .join("");
+      return new Response(`<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`);
+    }) as unknown as typeof fetch;
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now })).rejects.toThrow(
+      /查看别的缓存前缀下挂了规则的目录是否已经删空失败/,
+    );
+    expect(slowAborted).toBe(true);
+    expect(methods).not.toContain("PUT");
   });
 
   it("筛掉刚写入的 build 后名额够用时，不去看别的前缀", async () => {
-    // 只剩一个名额：deploying 刚写入、不占名额，old1 独占，不必再发请求看 site-b/
+    // 用户的规则已达 990 条，上限放宽到 1000，只剩一个名额：deploying 刚写入、不占名额，old1 独占，
+    // 不必再发请求看 site-b/ 下的目录
     const { store, calls } = fakeR2({
       buildIds: ["live", "deploying", "old1"],
-      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 501),
+      lifecycle: withOtherSite(MAX_RULES - RESERVED_RULES, RESERVED_RULES - 1),
       writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
     });
     const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
     expect(state.plan.deferred).toEqual([]);
-    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix") === "site-b/")).toBe(false);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix")?.startsWith("site-b/"))).toBe(false);
   });
 
   it("名额为 0、但弃用前缀的规则让出余量后空出名额时，照常读写入时间并挂规则", async () => {
@@ -443,7 +491,7 @@ describe("collectPlan 与规则总数上限", () => {
     const { store, calls } = fakeR2({
       buildIds: ["live", "deploying", "old1"],
       lifecycle: withOtherSite(985, 5),
-      emptyScopes: ["site-b/"],
+      emptyUnder: ["site-b/"],
       writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
     });
     const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });

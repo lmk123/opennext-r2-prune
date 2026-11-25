@@ -5,6 +5,8 @@ import {
   isWholeBucket,
   type KeptBuild,
   makePlan,
+  otherRuleDir,
+  othersCanMatter,
   PlanError,
   type PrunePlan,
   ruleBudget,
@@ -144,17 +146,26 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   const candidates = draft.expire.filter((b) => b.state === "new").map((b) => b.buildId);
   const ruled = draft.expire.length - candidates.length;
 
-  // 名额不够时才去看别的前缀是不是已经弃用（下面一个对象都没有）：那里的规则没人回收，名额可能永远空不出来
+  // 名额不够时才去看本工具为别的前缀写的规则，作用的目录是不是已经删空：删空了规则还在，可能没人回收，
+  // 名额可能永远空不出来。这些规则全算上也挤不进余量时，看了也改变不了结果，不看
   let budget = ruleBudget(current, ruled);
-  let emptyScopes: Set<string> | undefined;
-  const findEmptyScopes = async () => {
-    const scopes = [...new Set(current.others.map((rule) => rule.scope))];
-    const empty = await mapWithConcurrency(scopes, concurrency, signal, (scope) => opts.store.isEmptyUnder(scope));
-    emptyScopes = new Set(scopes.filter((_, i) => empty[i]));
-    budget = ruleBudget(current, ruled, emptyScopes);
+  let emptyRuleDirs: Set<string> | undefined;
+  const findEmptyRuleDirs = async () => {
+    const dirs = [...new Set(current.others.map(otherRuleDir))];
+    // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
+    const looking = new AbortController();
+    const empty = await mapWithConcurrency(dirs, concurrency, looking.signal, (dir) =>
+      opts.store.isEmptyUnder(dir, looking.signal).catch((error: unknown) => {
+        looking.abort();
+        throw error;
+      }),
+    );
+    emptyRuleDirs = new Set(dirs.filter((_, i) => empty[i]));
+    budget = ruleBudget(current, ruled, emptyRuleDirs);
   };
-  // 名额为 0 时先看：读不读写入时间要看名额是不是永远空不出来，弃用前缀的规则还可能让出余量、空出名额
-  if (candidates.length > 0 && budget.room === 0 && current.others.length > 0) await findEmptyScopes();
+  const othersMatter = othersCanMatter(current);
+  // 名额为 0 时先看：读不读写入时间要看名额是不是永远空不出来，删空目录的规则还可能让出余量、空出名额
+  if (candidates.length > 0 && budget.room === 0 && othersMatter) await findEmptyRuleDirs();
 
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
@@ -184,10 +195,10 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     });
   }
   // 名额还有时，筛掉刚写入的再判断够不够：刚写入的不占名额，筛完够用就不必去看别的前缀
-  if (!emptyScopes && candidates.length - fresh.length > budget.room && current.others.length > 0) {
-    await findEmptyScopes();
+  if (!emptyRuleDirs && candidates.length - fresh.length > budget.room && othersMatter) {
+    await findEmptyRuleDirs();
   }
-  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyScopes });
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyRuleDirs });
 
   return {
     onlineBuildId,
