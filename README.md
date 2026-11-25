@@ -81,6 +81,25 @@ npx opennext-r2-prune \
 R2 API token 的权限见下文「定时任务」一节末尾：`--dry-run` 需要 Admin Read only，写入需要
 Admin Read & Write（Object 级 token 读写不了 lifecycle）。
 
+### 查看写入的规则
+
+工具写的就是 bucket 普通的 Object lifecycle 规则，Cloudflare Dashboard 上能直接看到，和你自己
+配的规则列在一起：
+
+```
+https://dash.cloudflare.com/<账号ID>/r2/default/buckets/<bucket 名>/settings#object-lifecycle-rules
+```
+
+也可以用命令行：
+
+```bash
+npx wrangler r2 bucket lifecycle list <bucket 名>
+```
+
+本工具的规则 ID（即 Dashboard 上的规则名）形如 `opennext-r2-prune:<前缀>/<buildId>/`，前缀为空时是
+`opennext-r2-prune:<buildId>/`。**不要在 Dashboard 上手动改、删当前前缀下的这些规则**，想清理就再跑
+一次工具，它会自己回收已删完的、摘掉不该删的；运行期间改了配置，这一趟会在写入前中止。
+
 ### 它怎么知道该保留哪些 build
 
 `@opennextjs/cloudflare` 不需要任何配置就把 `.next/BUILD_ID` 作为静态资源暴露在
@@ -291,7 +310,7 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - **删除不是即时的**，R2 通常在 24 小时内完成。跑完当场去看 bucket 还是满的，属正常。
 - lifecycle 规则上限 1000 条，所有前缀共用。工具每次运行会自动回收自己前缀下已经删完的规则，正常使用不会触顶。
 - **改了 `--prefix` 之后，旧前缀下的规则就不再归这一趟管**，会一直留在 bucket 上占名额。旧目录删完后，
-  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/`（旧前缀为空时是 `opennext-r2-prune:<buildId>/`）的规则手动删除。
+  在 Dashboard 或用 `npx wrangler r2 bucket lifecycle list`（见「查看写入的规则」）找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/`（旧前缀为空时是 `opennext-r2-prune:<buildId>/`）的规则手动删除。
   新旧前缀互相嵌套（比如改成空前缀，或从 `incremental-cache` 改成 `incremental-cache/v2`）时，删掉这些规则之前
   运行会一直中止。
 - Next.js 16.2+ 的 build ID 是确定性的，**回滚到一个已被判定作废的 build 后，应立即手动
