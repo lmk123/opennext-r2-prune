@@ -42,7 +42,7 @@ export interface RunOptions {
   /** 并发探测预览时的并发数 */
   concurrency?: number;
   /**
-   * 读到现有配置里有对整个 bucket 生效的本工具规则（含别的前缀下的）时立即回调（在探测之前），
+   * 读到现有配置里有对整个 bucket 生效的本工具规则（含别的前缀下的、ID 格式不对的）时立即回调（在探测之前），
    * 参数是这些规则的 ID。探测或校验失败时整趟会中止，调用方拿不到 RunState，靠这个回调才能在
    * 中止前把危险规则报出来。
    */
@@ -68,7 +68,7 @@ export interface RunState {
    * （含线上当前的；少于 --recent-builds 说明全部 deployment 已经翻完了）、有几个预览
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
-  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的本工具规则的 ID，含别的前缀下的 */
+  /** 现有配置里启用中、前缀为空（对整个 bucket 生效）的本工具规则的 ID，含别的前缀下的、ID 格式不对的 */
   wholeBucketRules: string[];
   /** 写入前读到的 lifecycle 配置。写入报错时要拿它判断请求到底生效没有 */
   lifecycle: ParsedLifecycle;

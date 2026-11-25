@@ -174,7 +174,7 @@ export class R2Store {
     } catch (error) {
       // 从未配过规则的 bucket 会返回 404 NoSuchLifecycleConfiguration，那是空配置不是错误
       if (error instanceof S3Error && (error.status === 404 || error.code === "NoSuchLifecycleConfiguration")) {
-        return { prefix: normalizePrefix(prefix), own: [], foreign: [], others: [] };
+        return { prefix: normalizePrefix(prefix), own: [], foreign: [], others: [], malformed: [] };
       }
       throw error;
     }

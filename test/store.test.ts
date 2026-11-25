@@ -99,7 +99,7 @@ describe("lifecycle", () => {
       ok("<Error><Code>NoSuchLifecycleConfiguration</Code></Error>", { status: 404 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    expect(await store.getLifecycle("incremental-cache")).toEqual({ prefix: "incremental-cache/", own: [], foreign: [], others: [] });
+    expect(await store.getLifecycle("incremental-cache")).toEqual({ prefix: "incremental-cache/", own: [], foreign: [], others: [], malformed: [] });
   });
 
   it("其它错误照常抛出", async () => {

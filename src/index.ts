@@ -66,7 +66,7 @@ export interface PruneOptions {
   onRetry?: OnRetry;
   /**
    * 读到 bucket 上有对整个 bucket 生效的本工具规则时立即回调（在探测之前），参数是这些规则的 ID，
-   * 含别的前缀下的。探测或校验失败时整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
+   * 含别的前缀下的、ID 格式不对的。探测或校验失败时整趟会中止、拿不到结果，这是调用方唯一能得知这些危险规则的地方，务必报出来。
    */
   onWholeBucketRules?: (ruleIds: string[]) => void;
 }
@@ -89,7 +89,7 @@ export interface PrunePlanSummary {
    */
   cloudflare: { deploymentsScanned: number; recentBuilds: number; previews: number } | null;
   /**
-   * 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的。只有本次前缀下的
+   * 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的、ID 格式不对的。只有本次前缀下的
    * 会被写入改写，别的前缀下的得手动删除
    */
   wholeBucketRules: string[];

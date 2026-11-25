@@ -219,7 +219,7 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 
 给每个站点配一个不同的缓存前缀（OpenNext 的 `NEXT_INC_CACHE_R2_PREFIX`），然后对每个站点各跑一次，
 `--prefix` 与 `--worker` / `--url` 一一对应地传；作为库调用时就对每个站点各调一次 `prune` / `planPrune`。
-规则 ID 里带着前缀（`opennext-r2-prune:<前缀>/<buildId>/`），每趟只认领、改写、回收自己前缀下的规则，
+规则 ID 是标记加上规则作用的整个前缀（比如 `opennext-r2-prune:incremental-cache/<buildId>/`），每趟只认领、改写、回收自己前缀下的规则，
 别的前缀的规则和你自己配的规则一样原样保留，两个站点的 build id 相同也不会撞。
 
 - **前缀必须各不相同**。两个站点共用同一个前缀时，每趟的保留集只有本站点的 build，另一个站点的线上
@@ -241,9 +241,10 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - 保留集为空、或保留集与 bucket 里现存的 build 没有交集，都拒绝继续。
 - 要保留的 build 不在 bucket 里时报错退出 —— 通常意味着 bucket、`--prefix` 或域名填错了。
   确认无误可用 `--force` 跳过。
-- **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:<前缀>/<buildId>/`，每趟运行只认领当前
-  `--prefix` 下的规则；你在 bucket 上配的其它 lifecycle 规则、以及别的前缀下本工具的规则都原样保留。
-  带本工具标记、格式却不对的 ID 会让运行中止，不猜它属于谁。
+- **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:` 加上规则作用的前缀，比如
+  `opennext-r2-prune:incremental-cache/<buildId>/`（前缀为空时是 `opennext-r2-prune:<buildId>/`，结尾斜杠被服务端去掉也认得出），
+  每趟运行只认领当前 `--prefix` 下的规则；你在 bucket 上配的其它 lifecycle 规则、以及别的前缀下本工具的规则都原样保留。
+  带本工具标记、却拆不出前缀和 buildId 的 ID 会让运行中止，不猜它属于谁（其中对整个 bucket 生效的会先照常报出）。
 - 探测每个 `/BUILD_ID` 时都带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
   把线上正在服务的 build 判成作废 —— 这是它能造成的最坏后果，所以必须绕开缓存。
 - **前缀为空默认拒绝运行**。那意味着把 bucket 根下的每个一级目录都当成 build 缓存，`assets/`、
@@ -275,9 +276,10 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - **已在生效的整 bucket 规则会被醒目报出**。读到本工具的规则没有 `<Filter><Prefix>`（比如被
   R2 丢掉了前缀；读回来若带着裸 `<Prefix>`，R2 也不认，同样按整个 bucket 对待，报错里
   会写出它的原值）时，在探测之前就向 stderr 打出警告，所以即便本次因列目录或探测失败中止、或只是 `--dry-run`，你也
-  能看到它；`--json` 里的 `wholeBucketRules` 列出这些规则的 ID。别的前缀下的也会报出（那个前缀可能已经
-  弃用，再没有运行会报它），但只有当前前缀下的会在写入成功时被改写成正确的前缀，别的得手动删除。
-- 规则 ID 带着整个缓存前缀，按 bucket 里现有的 build 算出的 ID 超过 255 个字符（S3 规范的上限）时在探测之前中止，请换一个更短的前缀。
+  能看到它；`--json` 里的 `wholeBucketRules` 照 bucket 上的原样列出这些规则的 ID。别的前缀下的、ID 格式不对的也会报出
+  （那个前缀可能已经弃用，再没有运行会报它），但只有当前前缀下的会在写入成功时被改写成正确的前缀，别的得手动删除。
+- 规则 ID 带着整个缓存前缀，按 bucket 里现有的目录算出的 ID 超过 255 个字符（S3 规范的上限）时在探测之前中止。
+  报错会分别写出前缀和目录名各占多少字符：前缀太长就换一个更短的，目录名本身就太长时它多半不是 build 缓存目录。
 - 一条规则都不剩时要清空配置。S3 规范不允许不含 `<Rule>` 的配置，R2 文档也没把
   DeleteBucketLifecycle 列为已支持，所以先 PUT 空配置，被当作格式错误（400）拒掉再退回
   `DELETE ?lifecycle`（DELETE 也失败时，报错里会一并写明 PUT 被拒的原因），生效与否由回读核对确认。**这两条路径在 R2 上的实际表现尚未实测。**
@@ -287,7 +289,7 @@ if (planned.changed && (await askSomeone(planned.expire))) {
 - **删除不是即时的**，R2 通常在 24 小时内完成。跑完当场去看 bucket 还是满的，属正常。
 - lifecycle 规则上限 1000 条，所有前缀共用。工具每次运行会自动回收自己前缀下已经删完的规则，正常使用不会触顶。
 - **改了 `--prefix` 之后，旧前缀下的规则就不再归这一趟管**，会一直留在 bucket 上占名额。旧目录删完后，
-  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/` 的规则手动删除。
+  用 `npx wrangler r2 bucket lifecycle list` 找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/`（旧前缀为空时是 `opennext-r2-prune:<buildId>/`）的规则手动删除。
   新旧前缀互相嵌套（比如改成空前缀，或从 `incremental-cache` 改成 `incremental-cache/v2`）时，删掉这些规则之前
   运行会一直中止。
 - Next.js 16.2+ 的 build ID 是确定性的，**回滚到一个已被判定作废的 build 后，应立即手动

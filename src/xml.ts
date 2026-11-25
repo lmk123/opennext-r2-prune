@@ -91,7 +91,15 @@ export interface OwnRule {
    * 规则仍按前缀为空（作用于整个 bucket）对待；留下原值只为报警告时如实说明读到了什么。
    */
   barePrefix?: string;
+  /**
+   * 从 bucket 读出的规则带着原始 <ID>，报给用户时照原样写出，好让人在 lifecycle list 里找得到；
+   * 判定层新生成的规则没有，ID 由 renderLifecycle 拼出
+   */
+  id?: string;
 }
+
+/** 规则里与归属无关的部分 */
+type RuleBody = Omit<OwnRule, "buildId" | "id">;
 
 /** 从某个缓存前缀的视角分拣出的 lifecycle 配置 */
 export interface LifecycleDoc {
@@ -102,9 +110,15 @@ export interface LifecycleDoc {
   foreign: string[];
 }
 
-/** 本工具为别的缓存前缀写的规则。scope 是它所属的缓存前缀（已归一化） */
+/** 本工具为别的缓存前缀写的规则。scope 是它所属的缓存前缀，取自 ID，原样保留不归一化 */
 export interface OtherScopeRule extends OwnRule {
+  id: string;
   scope: string;
+}
+
+/** 带本工具标记、却拆不出「前缀 + buildId」的规则 */
+export interface MalformedRule extends RuleBody {
+  id: string;
 }
 
 /** 从 bucket 读出的配置 */
@@ -114,6 +128,11 @@ export interface ParsedLifecycle extends LifecycleDoc {
    * 只供安全检查用（前缀互相嵌套、对整个 bucket 生效），这一趟从不改写它们
    */
   others: OtherScopeRule[];
+  /**
+   * 带本工具标记、格式却不对的规则，原始片段同样在 foreign 里。解析时不抛错：先让调用方报出其中
+   * 对整个 bucket 生效的，再由 checkLayout 中止
+   */
+  malformed: MalformedRule[];
 }
 
 export const RULE_ID_PREFIX = "opennext-r2-prune:";
@@ -135,13 +154,14 @@ export function ruleId(prefix: string, buildId: string): string {
  * 从 lifecycle 配置 XML 中分拣出「本工具为 prefix 写的规则」与「其余规则」。
  * 归属只看 <ID>：以 RULE_ID_PREFIX 开头、且其后的前缀部分恰好等于 prefix。前缀取自 ID 而不是
  * <Filter><Prefix>，这样被 R2 丢掉前缀的规则仍能认回来、改写掉。别的前缀的规则与外部规则一样原样搬运，
- * 另外解析进 others 供安全检查用。
+ * 另外解析进 others 供安全检查用；拆不开的进 malformed，不在这里抛错。
  */
 export function parseLifecycle(xml: string, prefix: string): ParsedLifecycle {
   const scope = normalizePrefix(prefix);
   const own: OwnRule[] = [];
   const foreign: string[] = [];
   const others: OtherScopeRule[] = [];
+  const malformed: MalformedRule[] = [];
 
   for (const block of blocks(xml, "Rule")) {
     const id = text(block, "ID")?.trim();
@@ -149,29 +169,29 @@ export function parseLifecycle(xml: string, prefix: string): ParsedLifecycle {
       foreign.push(block);
       continue;
     }
-    const target = assertLiteral(id.slice(RULE_ID_PREFIX.length), "规则 ID 中的前缀");
-    // buildId 是一级目录名，不含斜杠，所以最后一段就是 buildId，之前的部分就是缓存前缀
-    const path = target.endsWith("/") ? target.slice(0, -1) : "";
+    const target = id.slice(RULE_ID_PREFIX.length);
+    // buildId 是一级目录名，不含斜杠，所以最后一段就是 buildId，之前的部分就是缓存前缀。
+    // 结尾斜杠可有可无：带 / 的 ID 在 R2 上未实测，被服务端去掉结尾斜杠时仍认得回来
+    const path = target.endsWith("/") ? target.slice(0, -1) : target;
     const buildId = path.slice(path.lastIndexOf("/") + 1);
-    if (buildId === "") {
-      throw new XmlAssumptionError(
-        `bucket 上有一条规则的 ID 是 ${id}，以本工具的标记开头，却不是「${RULE_ID_PREFIX}<前缀>/<buildId>/」的格式，` +
-          `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这条规则再重跑。`,
-      );
+    if (buildId === "" || !LITERAL_SAFE.test(target)) {
+      foreign.push(block);
+      malformed.push({ ...parseRuleBody(block), id });
+      continue;
     }
     const ruleScope = path.slice(0, path.length - buildId.length);
     if (ruleScope !== scope) {
       foreign.push(block);
-      others.push({ ...parseRuleBody(block, buildId), scope: ruleScope });
+      others.push({ buildId, ...parseRuleBody(block), id, scope: ruleScope });
       continue;
     }
-    own.push(parseRuleBody(block, buildId));
+    own.push({ buildId, ...parseRuleBody(block), id });
   }
 
-  return { prefix: scope, own, foreign, others };
+  return { prefix: scope, own, foreign, others, malformed };
 }
 
-function parseRuleBody(block: string, buildId: string): OwnRule {
+function parseRuleBody(block: string): RuleBody {
   // 只认 <Filter><Prefix>：实测 R2 会静默丢掉直接挂在 <Rule> 下的 <Prefix>，那样的规则实际
   // 作用于整个 bucket。读不到 Filter 里的前缀就记为空，判定层会因前缀不符把它改写掉。
   const filter = text(block, "Filter");
@@ -180,7 +200,6 @@ function parseRuleBody(block: string, buildId: string): OwnRule {
   const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
   const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
   return {
-    buildId,
     prefix: assertLiteral(filterPrefix ?? "", "规则中的 Prefix"),
     expireDays: Number.isInteger(days) && days > 0 ? days : 0,
     enabled: text(block, "Status")?.trim() === "Enabled",

@@ -364,7 +364,7 @@ function toJson(plan: PrunePlanSummary) {
     onlineBuildId: plan.onlineBuildId ?? (online.length === 1 ? online[0] : null),
     onlineBuildIds: online,
     cloudflare: plan.cloudflare,
-    // 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的。只有当前前缀下的
+    // 运行前就已对整个 bucket 生效（前缀为空）的本工具规则的 ID，含别的前缀下的、ID 格式不对的。只有当前前缀下的
     // 会在写入成功时被改写，别的前缀下的得手动删除
     wholeBucketRules: plan.wholeBucketRules,
     changed: plan.changed,

@@ -1,5 +1,13 @@
 import { normalizePrefix, rulePrefix } from "./prefix.ts";
-import { type LifecycleDoc, MAX_RULE_ID_LENGTH, type OwnRule, type ParsedLifecycle, ruleId } from "./xml.ts";
+import {
+  type LifecycleDoc,
+  MAX_RULE_ID_LENGTH,
+  type OwnRule,
+  type ParsedLifecycle,
+  RULE_ID_PREFIX,
+  ruleId,
+  XmlAssumptionError,
+} from "./xml.ts";
 
 /**
  * 判定哪些 build 该留、哪些该交给 R2 删，以及最终要写回的规则集。
@@ -103,29 +111,47 @@ export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "pre
     );
   }
 
-  // 外层前缀的「一级目录」里就有内层前缀所在的那一段，外层那一趟会把它当成一个作废 build，
-  // 整个删掉内层站点的缓存。别的前缀写过规则就说明那里有站点在用，两个方向都中止。
-  const nested = [...new Set(current.others.map((rule) => rule.scope))].filter(
-    (scope) => scope.startsWith(current.prefix) || current.prefix.startsWith(scope),
-  );
-  if (nested.length > 0) {
-    const shown = (scope: string) => (scope === "" ? "（空，即 bucket 根）" : scope);
-    throw new PlanError(
-      `bucket 上有本工具为缓存前缀 ${nested.map(shown).join("、")} 写的规则，与本次的前缀 ${shown(current.prefix)} 互相嵌套：` +
-        `外层前缀的运行会把内层前缀所在的目录当成一个 build，判作废后连同另一个站点的缓存整个删掉，已中止。\n` +
-        `请给共用 bucket 的每个站点换成互不嵌套的前缀；若那些前缀已经弃用，用 npx wrangler r2 bucket lifecycle list ` +
-        `找出 ID 形如 ${nested.map((scope) => ruleId(scope, "<buildId>")).join("、")} 的规则手动删除后重跑。`,
+  // 拆不出归属的规则不猜：它可能是任何一个站点的。对整个 bucket 生效的已由调用方先报过
+  if (current.malformed.length > 0) {
+    const listed = current.malformed
+      .map((rule) => (isWholeBucket(rule) ? `${rule.id}（没有 <Filter><Prefix>，正对整个 bucket 生效！）` : rule.id))
+      .join("、");
+    throw new XmlAssumptionError(
+      `bucket 上有规则以本工具的标记开头，却拆不出「${RULE_ID_PREFIX}<规则作用的前缀>」里的缓存前缀与 buildId：${listed}，` +
+        `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这些规则再重跑。`,
     );
   }
 
-  // ID 带着整个缓存前缀，前缀太长时 PUT 会被拒。按 bucket 里现有的每个 build 都算一遍，不等判定出
-  // 哪些作废：今天保留的 build 迟早也会作废、要写规则，早点拦下，好说清是哪个前缀太长
-  const tooLong = existing.map((buildId) => ruleId(prefix, buildId)).find((id) => id.length > MAX_RULE_ID_LENGTH);
-  if (tooLong !== undefined) {
+  // 外层前缀的「一级目录」里就有内层前缀所在的那一段，外层那一趟会把它当成一个作废 build，
+  // 整个删掉内层站点的缓存。别的前缀写过规则就说明那里有站点在用，两个方向都中止。
+  const nested = current.others.filter(
+    (rule) => rule.scope.startsWith(current.prefix) || current.prefix.startsWith(rule.scope),
+  );
+  if (nested.length > 0) {
+    const shown = (scope: string) => (scope === "" ? "（空，即 bucket 根）" : scope);
+    const scopes = [...new Set(nested.map((rule) => rule.scope))];
     throw new PlanError(
-      `build 判作废时要写的规则 ID ${tooLong} 长 ${tooLong.length} 个字符，超过 lifecycle 规则 ID 的 ` +
-        `${MAX_RULE_ID_LENGTH} 字符上限，已中止。ID 里带着整个缓存前缀，请换一个更短的 --prefix` +
-        `（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）。`,
+      `bucket 上有本工具为缓存前缀 ${scopes.map(shown).join("、")} 写的规则，与本次的前缀 ${shown(current.prefix)} 互相嵌套：` +
+        `外层前缀的运行会把内层前缀所在的目录当成一个 build，判作废后连同另一个站点的缓存整个删掉，已中止。\n` +
+        `请给共用 bucket 的每个站点换成互不嵌套的前缀；若那些前缀已经弃用，用 npx wrangler r2 bucket lifecycle list ` +
+        `找出这些规则手动删除后重跑：${nested.map((rule) => rule.id).join("、")}。`,
+    );
+  }
+
+  // ID 带着整个缓存前缀，太长时 PUT 会被拒。按 bucket 里现有的每个目录都算一遍，不等判定出
+  // 哪些作废：今天保留的 build 迟早也会作废、要写规则，早点拦下，好说清是前缀还是目录名太长
+  const tooLong = existing.find((buildId) => ruleId(prefix, buildId).length > MAX_RULE_ID_LENGTH);
+  if (tooLong !== undefined) {
+    const id = ruleId(prefix, tooLong);
+    const prefixLength = normalizePrefix(prefix).length;
+    // 前缀为空时 ID 仍超长，只能是目录名本身太长，换前缀无济于事
+    const fix =
+      ruleId("", tooLong).length > MAX_RULE_ID_LENGTH
+        ? `目录名本身就太长，换前缀也没用：OpenNext 的 build id 不会这么长，请确认它是不是缓存目录，不是就把它移出 ${normalizePrefix(prefix) || "bucket 根"}。`
+        : `请换一个更短的 --prefix（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）；若目录名长得反常，先确认它是不是缓存目录。`;
+    throw new PlanError(
+      `目录 ${tooLong} 判作废时要写的规则 ID ${id} 长 ${id.length} 个字符（缓存前缀占 ${prefixLength}、目录名占 ${tooLong.length}），` +
+        `超过 lifecycle 规则 ID 的 ${MAX_RULE_ID_LENGTH} 字符上限，已中止。${fix}`,
     );
   }
 }
@@ -311,17 +337,19 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
  * 启用中、没有 <Filter><Prefix> 的规则：它对整个 bucket 生效（被 R2 丢掉前缀后就是这样）。
  * 读回来带着裸 <Prefix> 的也算 —— R2 不认那种写法。
  */
-export function isWholeBucket(rule: OwnRule): boolean {
+export function isWholeBucket(rule: Pick<OwnRule, "enabled" | "prefix">): boolean {
   return rule.enabled && rule.prefix === "";
 }
 
 /**
- * 本工具所有对整个 bucket 生效的规则的 ID，别的前缀下的也算：那些前缀可能已经弃用、再没有运行会
- * 报出它们，而它们删的是整个 bucket。只有当前前缀下的会被这一趟改写，其余只能报出来让人手动删。
+ * 本工具所有对整个 bucket 生效的规则的 ID（照 bucket 上的原样），别的前缀下的、格式不对的也算：
+ * 那些前缀可能已经弃用、再没有运行会报出它们，而它们删的是整个 bucket。只有当前前缀下的会被这一趟
+ * 改写，其余只能报出来让人手动删。
  */
 export function wholeBucketRules(doc: ParsedLifecycle): string[] {
   return [
-    ...doc.own.filter(isWholeBucket).map((rule) => ruleId(doc.prefix, rule.buildId)),
-    ...doc.others.filter(isWholeBucket).map((rule) => ruleId(rule.scope, rule.buildId)),
+    ...doc.own.filter(isWholeBucket).map((rule) => rule.id ?? ruleId(doc.prefix, rule.buildId)),
+    ...doc.others.filter(isWholeBucket).map((rule) => rule.id),
+    ...doc.malformed.filter(isWholeBucket).map((rule) => rule.id),
   ];
 }

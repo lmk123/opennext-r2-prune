@@ -289,22 +289,25 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     let puts = 0;
     const store = {
       listBuildIds: async () => ["live", "old1"],
-      getLifecycle: async () => ({ prefix: "site-b/", own: [], foreign: [], others: [] }),
+      getLifecycle: async () => ({ prefix: "site-b/", own: [], foreign: [], others: [], malformed: [] }),
       putLifecycle: async () => void puts++,
     } as unknown as R2Store;
     await expect(collectPlan({ store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/内部错误/);
     expect(puts).toBe(0);
   });
 
-  it("本工具标记的规则 ID 格式不对时中止，不发任何写请求", async () => {
+  it("本工具标记的规则 ID 格式不对时，先报出其中与别处对整个 bucket 生效的，再中止，不发任何写请求", async () => {
     const lifecycle = `<LifecycleConfiguration><Rule>
-      <ID>opennext-r2-prune:old1</ID><Status>Enabled</Status>
-      <Filter><Prefix>incremental-cache/old1/</Prefix></Filter><Expiration><Days>1</Days></Expiration>
+      <ID>opennext-r2-prune:a//</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
+    </Rule><Rule>
+      <ID>opennext-r2-prune:incremental-cache/b2/</ID><Status>Enabled</Status><Expiration><Days>1</Days></Expiration>
     </Rule></LifecycleConfiguration>`;
-    const { store, calls } = sharedBucket({ "incremental-cache/": ["live", "old1"] }, lifecycle);
-    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(
-      /无从判断它属于哪个缓存前缀/,
-    );
+    const { store, calls } = sharedBucket({ "incremental-cache/": ["live", "old1", "b2"] }, lifecycle);
+    const seen: string[][] = [];
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
+    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    expect(seen).toEqual([["opennext-r2-prune:incremental-cache/b2/", "opennext-r2-prune:a//"]]);
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
 });

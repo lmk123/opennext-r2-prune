@@ -80,6 +80,7 @@ describe("parseLifecycle", () => {
         prefix: "incremental-cache/oldbuild1/",
         expireDays: 1,
         enabled: true,
+        id: "opennext-r2-prune:incremental-cache/oldbuild1/",
       },
     ]);
     expect(parsed.foreign).toHaveLength(1);
@@ -118,6 +119,7 @@ describe("parseLifecycle", () => {
         enabled: true,
         // 原值留着只为报警告时说清读到了什么
         barePrefix: "incremental-cache/b2/",
+        id: "opennext-r2-prune:incremental-cache/b2/",
       },
     ]);
   });
@@ -139,6 +141,7 @@ describe("parseLifecycle", () => {
       prefix: "incremental-cache/b3/",
       expireDays: 7,
       enabled: false,
+      id: "opennext-r2-prune:incremental-cache/b3/",
     });
   });
 });
@@ -168,15 +171,25 @@ describe("parseLifecycle 按缓存前缀认领规则", () => {
     const dropped = `<LifecycleConfiguration><Rule><ID>opennext-r2-prune:site-a/b1/</ID><Status>Enabled</Status>
       <Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`;
     expect(parseLifecycle(dropped, "site-a").own).toEqual([
-      { buildId: "b1", prefix: "", expireDays: 1, enabled: true },
+      { buildId: "b1", prefix: "", expireDays: 1, enabled: true, id: "opennext-r2-prune:site-a/b1/" },
     ]);
     expect(parseLifecycle(dropped, "site-b").own).toEqual([]);
   });
 
-  it("带本工具标记、格式却不对的 ID 直接报错，不猜它属于谁", () => {
-    for (const id of ["opennext-r2-prune:b1", "opennext-r2-prune:", "opennext-r2-prune:/"]) {
+  it("ID 的结尾斜杠被去掉时照样认得回来", () => {
+    const xml = `<LifecycleConfiguration>${rule("opennext-r2-prune:site-a/b1", "site-a/b1/")}${rule("opennext-r2-prune:b2", "b2/")}</LifecycleConfiguration>`;
+    expect(parseLifecycle(xml, "site-a").own.map((r) => [r.buildId, r.id])).toEqual([["b1", "opennext-r2-prune:site-a/b1"]]);
+    expect(parseLifecycle(xml, "").own.map((r) => r.buildId)).toEqual(["b2"]);
+  });
+
+  it("带本工具标记、格式却不对的 ID 不抛错，原样搬运并另记进 malformed，不猜它属于谁", () => {
+    for (const id of ["opennext-r2-prune:", "opennext-r2-prune:/", "opennext-r2-prune:a//", "opennext-r2-prune:a b/"]) {
       const xml = `<LifecycleConfiguration>${rule(id, "x/")}</LifecycleConfiguration>`;
-      expect(() => parseLifecycle(xml, "incremental-cache")).toThrow(XmlAssumptionError);
+      const parsed = parseLifecycle(xml, "incremental-cache");
+      expect(parsed.malformed).toEqual([{ id, prefix: "x/", expireDays: 1, enabled: true }]);
+      expect(parsed.own).toEqual([]);
+      expect(parsed.others).toEqual([]);
+      expect(parsed.foreign).toHaveLength(1);
     }
   });
 

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { makePlan, MAX_RULES, PlanError, type PlanInput, verifyWritten, wholeBucketRules } from "../src/plan.ts";
 import { rulePrefix } from "../src/prefix.ts";
-import type { OwnRule, ParsedLifecycle } from "../src/xml.ts";
+import { type OwnRule, type ParsedLifecycle, XmlAssumptionError } from "../src/xml.ts";
 
 function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
     existing: ["online1", "old1", "old2"],
     keep: [{ buildId: "online1", reason: "online" }],
-    current: { prefix: "incremental-cache/", own: [], foreign: [], others: [] },
+    current: { prefix: "incremental-cache/", own: [], foreign: [], others: [], malformed: [] },
     prefix: "incremental-cache",
     expireDays: 1,
     ...overrides,
@@ -86,7 +86,7 @@ describe("安全校验", () => {
 
   it("外部规则也计入上限", () => {
     const foreign = Array.from({ length: MAX_RULES - 1 }, () => "<ID>x</ID>");
-    expect(() => makePlan(input({ current: { prefix: "incremental-cache/", own: [], foreign, others: [] } }))).toThrow(/上限/);
+    expect(() => makePlan(input({ current: { prefix: "incremental-cache/", own: [], foreign, others: [], malformed: [] } }))).toThrow(/上限/);
   });
 });
 
@@ -96,6 +96,7 @@ describe("规则合并与回收", () => {
     own,
     foreign,
     others: [],
+    malformed: [],
   });
 
   it("已经空掉的目录，其规则被回收", () => {
@@ -222,7 +223,7 @@ describe("规则合并与回收", () => {
     // 多一个前导斜杠，规则就作用在一个不存在的 key 空间上，一个对象都删不掉
     expect(rulePrefix("", "abc")).toBe("abc/");
     expect(rulePrefix("/", "abc")).toBe("abc/");
-    const plan = makePlan(input({ prefix: "", allowRootPrefix: true, current: { prefix: "", own: [], foreign: [], others: [] } }));
+    const plan = makePlan(input({ prefix: "", allowRootPrefix: true, current: { prefix: "", own: [], foreign: [], others: [], malformed: [] } }));
     expect(plan.nextDoc.own.map((r) => r.prefix)).toEqual(["old1/", "old2/"]);
   });
 
@@ -275,7 +276,7 @@ describe("多来源保留集", () => {
           { buildId: "online1", reason: "online" },
           { buildId: "gone", reason: "preview" },
         ],
-        current: { prefix: "incremental-cache/", own: [ownRule("gone")], foreign: [], others: [] },
+        current: { prefix: "incremental-cache/", own: [ownRule("gone")], foreign: [], others: [], malformed: [] },
       }),
     );
     expect(plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
@@ -355,6 +356,7 @@ describe("verifyWritten 报出裸 Prefix", () => {
       own: [ownRule("old1", { prefix: "", barePrefix: "incremental-cache/old1/" })],
       foreign: [],
       others: [],
+      malformed: [],
     };
     expect(verifyWritten(doc, actual).own).toEqual([
       "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
@@ -370,31 +372,42 @@ describe("wholeBucketRules", () => {
       own: [ownRule("ok"), ownRule("bad", { prefix: "" }), ownRule("off", { prefix: "", enabled: false })],
       foreign: [],
       others: [],
+      malformed: [],
     };
     expect(wholeBucketRules(doc)).toEqual(["opennext-r2-prune:incremental-cache/bad/"]);
   });
 
-  it("别的前缀下的也报出来：那个前缀可能已经弃用，再没有运行会报它", () => {
+  it("别的前缀下的、格式不对的也报出来，且照 bucket 上的原样写出 ID", () => {
     const doc = {
       prefix: "incremental-cache/",
-      own: [],
+      own: [ownRule("b0", { prefix: "", id: "opennext-r2-prune:incremental-cache/b0" })],
       foreign: [],
       others: [
-        { ...ownRule("b1", { prefix: "" }), scope: "old-cache/" },
-        { ...ownRule("b2", { prefix: "old-cache/b2/" }), scope: "old-cache/" },
+        // 前导斜杠的 scope 重新拼 ID 会被归一化掉，用户照着找不到
+        { ...ownRule("b1", { prefix: "" }), id: "opennext-r2-prune:/old-cache/b1/", scope: "/old-cache/" },
+        { ...ownRule("b2", { prefix: "old-cache/b2/" }), id: "opennext-r2-prune:old-cache/b2/", scope: "old-cache/" },
+      ],
+      malformed: [
+        { id: "opennext-r2-prune:", prefix: "", expireDays: 1, enabled: true },
+        { id: "opennext-r2-prune:/", prefix: "x/", expireDays: 1, enabled: true },
       ],
     };
-    expect(wholeBucketRules(doc)).toEqual(["opennext-r2-prune:old-cache/b1/"]);
+    expect(wholeBucketRules(doc)).toEqual([
+      "opennext-r2-prune:incremental-cache/b0",
+      "opennext-r2-prune:/old-cache/b1/",
+      "opennext-r2-prune:",
+    ]);
   });
 });
 
 describe("多个前缀共用 bucket", () => {
-  const other = (scope: string) => ({ ...ownRule("x", { prefix: `${scope}x/` }), scope });
+  const other = (scope: string) => ({ ...ownRule("x", { prefix: `${scope}x/` }), id: `opennext-r2-prune:${scope}x/`, scope });
   const withOthers = (prefix: string, ...scopes: string[]): ParsedLifecycle => ({
     prefix,
     own: [],
     foreign: scopes.map(() => "<ID>placeholder</ID>"),
     others: scopes.map(other),
+    malformed: [],
   });
 
   it("别的前缀与本前缀互不嵌套时照常计算", () => {
@@ -420,9 +433,38 @@ describe("多个前缀共用 bucket", () => {
     ).toThrow(/互相嵌套/);
   });
 
+  it("别的前缀嵌套时，报错里照原样列出那些规则的 ID", () => {
+    expect(() => makePlan(input({ current: withOthers("incremental-cache/", "incremental-cache/nested/") }))).toThrow(
+      "opennext-r2-prune:incremental-cache/nested/x/",
+    );
+  });
+
   it("规则 ID 超出长度上限时中止，说明是前缀太长", () => {
     const prefix = `${"p".repeat(240)}/`;
     expect(() => makePlan(input({ prefix, current: withOthers(prefix) }))).toThrow(/更短的 --prefix/);
+  });
+
+  it("目录名本身就让 ID 超长时，不叫人换前缀", () => {
+    const long = "d".repeat(240);
+    const error = (() => {
+      try {
+        makePlan(input({ existing: ["online1", long], current: withOthers("incremental-cache/") }));
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(error).toBeInstanceOf(PlanError);
+    expect(error!.message).toMatch(/目录名本身就太长/);
+    expect(error!.message).not.toMatch(/更短的 --prefix/);
+  });
+
+  it("有格式不对的本工具规则时中止，并点出其中对整个 bucket 生效的", () => {
+    const current = {
+      ...withOthers("incremental-cache/"),
+      malformed: [{ id: "opennext-r2-prune:", prefix: "", expireDays: 1, enabled: true }],
+    };
+    expect(() => makePlan(input({ current }))).toThrow(XmlAssumptionError);
+    expect(() => makePlan(input({ current }))).toThrow(/opennext-r2-prune:（没有 <Filter><Prefix>，正对整个 bucket 生效！）/);
   });
 
   it("计划用的前缀与配置分拣时的前缀不一致时中止", () => {
