@@ -51,7 +51,7 @@ const USAGE = `用法：opennext-r2-prune [选项]
   --grace-hours <n>            目录写入不满 n 小时的 build 不判作废，默认 24；0 关闭
                                OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住。
                                规则名额不够、要分批挂时，也按这里读到的写入时间先挂最老的；为 0 时按 build id 挑。
-                               名额一条不剩时不读写入时间
+                               名额一条不剩时不读写入时间（名额永远空不出来、要中止时照读）
   --dry-run                    只打印计划，不写入
   --yes, -y                    跳过确认。非交互环境下必须显式传
   --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段；
@@ -363,8 +363,9 @@ function printPlan(plan: PrunePlanSummary): void {
 
   if (plan.deferred.length > 0) {
     console.log(
-      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条，本工具挂规则时给你自己的规则留 ${RESERVED_RULES} 条余量），` +
-        `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时不读写入时间，刚写入的也列在这里）：`,
+      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条；本工具挂规则时一般给你自己的规则留 ${RESERVED_RULES} 条余量，` +
+        `你自己的规则加上弃用前缀下的规则已经挤进这段余量时才挂满 ${MAX_RULES} 条），` +
+        `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时可能没读写入时间，刚写入的也可能列在这里）：`,
     );
     for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
     console.log(

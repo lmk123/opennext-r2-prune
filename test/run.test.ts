@@ -323,7 +323,7 @@ describe("collectPlan 与规则总数上限", () => {
   it("名额被弃用前缀（下面已经没有对象）的规则占满时中止，不发任何写请求", async () => {
     const { store, calls } = fakeR2({
       buildIds: ["live", "old1"],
-      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 500),
+      lifecycle: withOtherSite(500, MAX_RULES - 500),
       emptyScopes: ["site-b/"],
     });
     await expect(
@@ -341,6 +341,34 @@ describe("collectPlan 与规则总数上限", () => {
     expect(state.plan.deferred).toEqual([{ buildId: "old1" }]);
     expect(state.plan.changed).toBe(false);
     expect(calls.some((c) => new URL(c.url).searchParams.get("prefix") === "site-b/")).toBe(true);
+  });
+
+  it("筛掉刚写入的 build 后名额够用时，不去看别的前缀", async () => {
+    // 只剩一个名额：deploying 刚写入、不占名额，old1 独占，不必再发请求看 site-b/
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 501),
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([]);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix") === "site-b/")).toBe(false);
+  });
+
+  it("名额为 0、但弃用前缀的规则让出余量后空出名额时，照常读写入时间并挂规则", async () => {
+    // 用户 985 条 + 弃用前缀 5 条：只算用户的规则时名额为 0，算上弃用前缀后上限放宽到 1000
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1"],
+      lifecycle: withOtherSite(985, 5),
+      emptyScopes: ["site-b/"],
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live", "deploying"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
   it("graceHours 为 0 时不读写入时间，名额不够就按 buildId 挑", async () => {

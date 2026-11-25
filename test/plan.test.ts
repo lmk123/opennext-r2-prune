@@ -274,7 +274,7 @@ describe("规则总数上限", () => {
   });
 
   it("弃用前缀（下面已经没有对象）的规则加上用户的规则占满名额时中止，并列出那些前缀", () => {
-    const others = otherSite(MAX_RULES - RESERVED_RULES - 500);
+    const others = otherSite(MAX_RULES - 500);
     expect(() =>
       makePlan(
         input({
@@ -287,7 +287,7 @@ describe("规则总数上限", () => {
   });
 
   it("名额永远空不出来、但还有回收要写时先照常写入，不中止", () => {
-    const others = otherSite(MAX_RULES - RESERVED_RULES - 500);
+    const others = otherSite(MAX_RULES - 500);
     const plan = makePlan(
       input({
         existing: ["online1", "new1"],
@@ -300,6 +300,21 @@ describe("规则总数上限", () => {
     );
     expect(plan.reclaim).toEqual([{ buildId: "online1", reason: "revived" }]);
     expect(plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(plan.changed).toBe(true);
+  });
+
+  it("弃用前缀的规则和用户的规则合起来挤进余量时让出余量，不中止", () => {
+    // 用户 985 条 + 弃用前缀 5 条 = 990：只看用户的规则不会让出余量，就会在还空着 10 条时中止
+    const others = otherSite(5);
+    const plan = makePlan(
+      input({
+        existing: ["online1", "new1"],
+        current: { ...lifecycle([], [...foreign(985), ...others.map((rule) => `<ID>${rule.id}</ID>`)]), others },
+        emptyScopes: new Set(["site-b/"]),
+      }),
+    );
+    expect(plan.expire).toEqual([{ buildId: "new1", state: "new" }]);
+    expect(plan.deferred).toEqual([]);
     expect(plan.changed).toBe(true);
   });
 

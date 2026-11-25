@@ -310,48 +310,50 @@ export interface RuleBudget {
   cap: number;
   /** 用户自己的规则条数 */
   users: number;
-  /** 本工具为已经没有对象的前缀写的规则，没有哪一趟会回收 */
+  /** 本工具为已经没有对象的前缀写的规则，眼下看不出有哪一趟会回收 */
   stale: OtherScopeRule[];
-  /** 用户的规则加上 stale 就占满了 cap：名额永远空不出来 */
+  /** 用户的规则加上 stale 就占满了 MAX_RULES：名额永远空不出来 */
   exhausted: boolean;
 }
 
 /**
  * 核算 lifecycle 规则名额。ruled 是这一趟留着已有规则的作废 build 个数。
  *
- * 总数只挂到上限减去 RESERVED_RULES，给用户自己的规则留余量；用户的规则已经挤进这段余量时让给本工具，
- * 否则每轮一条都挂不上。本工具为别的在用前缀写的规则会被那个前缀的运行回收，不算永久占用。
+ * 总数只挂到上限减去 RESERVED_RULES，给用户自己的规则留余量；永久占用（用户的规则加上 stale）已经挤进
+ * 这段余量时让给本工具，否则每轮一条都挂不上。两者要合起来算：只看用户的规则，stale 再占掉几条就会在
+ * 还有空位时中止。本工具为别的在用前缀写的规则会被那个前缀的运行回收，不算永久占用。
  */
 export function ruleBudget(current: ParsedLifecycle, ruled: number, emptyScopes?: ReadonlySet<string>): RuleBudget {
   // foreign 里也装着本工具为别的前缀写的、以及拆不开的规则的原文，扣掉才是用户自己的
   const users = current.foreign.length - current.others.length - current.malformed.length;
   const stale = emptyScopes ? current.others.filter((rule) => emptyScopes.has(rule.scope)) : [];
-  const cap = users >= MAX_RULES - RESERVED_RULES ? MAX_RULES : MAX_RULES - RESERVED_RULES;
+  const permanent = users + stale.length;
+  const cap = permanent >= MAX_RULES - RESERVED_RULES ? MAX_RULES : MAX_RULES - RESERVED_RULES;
   return {
     room: Math.max(0, cap - current.foreign.length - ruled),
     cap,
     users,
     stale,
-    exhausted: users + stale.length >= cap,
+    exhausted: permanent >= MAX_RULES,
   };
 }
 
 function exhaustedMessage(budget: RuleBudget, deferred: number): string {
   const scopes = [...new Set(budget.stale.map((rule) => rule.scope))];
+  // 前缀下没有对象只说明眼下没有：在用的站点也可能恰好所有目录都删空了，所以两种补救都给
   const staleNote =
     budget.stale.length > 0
-      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则还有 ${budget.stale.length} 条——这些前缀下已经一个对象都没有，` +
-        `没有站点在用，不会有哪一趟运行回收它们`
+      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则还有 ${budget.stale.length} 条——这些前缀下眼下一个对象都没有，` +
+        `多半是改 --prefix 前的旧前缀，不会有哪一趟运行回收它们`
       : "";
-  const capNote =
-    budget.cap < MAX_RULES ? `，本工具挂规则时最多挂到 ${budget.cap} 条、给你自己的规则留 ${RESERVED_RULES} 条余量` : "";
   const staleFix =
     budget.stale.length > 0
-      ? `（弃用前缀下的规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/，确认那个前缀确实弃用后删掉）`
+      ? `。那些前缀若其实还有站点在用，让那个站点先跑一趟，它会回收自己已删完的规则；确认已经弃用就手动删掉` +
+        `（规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/，前缀下没有对象，删掉不会误删任何东西）`
       : "";
   return (
     `核对 lifecycle 规则名额时中止：R2 每个 bucket 最多 ${MAX_RULES} 条 lifecycle 规则，bucket 上你自己的规则有 ` +
-    `${budget.users} 条${staleNote}${capNote}，名额永远空不出来，${deferred} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
+    `${budget.users} 条${staleNote}，名额永远空不出来，${deferred} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
     `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉${staleFix}，空出名额后重跑。`
   );
 }

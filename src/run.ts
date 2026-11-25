@@ -147,12 +147,14 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
   // 名额不够时才去看别的前缀是不是已经弃用（下面一个对象都没有）：那里的规则没人回收，名额可能永远空不出来
   let budget = ruleBudget(current, ruled);
   let emptyScopes: Set<string> | undefined;
-  if (candidates.length > budget.room && current.others.length > 0) {
+  const findEmptyScopes = async () => {
     const scopes = [...new Set(current.others.map((rule) => rule.scope))];
     const empty = await mapWithConcurrency(scopes, concurrency, signal, (scope) => opts.store.isEmptyUnder(scope));
     emptyScopes = new Set(scopes.filter((_, i) => empty[i]));
     budget = ruleBudget(current, ruled, emptyScopes);
-  }
+  };
+  // 名额为 0 时先看：读不读写入时间要看名额是不是永远空不出来，弃用前缀的规则还可能让出余量、空出名额
+  if (candidates.length > 0 && budget.room === 0 && current.others.length > 0) await findEmptyScopes();
 
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
@@ -171,6 +173,10 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
         fresh.push({ buildId, reason: "fresh", source: `写入于 ${time.toISOString()}` });
       }
     }
+  }
+  // 名额还有时，筛掉刚写入的再判断够不够：刚写入的不占名额，筛完够用就不必去看别的前缀
+  if (!emptyScopes && candidates.length - fresh.length > budget.room && current.others.length > 0) {
+    await findEmptyScopes();
   }
   const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyScopes });
 
