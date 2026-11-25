@@ -9,5 +9,25 @@
   },
   "enabledPlugins": {
     "context-keeper@lmk123": true
+  },
+  "permissions": {
+    "deny": [
+      "Read(//**/.env)",
+      "Edit(//**/.env)",
+      "Read(//**/.env.local)",
+      "Edit(//**/.env.local)",
+      "Read(//**/.env.*.local)",
+      "Edit(//**/.env.*.local)",
+      "Read(//**/.env.development)",
+      "Edit(//**/.env.development)",
+      "Read(//**/.env.test)",
+      "Edit(//**/.env.test)",
+      "Read(//**/.env.staging)",
+      "Edit(//**/.env.staging)",
+      "Read(//**/.env.production)",
+      "Edit(//**/.env.production)",
+      "Read(//**/.secrets/**)",
+      "Edit(//**/.secrets/**)"
+    ]
   }
 }

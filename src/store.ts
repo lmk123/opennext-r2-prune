@@ -183,7 +183,7 @@ export class R2Store {
   /**
    * 整份覆盖 lifecycle 配置。一条规则都不剩时走清空：S3 规范不允许不含 <Rule> 的配置，
    * 而 R2 文档既没写它对空配置的态度，也没把 DeleteBucketLifecycle 列为已支持。所以先按 PUT
-   * 试，被当成格式错误（400）拒掉再退回 DELETE。到底生效没有，由调用方的回读核对确认。
+   * 试（实测 R2 接受），被当成格式错误（400）拒掉再退回 DELETE，留给别的 S3 实现。到底生效没有，由调用方的回读核对确认。
    */
   async putLifecycle(doc: LifecycleDoc): Promise<void> {
     const body = renderLifecycle(doc);
