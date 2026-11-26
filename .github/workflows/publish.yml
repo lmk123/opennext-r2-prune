@@ -1,0 +1,45 @@
+# 推送 v* tag 时发布到 npm。
+# 用 npm Trusted Publishing（OIDC）认证，不需要 NPM_TOKEN；需要先在 npmjs.com 包设置的
+# Trusted Publisher 里登记本仓库和这个文件名（publish.yml），改文件名要同步改那边。
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # Trusted Publishing 靠 OIDC token 认证，同时自动生成 provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          # Trusted Publishing 需要 npm >= 11.5.1，Node 24 自带的 npm 满足
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - name: 核对 tag 与 package.json 版本一致
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 package.json 的版本 ${version} 不一致：删掉这个 tag，改好版本号合并后重新打 v${version}"
+            exit 1
+          fi
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # 用 npm 而不是 pnpm 发布：Trusted Publishing 由 npm CLI 实现；prepare 会先重新构建 dist
+      - run: npm publish
