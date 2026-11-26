@@ -5,12 +5,16 @@ import {
   isWholeBucket,
   type KeptBuild,
   makePlan,
+  otherRuleDir,
+  othersCanMatter,
   PlanError,
   type PrunePlan,
+  ruleBudget,
   type VerifyProblems,
   verifyWritten,
   wholeBucketRules,
 } from "./plan.ts";
+import { rulePrefix } from "./prefix.ts";
 import type { OnRetry } from "./retry.ts";
 import { type R2Store, S3Error } from "./store.ts";
 import { type LifecycleDoc, type ParsedLifecycle, XmlAssumptionError } from "./xml.ts";
@@ -134,32 +138,57 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
     force: opts.force,
     allowRootPrefix: opts.allowRootPrefix,
   };
-  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间。这一遍还没排除刚写入的
-  // build，会把它们算成要挂规则的，所以不判规则上限，留给下面的最终计划
-  const first = makePlan({ ...planInput, keep: keeps, skipRuleLimit: true });
+  // 先按探测结果算一遍：保留集本身有问题时直接报出来，不必再去读写入时间。
+  // 这一遍不管规则名额：刚写入的 build 还没筛掉，算进去会白占名额，甚至让本可以继续的一趟中止
+  const draft = makePlan({ ...planInput, keep: keeps, skipRuleLimit: true });
 
-  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长
-  const candidates = first.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  // 只看本次要新挂规则的：已有规则的 build 挂规则时就看过了，每趟都重看会让请求数随 build 数增长。
+  // 顺带拿到的写入时间也决定名额不够时先挂谁；--grace-hours 0 时不读，名额不够就按 buildId 挑
+  const candidates = draft.expire.filter((b) => b.state === "new").map((b) => b.buildId);
+  const ruled = draft.expire.length - candidates.length;
+
+  // 名额为 0 时才去看本工具为别的前缀写的规则，作用的目录是不是已经删空：删空了规则还在，可能没人回收，
+  // 名额可能永远空不出来，也可能让出余量。名额还有时看了也改变不了结果：别的前缀的规则多到能起作用，
+  // 上限就已经放宽到 MAX_RULES，而名额永远空不出来意味着名额为 0。这些规则全算上也挤不进余量时同理，不看。
+  // 按前缀各列一遍目录，不逐条探查：名额为 0 时每趟都要看，逐条看请求数会随别的前缀的规则数增长
+  let budget = ruleBudget(current, ruled);
+  let emptyRuleDirs: Set<string> | undefined;
+  const findEmptyRuleDirs = async () => {
+    const scopes = [...new Set(current.others.map((rule) => rule.scope))];
+    // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
+    const looking = new AbortController();
+    const listed = await mapWithConcurrency(scopes, concurrency, looking.signal, (scope) =>
+      opts.store.listBuildIds(scope, looking.signal, "listOtherScope").catch((error: unknown) => {
+        looking.abort();
+        throw error;
+      }),
+    );
+    // 按归一化后的前缀拼：ID 里的前缀不规范的规则，哪一趟都不会认领它，理应算作没人回收
+    const present = new Set(scopes.flatMap((scope, i) => listed[i]!.map((buildId) => rulePrefix(scope, buildId))));
+    emptyRuleDirs = new Set(current.others.map(otherRuleDir).filter((dir) => !present.has(dir)));
+    budget = ruleBudget(current, ruled, emptyRuleDirs);
+  };
+  // 在读写入时间之前看：读不读要看名额是不是永远空不出来，删空目录的规则还可能让出余量、空出名额
+  if (candidates.length > 0 && budget.room === 0 && othersCanMatter(current)) await findEmptyRuleDirs();
+
   const graceMs = (opts.graceHours ?? 24) * 3_600_000;
   const fresh: KeptBuild[] = [];
-  if (graceMs > 0 && candidates.length > 0) {
-    // 候选全算刚写入时规则最少；这样仍超上限就不必再为每个候选发读请求，直接按上限中止
-    makePlan({
-      ...planInput,
-      keep: [...keeps, ...candidates.map((buildId) => ({ buildId, reason: "fresh" as const }))],
-    });
-
+  let writtenAt: Map<string, Date | null> | undefined;
+  // 名额为 0 时一条也挂不上，不必读：积压大时每轮都逐个读，请求数随积压增长。名额永远空不出来时仍要读，
+  // 好分清要中止的是不是全是刚写入的 build
+  if (graceMs > 0 && candidates.length > 0 && (budget.room > 0 || budget.exhausted)) {
     const now = (opts.now ?? Date.now)();
     // 一个读失败整趟就已失败：中止其余在途请求，别让还在退避重试的请求把进程拖住
     const reading = new AbortController();
-    const writtenAt = await mapWithConcurrency(candidates, concurrency, reading.signal, (buildId) =>
+    const reads = await mapWithConcurrency(candidates, concurrency, reading.signal, (buildId) =>
       opts.store.buildWrittenAt(opts.prefix, buildId, reading.signal).catch((error: unknown) => {
         reading.abort();
         throw error;
       }),
     );
+    writtenAt = new Map(candidates.map((buildId, i) => [buildId, reads[i]?.writtenAt ?? null]));
     candidates.forEach((buildId, i) => {
-      const read = writtenAt[i];
+      const read = reads[i];
       // 目录在列举之后被删空了就没什么可保护的，照常挂规则，下次运行会回收
       if (!read) return;
       // 用 R2 自己的时钟比：本机时钟走快时拿 Date.now() 比，会把正在部署的 build 算成老的
@@ -169,7 +198,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       }
     });
   }
-  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh] });
+  const plan = makePlan({ ...planInput, keep: [...keeps, ...fresh], writtenAt, emptyRuleDirs });
 
   return {
     onlineBuildId,

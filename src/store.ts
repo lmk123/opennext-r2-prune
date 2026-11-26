@@ -39,10 +39,11 @@ export interface BuildWrittenAt {
 }
 
 /** 本工具发给 R2 的几种请求。报错时据此说明是哪一步失败、缺的是什么权限。 */
-export type S3Operation = "list" | "writtenAt" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
+export type S3Operation = "list" | "listOtherScope" | "writtenAt" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
 const OPERATION_LABEL: Record<S3Operation, string> = {
   list: "列出 build 目录",
+  listOtherScope: "列出本工具在别的缓存前缀下写过规则的 build 目录",
   writtenAt: "读取 build 目录的写入时间",
   getLifecycle: "读取 lifecycle 规则",
   putLifecycle: "写入 lifecycle 规则",
@@ -53,6 +54,7 @@ const OPERATION_LABEL: Record<S3Operation, string> = {
 // 实测 Object 级 token 不论只读还是读写，GET / PUT ?lifecycle 都返回 403 AccessDenied，只有 Admin 级能用。
 const PERMISSION_HINT: Record<S3Operation, string> = {
   list: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
+  listOtherScope: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
   writtenAt: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
   getLifecycle:
     "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
@@ -145,8 +147,13 @@ export class R2Store {
   /**
    * 列出 `<prefix>/` 下的一级“目录”，也就是全部 buildId。
    * Delimiter 让 R2 在服务端折叠，通常一个请求就够 —— 不需要遍历任何缓存对象。
+   * operation 只影响报错时说是哪一步失败；signal 中止时不再重试。
    */
-  async listBuildIds(prefix: string): Promise<string[]> {
+  async listBuildIds(
+    prefix: string,
+    signal?: AbortSignal,
+    operation: "list" | "listOtherScope" = "list",
+  ): Promise<string[]> {
     const normalized = normalizePrefix(prefix);
     const found: string[] = [];
     let token: string | undefined;
@@ -158,7 +165,7 @@ export class R2Store {
       url.searchParams.set("delimiter", "/");
       if (token) url.searchParams.set("continuation-token", token);
 
-      const result = parseListObjects(await (await this.#request("list", url.toString())).text());
+      const result = parseListObjects(await (await this.#request(operation, url.toString(), undefined, signal)).text());
       for (const commonPrefix of result.commonPrefixes) {
         const buildId = commonPrefix.slice(normalized.length).replace(/\/$/, "");
         if (buildId) found.push(buildId);

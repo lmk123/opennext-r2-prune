@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BuildIdProbeError } from "../src/build-id.ts";
 import { CloudflareApi } from "../src/cloudflare.ts";
 import { collectPlan, writeAndVerify, WriteNotAppliedError } from "../src/run.ts";
-import { MAX_RULES, PlanError } from "../src/plan.ts";
+import { MAX_RULES, PlanError, RESERVED_RULES } from "../src/plan.ts";
 import { R2Store, S3Error } from "../src/store.ts";
 import { type LifecycleDoc, XmlAssumptionError } from "../src/xml.ts";
 
@@ -24,6 +24,8 @@ function fakeR2(opts: {
   lifecycle?: string;
   writtenAt?: Record<string, string>;
   failWrittenAt?: boolean;
+  /** 别的缓存前缀（如 site-b/）下现存的 build 目录；没列的前缀下一个目录都没有 */
+  otherScopes?: Record<string, string[]>;
   /** 读写入时间时响应的 Date 头，即 R2 那边的「此刻」；不给就不带这个头 */
   serverDate?: string;
 }) {
@@ -51,9 +53,9 @@ function fakeR2(opts: {
       );
     }
 
-    const prefixes = opts.buildIds
-      .map((id) => `<CommonPrefixes><Prefix>incremental-cache/${id}/</Prefix></CommonPrefixes>`)
-      .join("");
+    const listed = url.searchParams.get("prefix")!;
+    const dirs = listed === "incremental-cache/" ? opts.buildIds : (opts.otherScopes?.[listed] ?? []);
+    const prefixes = dirs.map((id) => `<CommonPrefixes><Prefix>${listed}${id}/</Prefix></CommonPrefixes>`).join("");
     return new Response(
       `<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`,
     );
@@ -254,51 +256,6 @@ describe("collectPlan", () => {
     expect(methods).not.toContain("PUT");
   });
 
-  it("规则上限按排除刚写入的 build 之后的计划判", async () => {
-    // 用户规则占到只剩一个名额：两个候选里有一个刚写入，实际只需挂一条
-    const foreign = Array.from(
-      { length: MAX_RULES - 1 },
-      (_, i) =>
-        `<Rule><ID>user-${i}</ID><Status>Enabled</Status><Filter><Prefix>logs/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
-    ).join("");
-    const lifecycle = `<LifecycleConfiguration>${foreign}</LifecycleConfiguration>`;
-    const now = Date.parse("2026-11-25T12:00:00.000Z");
-
-    const fits = fakeR2({ buildIds: ["live", "deploying", "old1"], lifecycle, writtenAt: { deploying: "2026-11-25T11:30:00.000Z" } });
-    const state = await collectPlan({ store: fits.store, prefix: "incremental-cache", keep: ["live"], now: () => now });
-    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
-
-    // 都不是刚写入的，最终计划确实超限，照样拒绝
-    const over = fakeR2({ buildIds: ["live", "deploying", "old1"], lifecycle });
-    await expect(collectPlan({ store: over.store, prefix: "incremental-cache", keep: ["live"], now: () => now })).rejects.toThrow(
-      /上限/,
-    );
-    expect(over.calls.some((c) => c.method === "PUT")).toBe(false);
-  });
-
-  it("候选全算刚写入也超上限时，不读写入时间直接中止", async () => {
-    // 用户规则 999 条，加上两条已挂好的本工具规则已到 1001：new1 刚不刚写入都救不回来
-    const foreign = Array.from(
-      { length: MAX_RULES - 1 },
-      (_, i) =>
-        `<Rule><ID>user-${i}</ID><Status>Enabled</Status><Filter><Prefix>logs/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
-    ).join("");
-    const own = ["old1", "old2"]
-      .map(
-        (id) => `<Rule><ID>opennext-r2-prune:incremental-cache/${id}/</ID><Status>Enabled</Status>
-          <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
-      )
-      .join("");
-    const { store, calls } = fakeR2({
-      buildIds: ["live", "new1", "old1", "old2"],
-      lifecycle: `<LifecycleConfiguration>${foreign}${own}</LifecycleConfiguration>`,
-    });
-
-    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(/上限/);
-    expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
-    expect(calls.some((c) => c.method === "PUT")).toBe(false);
-  });
-
   it("保留集填错时，刚写入的 build 撑不起「有交集」，也不读写入时间、不写入", async () => {
     // makePlan 里 fresh 不计入保留集的校验，经过 collectPlan 时由第一遍计划先拦下
     const { store, calls } = fakeR2({
@@ -346,6 +303,216 @@ describe("collectPlan", () => {
     expect(state.plan.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(state.plan.nextDoc.own).toHaveLength(0);
     expect(state.plan.changed).toBe(true);
+  });
+});
+
+describe("collectPlan 与规则总数上限", () => {
+  /** n 条用户自己的规则 */
+  const userRules = (n: number) =>
+    `<LifecycleConfiguration>${Array.from(
+      { length: n },
+      (_, i) => `<Rule><ID>user-${i}</ID><Status>Enabled</Status>
+        <Filter><Prefix>uploads/${i}/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>`,
+    ).join("")}</LifecycleConfiguration>`;
+  const now = Date.parse("2026-11-25T12:00:00.000Z");
+
+  it("名额不够时按写入时间先挂最早的，其余推迟，不中止", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "a", "b", "c"],
+      lifecycle: userRules(998),
+      writtenAt: { a: "2026-03-01T00:00:00.000Z", b: "2026-01-01T00:00:00.000Z", c: "2026-02-01T00:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["b", "c"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "a" }]);
+    expect(state.plan.nextDoc.foreign).toHaveLength(998);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("名额按 --grace-hours 筛过之后算：刚写入的 build 不占名额", async () => {
+    // 只剩一个名额；deploying 写入最晚，先算名额的话它会和 old1 抢，筛过之后 old1 独占
+    const { store } = fakeR2({
+      buildIds: ["live", "deploying", "old1", "old2"],
+      lifecycle: userRules(MAX_RULES - 1),
+      writtenAt: {
+        deploying: "2026-11-25T11:00:00.000Z",
+        old1: "2026-01-01T00:00:00.000Z",
+        old2: "2026-02-01T00:00:00.000Z",
+      },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live", "deploying"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "old2" }]);
+  });
+
+  it("外部规则占满上限、但要新挂规则的 build 都刚写入时不中止", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying"],
+      lifecycle: userRules(MAX_RULES),
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.changed).toBe(false);
+    expect(state.plan.deferred).toEqual([]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("外部规则自己就占满上限、一条新规则都挂不上时中止，不发任何写请求", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], lifecycle: userRules(MAX_RULES) });
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
+    ).rejects.toThrow(/核对 lifecycle 规则名额时中止/);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+  });
+
+  it("已挂着规则的 build 不因名额被摘掉，新判作废的推迟", async () => {
+    const rules = ["old1", "old2"]
+      .map(
+        (id) => `<Rule><ID>opennext-r2-prune:incremental-cache/${id}/</ID><Status>Enabled</Status>
+          <Filter><Prefix>incremental-cache/${id}/</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`,
+      )
+      .join("");
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1", "old2", "new1"],
+      lifecycle: userRules(MAX_RULES - 2).replace("</LifecycleConfiguration>", `${rules}</LifecycleConfiguration>`),
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire).toEqual([
+      { buildId: "old1", state: "pending" },
+      { buildId: "old2", state: "pending" },
+    ]);
+    expect(state.plan.deferred).toEqual([{ buildId: "new1" }]);
+    expect(state.plan.changed).toBe(false);
+    // 名额为 0 时一条也挂不上，不读写入时间
+    expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
+  });
+
+  /** 用户的规则 users 条，外加本工具为前缀 site-0/ … site-(scopes-1)/ 轮流写的共 n 条，第 i 条作用于 b<i> */
+  const withOtherSite = (users: number, n: number, scopes = 1) =>
+    userRules(users).replace(
+      "</LifecycleConfiguration>",
+      `${Array.from({ length: n }, (_, i) => {
+        const dir = `${scopes === 1 ? "site-b" : `site-${i % scopes}`}/b${i}/`;
+        return `<Rule><ID>opennext-r2-prune:${dir}</ID><Status>Enabled</Status>
+          <Filter><Prefix>${dir}</Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule>`;
+      }).join("")}</LifecycleConfiguration>`,
+    );
+  const otherScopeLists = (calls: { url: string }[], scope: string) =>
+    calls.filter((c) => new URL(c.url).searchParams.get("prefix") === scope).length;
+
+  it("名额被旧前缀下目录已删空的规则占满时中止，哪怕旧前缀里还留着没挂规则的 build，不发任何写请求", async () => {
+    // 只有规则作用的目录是空的；site-b/ 本身还有切换前缀时保留下来的 build，按前缀看永远不空
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - 500),
+      otherScopes: { "site-b/": ["kept-at-switch"] },
+    });
+    await expect(
+      collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
+    ).rejects.toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\//);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+    // 500 条规则同在一个前缀下，列一次目录就够，不逐条探查
+    expect(otherScopeLists(calls, "site-b/")).toBe(1);
+  });
+
+  it("名额被仍在用的别的前缀占着时只推迟，不中止", async () => {
+    const n = MAX_RULES - RESERVED_RULES - 500;
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, n),
+      otherScopes: { "site-b/": Array.from({ length: n }, (_, i) => `b${i}`) },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.deferred).toEqual([{ buildId: "old1" }]);
+    expect(state.plan.changed).toBe(false);
+    expect(state.plan.quotaExhausted).toBe(false);
+    expect(otherScopeLists(calls, "site-b/")).toBe(1);
+  });
+
+  it("别的前缀的规则全算上也挤不进余量时，不去看它们的目录", async () => {
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "old1"],
+      lifecycle: withOtherSite(500, MAX_RULES - RESERVED_RULES - 501),
+    });
+    // 用户的规则 500 + 别的前缀 489 = 989，留着一个名额给 old1；就算那 489 条都没人回收，也不会让名额放宽或永远空不出来
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(calls.some((c) => new URL(c.url).searchParams.get("prefix")?.startsWith("site-b/"))).toBe(false);
+  });
+
+  it("一个别的前缀列目录失败时，中止其余在途的列举", async () => {
+    let slowAborted = false;
+    const methods: string[] = [];
+    // 规则分在 site-0/ … site-8/ 九个前缀下
+    const lifecycle = withOtherSite(500, MAX_RULES - RESERVED_RULES - 500, 9);
+    const fetchImpl = (async (request: Request, init?: RequestInit) => {
+      methods.push(request.method);
+      const url = new URL(request.url);
+      if (url.searchParams.has("lifecycle")) return new Response(lifecycle);
+      if (url.searchParams.get("prefix")?.startsWith("site-")) {
+        // 失败的排在第一批并发的最后：前面几个请求已经发出、挂着，才看得出它们有没有被中止
+        if (url.searchParams.get("prefix") === "site-7/") {
+          return new Response("<Error><Code>AccessDenied</Code></Error>", { status: 403 });
+        }
+        // 一直挂着，直到被中止
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            slowAborted = true;
+            reject(init.signal!.reason);
+          });
+        });
+      }
+      const prefixes = ["live", "old1"]
+        .map((id) => `<CommonPrefixes><Prefix>incremental-cache/${id}/</Prefix></CommonPrefixes>`)
+        .join("");
+      return new Response(`<ListBucketResult><IsTruncated>false</IsTruncated>${prefixes}</ListBucketResult>`);
+    }) as unknown as typeof fetch;
+    const store = new R2Store({ ...CREDS, fetchImpl });
+
+    await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now })).rejects.toThrow(
+      /列出本工具在别的缓存前缀下写过规则的 build 目录失败/,
+    );
+    expect(slowAborted).toBe(true);
+    expect(methods).not.toContain("PUT");
+  });
+
+  it("名额还有时，哪怕不够也不去看别的前缀：看了也改变不了结果", async () => {
+    // 用户的规则已达 990 条，上限已放宽到 1000，只剩一个名额。别的前缀的规则就算全没人回收，也让不出余量，
+    // 而名额永远空不出来意味着名额为 0，所以不必列 site-b/
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1", "old2"],
+      lifecycle: withOtherSite(MAX_RULES - RESERVED_RULES, RESERVED_RULES - 1),
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z", old2: "2026-02-01T00:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live", "deploying"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "old2" }]);
+    expect(otherScopeLists(calls, "site-b/")).toBe(0);
+  });
+
+  it("名额为 0、但弃用前缀的规则让出余量后空出名额时，照常读写入时间并挂规则", async () => {
+    // 用户 985 条 + 弃用前缀 5 条：只算用户的规则时名额为 0，算上弃用前缀后上限放宽到 1000
+    const { store, calls } = fakeR2({
+      buildIds: ["live", "deploying", "old1"],
+      lifecycle: withOtherSite(985, 5),
+      otherScopes: { "site-b/": [] },
+      writtenAt: { deploying: "2026-11-25T11:00:00.000Z" },
+    });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now });
+    expect(state.plan.keep.map((b) => b.buildId)).toEqual(["live", "deploying"]);
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
+    expect(state.plan.deferred).toEqual([]);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("graceHours 为 0 时不读写入时间，名额不够就按 buildId 挑", async () => {
+    const { store, calls } = fakeR2({ buildIds: ["live", "c", "a", "b"], lifecycle: userRules(MAX_RULES - 2) });
+    const state = await collectPlan({ store, prefix: "incremental-cache", keep: ["live"], graceHours: 0 });
+    expect(state.plan.expire.map((b) => b.buildId)).toEqual(["a", "b"]);
+    expect(state.plan.deferred).toEqual([{ buildId: "c" }]);
+    expect(calls).toHaveLength(2);
   });
 });
 

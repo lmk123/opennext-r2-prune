@@ -1,5 +1,5 @@
 import { CloudflareApi, CloudflareApiError } from "./cloudflare.ts";
-import type { ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
+import type { DeferredBuild, ExpiringBuild, KeptBuild, ReclaimedRule } from "./plan.ts";
 import type { OnRetry } from "./retry.ts";
 import { assertLifecycleUnchanged, collectPlan, writeAndVerify, WriteNotAppliedError } from "./run.ts";
 import { R2Store, S3Error } from "./store.ts";
@@ -16,7 +16,15 @@ import { ruleId } from "./xml.ts";
 export { BuildIdProbeError } from "./build-id.ts";
 export { CloudflareApiError } from "./cloudflare.ts";
 export { PlanError } from "./plan.ts";
-export type { ExpireState, ExpiringBuild, KeepReason, KeptBuild, ReclaimReason, ReclaimedRule } from "./plan.ts";
+export type {
+  DeferredBuild,
+  ExpireState,
+  ExpiringBuild,
+  KeepReason,
+  KeptBuild,
+  ReclaimReason,
+  ReclaimedRule,
+} from "./plan.ts";
 export type { OnRetry } from "./retry.ts";
 export { S3Error } from "./store.ts";
 export { XmlAssumptionError } from "./xml.ts";
@@ -104,6 +112,16 @@ export interface PrunePlanSummary {
   absent: KeptBuild[];
   /** 交给 R2 删除的 build */
   expire: ExpiringBuild[];
+  /**
+   * 保留集之外、但 lifecycle 规则名额不够（R2 每个 bucket 最多 1000 条，本工具挂规则时给用户自己的规则留 10 条余量），这次没挂规则的 build（不算保留）。
+   * 之后的运行回收已删完的规则、空出名额后再挂，逐轮清完。名额一条不剩时不读写入时间，刚写入的 build 也列在这里
+   */
+  deferred: DeferredBuild[];
+  /**
+   * 规则名额永远空不出来（你自己的规则加上没人回收的规则占满了 1000 条）：deferred 里的 build 等多少轮也挂不上，
+   * 得手动清理规则。只在这趟还有别的改动要写时可能为 true；没别的可写时 planPrune 直接抛 PlanError
+   */
+  quotaExhausted: boolean;
   /** 要回收或摘除的已有规则 */
   reclaim: ReclaimedRule[];
 }
@@ -278,6 +296,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
     keep: plan.keep,
     absent: plan.absent,
     expire: plan.expire,
+    deferred: plan.deferred,
+    quotaExhausted: plan.quotaExhausted,
     reclaim: plan.reclaim,
 
     async apply() {
