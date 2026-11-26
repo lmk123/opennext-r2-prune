@@ -174,7 +174,7 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: npx opennext-r2-prune@0.1 --yes
+      - run: npx opennext-r2-prune@0.2 --yes
         env:
           WORKER_NAME: your-worker
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
