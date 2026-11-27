@@ -197,31 +197,31 @@ export function describeError(error: unknown): string {
 function validate(opts: PruneOptions): void {
   const missing: string[] = [];
   if (!opts.bucket) missing.push("bucket");
-  if (!opts.endpoint && !opts.accountId) missing.push("accountId 或 endpoint");
+  if (!opts.endpoint && !opts.accountId) missing.push("accountId or endpoint");
   if (!opts.accessKeyId) missing.push("accessKeyId");
   if (!opts.secretAccessKey) missing.push("secretAccessKey");
-  if (opts.worker && !opts.apiToken) missing.push("apiToken（给了 worker）");
-  if (opts.worker && !opts.accountId) missing.push("accountId（给了 worker，要用它调 Cloudflare API）");
-  if (opts.apiToken && !opts.worker) missing.push("worker（给了 apiToken）");
+  if (opts.worker && !opts.apiToken) missing.push("apiToken (worker was given)");
+  if (opts.worker && !opts.accountId) missing.push("accountId (worker was given and needs it to call the Cloudflare API)");
+  if (opts.apiToken && !opts.worker) missing.push("worker (apiToken was given)");
   if (!opts.worker && !opts.siteUrl && !opts.buildIdUrl && (opts.keep ?? []).length === 0) {
-    missing.push("worker 与 apiToken（或 siteUrl / buildIdUrl / keep）");
+    missing.push("worker and apiToken (or siteUrl / buildIdUrl / keep)");
   }
-  if (missing.length > 0) throw new PruneOptionsError(`缺少必填项：${missing.join("、")}`);
+  if (missing.length > 0) throw new PruneOptionsError(`Missing required options: ${missing.join(", ")}`);
 
   const expireDays = opts.expireDays ?? 1;
   if (!Number.isInteger(expireDays) || expireDays < 1) {
-    throw new PruneOptionsError(`expireDays 必须是不小于 1 的整数，收到 ${expireDays}`);
+    throw new PruneOptionsError(`expireDays must be an integer of at least 1, got ${expireDays}`);
   }
   const graceHours = opts.graceHours ?? 24;
   if (!Number.isInteger(graceHours) || graceHours < 0) {
-    throw new PruneOptionsError(`graceHours 必须是不小于 0 的整数，收到 ${graceHours}`);
+    throw new PruneOptionsError(`graceHours must be an integer of at least 0, got ${graceHours}`);
   }
   if (opts.recentBuilds !== undefined) {
     if (!Number.isInteger(opts.recentBuilds) || opts.recentBuilds < 1) {
-      throw new PruneOptionsError(`recentBuilds 必须是不小于 1 的整数，收到 ${opts.recentBuilds}`);
+      throw new PruneOptionsError(`recentBuilds must be an integer of at least 1, got ${opts.recentBuilds}`);
     }
     // 没有 worker 就没有近期版本可翻，悄悄忽略会让人以为保住了近几个 build
-    if (!opts.worker) throw new PruneOptionsError("recentBuilds 需要配合 worker 与 apiToken 使用");
+    if (!opts.worker) throw new PruneOptionsError("recentBuilds requires worker and apiToken");
   }
 }
 
@@ -278,7 +278,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
   const { plan } = state;
   let applied = false;
   // 只点出本次前缀下的规则：同一个 bucket 上别的站点的规则不归这一趟管，叫人全删会误伤
-  const ownRules = `ID 形如 ${ruleId(prefix, "<buildId>")} 的规则`;
+  const ownRules = `the rules with IDs like ${ruleId(prefix, "<buildId>")}`;
 
   return {
     bucket: opts.bucket,
@@ -302,7 +302,7 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
 
     async apply() {
       // 第二次写入用的仍是第一次之前读到的配置，回读核对与撤销都会以错误的现状为准
-      if (applied) throw new Error("apply() 只能调用一次；要再写入请重新调用 planPrune()。");
+      if (applied) throw new Error("apply() can only be called once; call planPrune() again to write again.");
       applied = true;
       if (!plan.changed) return { written: false, verified: null, rolledBack: null, warnings: [], writeError: null };
       // 计划按 planPrune 时的配置算出，这之后被改过就不能照着写：会抹掉别人的改动，撤销也会以错误的现状为准
@@ -316,8 +316,8 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
           // 能确认写入没有生效：bucket 仍是写入前的样子
           const cause = error.cause;
           const detail = describeError(cause);
-          // S3Error 自己就写明了「写入 lifecycle 规则失败」，不再重复一遍
-          const message = cause instanceof S3Error ? detail : `写入 lifecycle 规则失败：${detail}`;
+          // S3Error 自己就写明了「Writing lifecycle rules failed」，不再重复一遍
+          const message = cause instanceof S3Error ? detail : `Writing lifecycle rules failed: ${detail}`;
           throw new PruneWriteError(
             message,
             { detail, written: false, verified: null, rolledBack: null, warnings: [] },
@@ -325,10 +325,10 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
           );
         }
         // 约定之外的异常：不知道写入走到了哪一步，新规则可能已经在 bucket 上，只能按「可能已写入」报
-        const detail = `写入阶段意外出错，无从确认规则是否已写入：${describeError(error)}`;
+        const detail = `Unexpected error during the write phase; can't confirm whether the rules were written: ${describeError(error)}`;
         throw new PruneWriteError(
-          `${detail}\n请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，` +
-            `并手动删除 ${ownRules}，尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`,
+          `${detail}\nCheck right away with npx wrangler r2 bucket lifecycle list ${opts.bucket} ` +
+            `and manually delete ${ownRules}, especially any whose prefix shows as (all prefixes) — it will delete the whole bucket.`,
           { detail, written: true, verified: null, rolledBack: null, warnings: [] },
           error,
         );
@@ -346,15 +346,15 @@ export async function planPrune(opts: PruneOptions): Promise<PrunePlanned> {
 
       const reasons =
         result.readBackError !== undefined
-          ? [...result.problems, `写入后读不回配置，无从核对：${describeError(result.readBackError)}`]
+          ? [...result.problems, `couldn't read the configuration back after writing, so it can't be verified: ${describeError(result.readBackError)}`]
           : result.problems;
       const rollback = result.rolledBack
-        ? "已撤掉本工具在该前缀下的全部规则并回读确认（其它规则保留），没有任何目录会因此被删。查明原因前不要重跑写入。"
-        : `撤掉本工具的规则时失败了：${describeError(result.rollbackError)}\n` +
-          `请立即用 npx wrangler r2 bucket lifecycle list ${opts.bucket} 检查，并手动删除 ${ownRules}，` +
-          `尤其是 prefix 显示为 (all prefixes) 的 —— 它会删掉整个 bucket。`;
-      throw new PruneWriteError(`写入后回读核对失败：\n  ${reasons.join("\n  ")}\n${rollback}`, {
-        detail: `写入后回读核对失败：${reasons.join("；")}`,
+        ? "Removed all of this tool's rules under this prefix and confirmed by reading back (other rules kept); no directory will be deleted because of this. Don't rerun the write until you find the cause."
+        : `Removing this tool's rules failed: ${describeError(result.rollbackError)}\n` +
+          `Check right away with npx wrangler r2 bucket lifecycle list ${opts.bucket} and manually delete ${ownRules}, ` +
+          `especially any whose prefix shows as (all prefixes) — it will delete the whole bucket.`;
+      throw new PruneWriteError(`Verification by reading back after writing failed:\n  ${reasons.join("\n  ")}\n${rollback}`, {
+        detail: `Verification by reading back after writing failed: ${reasons.join("; ")}`,
         // 撤销成功、或能确认写入根本没生效时为 false；其余撤销失败的情况下新规则可能还在
         written: result.written,
         verified: false,

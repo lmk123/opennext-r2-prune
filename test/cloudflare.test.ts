@@ -67,7 +67,7 @@ describe("CloudflareApi", () => {
     const { api: cf } = api(() => ok({ deployments: [{ id: "d1" }] }));
     await expect(allDeployments(cf, "w")).rejects.toMatchObject({
       code: "pagination",
-      message: expect.stringContaining("无法确认已经看到全部deployment"),
+      message: expect.stringContaining("Can't confirm all deployments were seen"),
     });
   });
 
@@ -136,7 +136,7 @@ describe("CloudflareApi", () => {
     const { api: cf, calls } = api(() => ok([{ name: "a" }, { name: "b" }], { cursor: "next" }));
     await expect(cf.listPreviews("w")).rejects.toMatchObject({
       code: "pagination",
-      message: expect.stringContaining("分页参数可能没被接受"),
+      message: expect.stringContaining("pagination parameters may not be honored"),
     });
     // 每遍在第二页发现重复就停
     expect(calls).toHaveLength(6);
@@ -289,7 +289,7 @@ describe("CloudflareApi", () => {
             { status: 503 },
           ),
       );
-      const result = expect(allDeployments(cf, "w")).rejects.toThrow(/连续 3 次服务端故障，稍后重跑即可/);
+      const result = expect(allDeployments(cf, "w")).rejects.toThrow(/server error 3 times in a row; just run again later/);
       await vi.runAllTimersAsync();
       await result;
     } finally {
@@ -299,6 +299,6 @@ describe("CloudflareApi", () => {
 
   it("响应不是 JSON 时给出可读的错误", async () => {
     const { api: cf } = api(() => new Response("<html>oops</html>", { status: 403 }));
-    await expect(allDeployments(cf, "w")).rejects.toThrow(/不是 JSON/);
+    await expect(allDeployments(cf, "w")).rejects.toThrow(/didn't return JSON/);
   });
 });

@@ -194,7 +194,7 @@ export async function collectPlan(opts: RunOptions): Promise<RunState> {
       // 用 R2 自己的时钟比：本机时钟走快时拿 Date.now() 比，会把正在部署的 build 算成老的
       const reference = read.serverTime?.getTime() ?? now;
       if (reference - read.writtenAt.getTime() < graceMs) {
-        fresh.push({ buildId, reason: "fresh", source: `写入于 ${read.writtenAt.toISOString()}` });
+        fresh.push({ buildId, reason: "fresh", source: `written at ${read.writtenAt.toISOString()}` });
       }
     });
   }
@@ -247,7 +247,7 @@ async function collectRecentKeeps(
   };
 
   if (!(await has(0))) {
-    throw new BuildIdProbeError(`Worker ${worker} 没有任何 deployment，请确认 --worker 填对了。`);
+    throw new BuildIdProbeError(`Worker ${worker} has no deployments; check that --worker is correct.`);
   }
 
   // 按窗口往回翻：每个窗口里的 version 并发探测。每个没探过的 version 至多贡献一个新 build，
@@ -306,13 +306,13 @@ async function collectPreviewKeeps(
     const url = preview.urls[0];
     if (!url) {
       throw new BuildIdProbeError(
-        `预览 ${preview.name} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与预览 URL。`,
+        `Preview ${preview.name} has no reachable URL, so its BUILD_ID can't be read. Check that the Worker has workers.dev and preview URLs enabled.`,
       );
     }
     const buildId = await explainProbe(
       WORKER_HINT,
       () => probe(buildIdUrlFor(url), signal),
-      `预览 ${preview.name}`,
+      `Preview ${preview.name}`,
     );
     return { buildId, reason: "preview" as const, source: preview.name };
   });
@@ -325,27 +325,27 @@ async function probeVersion(
   probe: Probe,
   signal: AbortSignal,
 ): Promise<string> {
-  const label = `版本 ${versionId.slice(0, 8)}`;
+  const label = `Version ${versionId.slice(0, 8)}`;
   const url = (await api.getVersionUrls(worker, versionId, signal))[0];
   if (!url) {
     throw new BuildIdProbeError(
-      `${label} 没有可访问的 URL，读不到它的 BUILD_ID。请确认 Worker 开启了 workers.dev 与 preview_urls。\n` +
-        `注意：实现了 Durable Object 的 Worker（例如用了 OpenNext 的 DO 队列或 DO tag cache）` +
-        `不会生成版本预览 URL，开了也没用 —— 这种情况请改用 --url 与 --keep。`,
+      `${label} has no reachable URL, so its BUILD_ID can't be read. Check that the Worker has workers.dev and preview_urls enabled.\n` +
+        `Note: a Worker that implements Durable Objects (e.g. one using OpenNext's DO queue or DO tag cache) ` +
+        `doesn't get version preview URLs even with them enabled — in that case use --url and --keep instead.`,
     );
   }
   return explainProbe(WORKER_HINT, () => probe(buildIdUrlFor(url), signal), label);
 }
 
-const SITE_HINT = "请改用 --keep 显式指定要保留的 build id。";
+const SITE_HINT = "Use --keep to explicitly specify the build ids to keep instead.";
 
 /**
  * 读 Worker 版本或预览失败时，--keep 帮不上忙：失败的那个 build 仍然读不到，整趟照样中止。
  * 能做的是让地址可读，或者整个退回 --url 模式。
  */
 const WORKER_HINT =
-  "请确认该地址能公开访问（workers.dev 已开启、未被 Cloudflare Access 挡住）；" +
-  "做不到时请去掉 --worker，改用 --url 与 --keep。";
+  "Check that the URL is publicly reachable (workers.dev enabled, not blocked by Cloudflare Access); " +
+  "if that's not possible, drop --worker and use --url and --keep instead.";
 
 /**
  * probeBuildId 只说哪里不对，这里按模式补上怎么办；读版本 / 预览时再补上是哪一个，
@@ -356,9 +356,9 @@ async function explainProbe<T>(hint: string, fn: () => Promise<T>, label?: strin
     return await fn();
   } catch (error) {
     if (error instanceof BuildIdProbeError) {
-      // 暂时性失败的报错里已经说了「稍后重跑」，再建议改配置只会把人带偏
+      // 暂时性失败的报错里已经说了「run again later」，再建议改配置只会把人带偏
       const suffix = error.transient ? "" : `\n${hint}`;
-      throw new BuildIdProbeError(`${label ? `${label}：` : ""}${error.message}${suffix}`, error.transient);
+      throw new BuildIdProbeError(`${label ? `${label}: ` : ""}${error.message}${suffix}`, error.transient);
     }
     throw error;
   }
@@ -398,7 +398,7 @@ export interface WriteResult {
   problems: string[];
   /**
    * 外部规则条数不符这类不影响本工具规则安全的问题，只提示、不触发撤销。撤销后回读发现的
-   * 外部规则不符同样记在这里（以「撤销后」开头），它可能意味着用户的规则丢了。
+   * 外部规则不符同样记在这里（以「after the rollback」开头），它可能意味着用户的规则丢了。
    */
   warnings: string[];
   /** 回读失败时的原因。此时无从核对，按「不符」处理并撤销 */
@@ -446,7 +446,7 @@ type ReadBack = { problems: VerifyProblems; actual: LifecycleDoc } | { error: un
 async function readBack(store: R2Store, expected: LifecycleDoc, opts: VerifyOptions): Promise<ReadBack> {
   const attempts = Math.max(1, opts.readBackAttempts ?? 3);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  let result: ReadBack = { error: new Error("没有读取") };
+  let result: ReadBack = { error: new Error("not read") };
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await sleep(opts.readBackDelayMs ?? 2000);
     let actual: LifecycleDoc;
@@ -486,9 +486,9 @@ export async function assertLifecycleUnchanged(store: R2Store, before: ParsedLif
   const now = await store.getLifecycle(before.prefix);
   if (JSON.stringify(now) === JSON.stringify(before)) return;
   throw new PlanError(
-    `写入前重读 lifecycle 配置，发现它在算出计划之后被改过（本工具规则 ${before.own.length} → ${now.own.length} 条，` +
-      `外部规则 ${before.foreign.length} → ${now.foreign.length} 条，条数相同时是内容变了），已中止，没有写入任何改动。` +
-      `请重新算计划再写入：库调用方重新调用 planPrune()，命令行直接重跑。`,
+    `Re-reading the lifecycle configuration before writing found it was changed after the plan was computed (this tool's rules ${before.own.length} → ${now.own.length}, ` +
+      `external rules ${before.foreign.length} → ${now.foreign.length}; same counts mean the contents changed), so it aborted without writing anything. ` +
+      `Recompute the plan before writing: library callers call planPrune() again, on the command line just run again.`,
   );
 }
 
@@ -548,7 +548,7 @@ export async function writeAndVerify(
     }
   }
 
-  const writeNote = failed ? [`写入请求报错：${message(writeError)}`] : [];
+  const writeNote = failed ? [`the write request errored: ${message(writeError)}`] : [];
   const base =
     "error" in check
       ? { problems: writeNote, warnings: [], readBackError: check.error }
@@ -568,17 +568,17 @@ export async function writeAndVerify(
     return {
       ...failure,
       rolledBack: false,
-      rollbackError: new Error(`撤销已写入，但回读确认失败：${message(after.error)}`),
+      rollbackError: new Error(`the rollback was written, but reading it back to confirm failed: ${message(after.error)}`),
     };
   }
   // 撤销后外部规则不符同样要报：可能是用户的规则丢了，也可能是被改掉 ID 的自有规则还在
-  const warnings = [...base.warnings, ...after.problems.foreign.map((warning) => `撤销后${warning}`)];
+  const warnings = [...base.warnings, ...after.problems.foreign.map((warning) => `after the rollback, ${warning}`)];
   if (after.problems.own.length > 0) {
     return {
       ...failure,
       warnings,
       rolledBack: false,
-      rollbackError: new Error(`撤销后读回来仍有本工具的规则：${after.problems.own.join("；")}`),
+      rollbackError: new Error(`this tool's rules are still read back after the rollback: ${after.problems.own.join("; ")}`),
     };
   }
   return { ...failure, warnings, rolledBack: true, written: false };

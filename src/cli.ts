@@ -22,46 +22,46 @@ import { ruleId } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
 
-const USAGE = `用法：opennext-r2-prune [选项]
+const USAGE = `Usage: opennext-r2-prune [options]
 
-给 R2 里作废的 OpenNext 缓存目录挂上 lifecycle 规则，由 R2 在 24 小时内后台删除。
-本工具不遍历缓存对象，所以目录里有多少个文件都不影响耗时。
+Attaches lifecycle rules to obsolete OpenNext cache directories in R2, so R2 deletes them in the background within 24 hours.
+The tool never walks the cached objects, so the number of files in a directory doesn't affect how long it takes.
 
-必填（可用环境变量代替）：
-  --bucket <名字>              R2 bucket 名                [R2_BUCKET]
+Required (environment variables can be used instead):
+  --bucket <name>              R2 bucket name              [R2_BUCKET]
   --account-id <id>            Cloudflare account id       [CLOUDFLARE_ACCOUNT_ID]
   --access-key-id <id>         R2 access key id            [R2_ACCESS_KEY_ID / AWS_ACCESS_KEY_ID]
   --secret-access-key <key>    R2 secret access key        [R2_SECRET_ACCESS_KEY / AWS_SECRET_ACCESS_KEY]
 
-保留哪些 build（至少给一种）：
-  --worker <名字>               Worker 名。配合 --api-token，保留近期线上与全部预览的 build
+Which builds to keep (at least one):
+  --worker <name>              Worker name. With --api-token, keeps recent live builds and every preview's build
                                                            [WORKER_NAME]
-  --api-token <token>          Cloudflare API token，需 Workers Scripts 读权限
+  --api-token <token>          Cloudflare API token with Workers Scripts read permission
                                                            [CLOUDFLARE_API_TOKEN]
-  --url <站点地址>              从 <站点>/BUILD_ID 读线上 build id  [SITE_URL]
-  --keep <build-id>            额外保留的 build id，可重复传
+  --url <site URL>             Read the live build id from <site>/BUILD_ID  [SITE_URL]
+  --keep <build-id>            Extra build id to keep; can be repeated
 
-可选：
-  --recent-builds <n>          保留最近几个不同的线上 build，默认 3（需 --worker）
-  --build-id-url <地址>         覆盖 BUILD_ID 的探测地址
-  --endpoint <地址>             覆盖 S3 endpoint，默认按 account id 拼
-  --prefix <前缀>               缓存前缀，默认 incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
-                               多个站点共用一个 bucket 时必须各用各的、互不嵌套的前缀，每趟只管自己前缀下的规则
-  --expire-days <n>            规则的过期天数，默认 1
-  --grace-hours <n>            目录写入不满 n 小时的 build 不判作废，默认 24；0 关闭
-                               OpenNext 部署时先写缓存再切流量，正赶上部署时新 build 还没上线，靠它保住。
-                               规则名额不够、要分批挂时，也按这里读到的写入时间先挂最老的；为 0 时按 build id 挑。
-                               名额一条不剩时不读写入时间（名额永远空不出来、要中止时照读）
-  --dry-run                    只打印计划，不写入
-  --yes, -y                    跳过确认。非交互环境下必须显式传
-  --json                       输出机器可读的结果（写入之后才输出，含 written / verified / rolledBack / warnings 字段；
-                               deferred 是规则名额不够、这次没挂规则的 build；quotaExhausted 为 true 时名额永远空不出来，要手动清理规则）
-  --force                      跳过「保留的 build 必须存在于 bucket」这项检查
-  --allow-root-prefix          承认 --prefix 为空（缓存直接放在 bucket 根下）
-  --verbose                    打印重试等额外信息
-  --help, -h                   显示本帮助
+Optional:
+  --recent-builds <n>          How many distinct recent live builds to keep, default 3 (requires --worker)
+  --build-id-url <URL>         Override the URL BUILD_ID is probed from
+  --endpoint <URL>             Override the S3 endpoint, derived from the account id by default
+  --prefix <prefix>            Cache prefix, default incremental-cache   [NEXT_INC_CACHE_R2_PREFIX]
+                               Sites sharing a bucket must each use their own, non-nested prefix; each run only manages rules under its own prefix
+  --expire-days <n>            Expiration days of the rules, default 1
+  --grace-hours <n>            Don't judge builds obsolete until their directory was written n hours ago, default 24; 0 disables
+                               OpenNext writes the cache before shifting traffic, so a new build caught mid-deploy isn't live yet; this protects it.
+                               When there aren't enough rule slots and rules go in batches, the oldest by this write time go first; with 0, by build id.
+                               Write times aren't read when no slots are left (except when slots can never be freed and the run aborts)
+  --dry-run                    Only print the plan, don't write
+  --yes, -y                    Skip confirmation. Required in non-interactive environments
+  --json                       Print a machine-readable result (only after writing; includes written / verified / rolledBack / warnings;
+                               deferred lists builds that got no rule for lack of slots; quotaExhausted true means slots can never be freed and rules need manual cleanup)
+  --force                      Skip the "kept builds must exist in the bucket" check
+  --allow-root-prefix          Acknowledge an empty --prefix (cache stored directly at the bucket root)
+  --verbose                    Print extra information such as retries
+  --help, -h                   Show this help
 
-退出码：0 成功（有 build 因规则名额不够推迟也算）/ 1 参数或校验失败（含规则名额永远空不出来） / 2 写入规则失败，或写入后回读核对不符（已尝试撤掉本工具的规则）`;
+Exit codes: 0 success (including builds deferred for lack of rule slots) / 1 invalid options or a failed check (including rule slots that can never be freed) / 2 writing rules failed, or the read-back after writing didn't match (the tool tried to remove its own rules)`;
 
 function parseCliArgs(argv: string[]) {
   return parseArgs({
@@ -125,31 +125,31 @@ async function main(argv: string[]): Promise<number> {
 
   const missing: string[] = [];
   if (!bucket) missing.push("--bucket");
-  if (!endpoint) missing.push("--account-id 或 --endpoint");
+  if (!endpoint) missing.push("--account-id or --endpoint");
   if (!accessKeyId) missing.push("--access-key-id");
   if (!secretAccessKey) missing.push("--secret-access-key");
   // WORKER_NAME 是个很泛的名字，CI 里可能是别的步骤设的：报错要说清楚 --worker 模式是被谁打开的
-  const workerFrom = values.worker ? "--worker" : `环境变量 WORKER_NAME=${worker}`;
+  const workerFrom = values.worker ? "--worker" : `the environment variable WORKER_NAME=${worker}`;
   if (worker && !apiToken) {
     missing.push(
-      `--api-token（${workerFrom} 开启了 --worker 模式${values.worker ? "" : "；不打算用它就清掉这个变量"}）`,
+      `--api-token (${workerFrom} turned on --worker mode${values.worker ? "" : "; unset that variable if you don't mean to use it"})`,
     );
   }
   // 只查命令行显式给的：CLOUDFLARE_API_TOKEN 在 CI 里常常是给 wrangler deploy 准备的，
   // 只用 --url 的人环境里带着它不该被拦下
-  if (values["api-token"] && !worker) missing.push("--worker（给了 --api-token）");
-  if (worker && !accountId) missing.push(`--account-id（${workerFrom} 要用它调 Cloudflare API）`);
+  if (values["api-token"] && !worker) missing.push("--worker (--api-token was given)");
+  if (worker && !accountId) missing.push(`--account-id (${workerFrom} needs it to call the Cloudflare API)`);
   if (!worker && !siteUrl && !values["build-id-url"] && keep.length === 0) {
-    missing.push("--worker 与 --api-token（或 --url / --build-id-url / --keep）");
+    missing.push("--worker and --api-token (or --url / --build-id-url / --keep)");
   }
   if (missing.length > 0) {
-    console.error(`缺少必填项：${missing.join("、")}\n\n${USAGE}`);
+    console.error(`Missing required options: ${missing.join(", ")}\n\n${USAGE}`);
     return 1;
   }
 
   const expireDays = Number(values["expire-days"] ?? 1);
   if (!Number.isInteger(expireDays) || expireDays < 1) {
-    console.error("--expire-days 必须是不小于 1 的整数");
+    console.error("--expire-days must be an integer of at least 1");
     return 1;
   }
 
@@ -158,24 +158,24 @@ async function main(argv: string[]): Promise<number> {
   const graceHoursRaw = values["grace-hours"] ?? "24";
   const graceHours = Number(graceHoursRaw);
   if (!/^\d+$/.test(graceHoursRaw) || !Number.isSafeInteger(graceHours)) {
-    console.error("--grace-hours 必须是不小于 0 的整数");
+    console.error("--grace-hours must be an integer of at least 0");
     return 1;
   }
 
   const recentBuildsRaw = values["recent-builds"] ?? "3";
   const recentBuilds = Number(recentBuildsRaw);
   if (!/^\d+$/.test(recentBuildsRaw) || !Number.isSafeInteger(recentBuilds) || recentBuilds < 1) {
-    console.error("--recent-builds 必须是不小于 1 的整数");
+    console.error("--recent-builds must be an integer of at least 1");
     return 1;
   }
   // 没有 --worker 就没有近期版本可翻，悄悄忽略会让人以为保住了近几个 build
   if (values["recent-builds"] !== undefined && !worker) {
-    console.error("--recent-builds 需要配合 --worker 与 --api-token 使用");
+    console.error("--recent-builds requires --worker and --api-token");
     return 1;
   }
 
   const onRetry = values.verbose
-    ? (attempt: number, reason: string) => console.error(`  第 ${attempt} 次重试：${reason}`)
+    ? (attempt: number, reason: string) => console.error(`  Retry ${attempt}: ${reason}`)
     : undefined;
 
   const planned = await planPrune({
@@ -203,11 +203,11 @@ async function main(argv: string[]): Promise<number> {
     // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
     onWholeBucketRules: (ruleIds) =>
       console.error(
-        `\n⚠️ 警告：bucket 上有 ${ruleIds.length} 条本工具的规则没有 <Filter><Prefix> 前缀` +
-          `（缺失，或只有 R2 不认的裸 <Prefix>），会对整个 bucket 生效：${ruleIds.join(", ")}。\n` +
-          `R2 会按它删掉 bucket 里的全部对象。本次运行写入成功只会改写当前前缀（${ruleId(prefix, "<buildId>")}）下的；` +
-          `别的前缀下的、或本次中止、只是 --dry-run 时，` +
-          `请立即用 npx wrangler r2 bucket lifecycle list ${bucket} 核对并手动删除这些规则。`,
+        `\n⚠️ Warning: ${ruleIds.length} of this tool's rules on the bucket have no <Filter><Prefix> prefix` +
+          ` (missing, or only a bare <Prefix> that R2 ignores), so they apply to the whole bucket: ${ruleIds.join(", ")}.\n` +
+          `R2 will use them to delete every object in the bucket. A successful write in this run only rewrites those under the current prefix (${ruleId(prefix, "<buildId>")}); ` +
+          `for those under other prefixes, or if this run aborts or is only a --dry-run, ` +
+          `check them right away with npx wrangler r2 bucket lifecycle list ${bucket} and delete them manually.`,
       ),
   });
 
@@ -218,9 +218,9 @@ async function main(argv: string[]): Promise<number> {
   // deployment 翻完了还凑不够名额时不能悄悄少保留：回滚目标可能就在被判作废的那几个里
   if (planned.cloudflare && planned.cloudflare.recentBuilds < recentBuilds) {
     console.error(
-      `\n注意：只凑到 ${planned.cloudflare.recentBuilds} 个不同的近期线上 build（--recent-builds 为 ${recentBuilds}），` +
-        `全部 ${planned.cloudflare.deploymentsScanned} 次部署已经翻完。更早的 build 会被判作废，` +
-        `需要保留的请用 --keep 显式指定。`,
+      `\nNote: only found ${planned.cloudflare.recentBuilds} distinct recent live builds (--recent-builds is ${recentBuilds}) ` +
+        `after going through all ${planned.cloudflare.deploymentsScanned} deployments. Older builds will be judged obsolete; ` +
+        `keep the ones you need explicitly with --keep.`,
     );
   }
 
@@ -242,42 +242,42 @@ async function main(argv: string[]): Promise<number> {
   if (!planned.changed) {
     note(
       planned.deferred.length > 0
-        ? "\n规则名额不够，本次无需改动；推迟的 build 等之后的运行回收规则、空出名额后再挂。"
-        : "\n规则已经是最新的，无需改动。",
+        ? "\nNot enough rule slots, so nothing to change this time; deferred builds get rules once a later run reclaims rules and frees slots."
+        : "\nRules are already up to date, no changes needed.",
     );
   } else if (values["dry-run"]) {
-    note("\n--dry-run：未写入任何改动。");
+    note("\n--dry-run: nothing was written.");
   } else if (!values.yes && !process.stdin.isTTY) {
-    console.error("\n非交互环境下需要显式传 --yes 才会写入规则。");
+    console.error("\nIn a non-interactive environment, pass --yes explicitly to write the rules.");
     code = 1;
   } else if (!values.yes && !(await confirm())) {
     cancelled = true;
-    note("已取消。");
+    note("Cancelled.");
   } else {
     try {
       const outcome = await planned.apply();
       ({ written, verified, warnings } = outcome);
       for (const warning of warnings) {
-        console.error(`\n注意：${warning}。本工具的规则核对无误，但请检查你自己的 lifecycle 规则是否完好。`);
+        console.error(`\nNote: ${warning}. This tool's rules verified correctly, but check that your own lifecycle rules are intact.`);
       }
       if (outcome.writeError !== null) {
-        console.error(`\n注意：写入请求报错（${outcome.writeError}），但回读确认规则已按原样生效。`);
+        console.error(`\nNote: the write request errored (${outcome.writeError}), but reading back confirmed the rules took effect as written.`);
       }
       const added = planned.expire.filter((b) => b.state === "new").length;
       const updated = planned.expire.filter((b) => b.state === "updated").length;
       note(
-        `\n已写入规则并回读核对无误：新增 ${added} 条，更新 ${updated} 条，回收 ${planned.reclaim.length} 个 build 的规则。` +
-          `\nR2 通常会在 24 小时内删完这些目录，下次运行会自动回收已完成的规则。` +
+        `\nRules written and verified by reading back: ${added} added, ${updated} updated, rules reclaimed for ${planned.reclaim.length} builds.` +
+          `\nR2 usually finishes deleting these directories within 24 hours; the next run reclaims the finished rules automatically.` +
           (planned.deferred.length > 0 && !planned.quotaExhausted
-            ? `\n另有 ${planned.deferred.length} 个作废 build 因规则名额不够没有挂规则，之后的运行空出名额后再挂。`
+            ? `\n${planned.deferred.length} more obsolete builds got no rule for lack of rule slots; a later run attaches them once slots are freed.`
             : ""),
       );
-      if (planned.quotaExhausted) console.error(`\n注意：${quotaExhaustedNote(planned.deferred.length)}`);
+      if (planned.quotaExhausted) console.error(`\nNote: ${quotaExhaustedNote(planned.deferred.length)}`);
     } catch (error) {
       if (!(error instanceof PruneWriteError)) throw error;
       ({ written, verified, rolledBack, warnings } = error);
       for (const warning of warnings) {
-        console.error(`\n注意：${warning}，请检查你自己的 lifecycle 规则是否完好。`);
+        console.error(`\nNote: ${warning}; check that your own lifecycle rules are intact.`);
       }
       failure = error.detail;
       console.error(`\n${error.message}`);
@@ -308,75 +308,75 @@ async function main(argv: string[]): Promise<number> {
 }
 
 const EXPIRE_NOTE: Record<ExpireState, string> = {
-  new: "新增规则",
-  updated: "改写规则（原规则与当前前缀 / 过期设置不符，或有重复）",
-  pending: "规则已存在，R2 仍在删",
+  new: "new rule",
+  updated: "rewritten rule (the old rule didn't match the current prefix / expiration, or was duplicated)",
+  pending: "rule already exists, R2 is still deleting",
 };
 
 const KEEP_NOTE: Record<KeptBuild["reason"], string> = {
-  online: "线上正在使用",
-  recent: "近期线上",
-  preview: "预览",
-  explicit: "--keep 指定",
-  fresh: "刚写入，暂不判作废",
+  online: "live",
+  recent: "recent live",
+  preview: "preview",
+  explicit: "given with --keep",
+  fresh: "just written, not judged obsolete yet",
 };
 
 function keepNote(build: KeptBuild): string {
-  return build.source ? `${KEEP_NOTE[build.reason]}（${build.source}）` : KEEP_NOTE[build.reason];
+  return build.source ? `${KEEP_NOTE[build.reason]} (${build.source})` : KEEP_NOTE[build.reason];
 }
 
 function printPlan(plan: PrunePlanSummary): void {
-  console.log(`bucket: ${plan.bucket}    前缀: ${normalizePrefix(plan.prefix) || "（bucket 根）"}`);
+  console.log(`bucket: ${plan.bucket}    prefix: ${normalizePrefix(plan.prefix) || "(bucket root)"}`);
   if (plan.onlineBuildId) {
-    console.log(`线上 BUILD_ID: ${plan.onlineBuildId}  （读自 ${plan.probedFrom}）`);
+    console.log(`Live BUILD_ID: ${plan.onlineBuildId}  (read from ${plan.probedFrom})`);
   }
   // 同时给了 --url 与 --worker 时，最新 deployment 里还可能有别的线上 build（灰度）
   const fromDeployment = plan.onlineBuildIds.filter((id) => id !== plan.onlineBuildId);
   if (fromDeployment.length > 0) {
     console.log(
-      `${plan.onlineBuildId ? "另有" : ""}线上 BUILD_ID: ${fromDeployment.join(", ")}  （读自最新的 deployment）`,
+      `${plan.onlineBuildId ? "Other live" : "Live"} BUILD_ID: ${fromDeployment.join(", ")}  (read from the latest deployment)`,
     );
   }
   if (plan.cloudflare) {
     console.log(
-      `Cloudflare：翻看了最近 ${plan.cloudflare.deploymentsScanned} 次部署，` +
-        `共 ${plan.cloudflare.previews} 个预览`,
+      `Cloudflare: looked through the latest ${plan.cloudflare.deploymentsScanned} deployments, ` +
+        `${plan.cloudflare.previews} previews in total`,
     );
   }
 
-  console.log(`\n保留 ${plan.keep.length} 个 build：`);
+  console.log(`\nKeeping ${plan.keep.length} builds:`);
   for (const build of plan.keep) {
-    console.log(`  保留  ${build.buildId}  ${keepNote(build)}`);
+    console.log(`  keep      ${build.buildId}  ${keepNote(build)}`);
   }
 
   if (plan.absent.length > 0) {
-    console.log(`\n以下要保留的 build 不在 bucket 里，无需处理：`);
+    console.log(`\nThese builds to keep aren't in the bucket, nothing to do:`);
     for (const build of plan.absent) {
-      console.log(`  跳过  ${build.buildId}  ${keepNote(build)}`);
+      console.log(`  skip      ${build.buildId}  ${keepNote(build)}`);
     }
   }
 
   if (plan.expire.length > 0) {
-    console.log(`\n交给 R2 删除 ${plan.expire.length} 个 build：`);
+    console.log(`\nHanding ${plan.expire.length} builds to R2 for deletion:`);
     for (const build of plan.expire) {
-      console.log(`  删除  ${build.buildId}  ${EXPIRE_NOTE[build.state]}`);
+      console.log(`  delete    ${build.buildId}  ${EXPIRE_NOTE[build.state]}`);
     }
   }
 
   if (plan.deferred.length > 0) {
     console.log(
-      `\nlifecycle 规则名额不够（R2 每个 bucket 最多 ${MAX_RULES} 条；本工具挂规则时一般给你自己的规则留 ${RESERVED_RULES} 条余量，` +
-        `你自己的规则加上别的前缀下目录已删空、却没被回收的规则已经挤进这段余量时才挂满 ${MAX_RULES} 条），` +
-        `以下 ${plan.deferred.length} 个保留集之外的 build 这次不挂规则（名额一条不剩时可能没读写入时间，刚写入的也可能列在这里）：`,
+      `\nNot enough lifecycle rule slots (R2 allows at most ${MAX_RULES} per bucket; this tool normally leaves ${RESERVED_RULES} spare for your own rules, ` +
+        `filling all ${MAX_RULES} only when your own rules plus other prefixes' rules whose directories are empty but not reclaimed have eaten into that margin), ` +
+        `so these ${plan.deferred.length} builds outside the keep set get no rule this time (with no slots left, write times may not have been read, so freshly written builds may be listed here too):`,
     );
     if (plan.quotaExhausted) {
-      for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额永远空不出来，要手动清理规则`);
+      for (const build of plan.deferred) console.log(`  defer     ${build.buildId}  slots can never be freed, rules need manual cleanup`);
       console.log(`  ${quotaExhaustedNote(plan.deferred.length)}`);
     } else {
-      for (const build of plan.deferred) console.log(`  推迟  ${build.buildId}  名额不够，之后的运行再挂`);
+      for (const build of plan.deferred) console.log(`  defer     ${build.buildId}  not enough slots, a later run attaches it`);
       console.log(
-        `  R2 删完已挂规则的目录后，之后的运行会回收那些规则、空出名额，逐轮挂完。名额若被本工具为别的前缀写的规则占着，` +
-          `要等那个前缀的运行回收；改 --prefix 前留下的旧前缀规则不会自己回收，得手动删掉。`,
+        `  Once R2 finishes deleting the directories that have rules, later runs reclaim those rules and free slots, attaching the rest round by round. ` +
+          `Slots held by this tool's rules for other prefixes wait for that prefix's run to reclaim them; rules left by an old prefix from before a --prefix change are never reclaimed and must be deleted manually.`,
       );
     }
   }
@@ -385,16 +385,16 @@ function printPlan(plan: PrunePlanSummary): void {
   const emptied = plan.reclaim.filter((r) => r.reason === "emptied");
 
   if (emptied.length > 0) {
-    console.log(`\n回收 ${emptied.length} 个 build 的已完成规则：`);
-    for (const rule of emptied) console.log(`  回收  ${rule.buildId}  目录已空`);
+    console.log(`\nReclaiming finished rules for ${emptied.length} builds:`);
+    for (const rule of emptied) console.log(`  reclaim   ${rule.buildId}  directory is empty`);
   }
 
   if (revived.length > 0) {
-    console.log(`\n警告：以下 build 带着删除规则却又要保留，规则将被立即摘除：`);
-    for (const rule of revived) console.log(`  摘除  ${rule.buildId}`);
+    console.log(`\nWarning: these builds have deletion rules but must be kept; the rules will be removed right away:`);
+    for (const rule of revived) console.log(`  remove    ${rule.buildId}`);
     console.log(
-      `  这通常发生在回滚到旧 build 之后。摘除前 R2 可能已经删掉了它的部分缓存，` +
-        `那些页面会在下次访问时回源重新渲染。`,
+      `  This usually happens after rolling back to an old build. R2 may already have deleted part of its cache before the removal; ` +
+        `those pages will be re-rendered from the origin on their next visit.`,
     );
   }
 }
@@ -426,9 +426,9 @@ function toJson(plan: PrunePlanSummary) {
 /** 名额永远空不出来、但这趟仍有别的改动要写时的提示：推迟的 build 不会自己挂上，下一趟没别的可写时会中止 */
 function quotaExhaustedNote(deferred: number): string {
   return (
-    `你自己的规则加上没人回收的规则（多半是改 --prefix 前的旧前缀写的、目录已经删空的）已经占满 ${MAX_RULES} 条，` +
-    `名额永远空不出来，这 ${deferred} 个推迟的 build 等多少轮也挂不上；下一趟没有别的改动可写时会中止（退出码 1）。` +
-    `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉，空出名额后重跑。`
+    `Your own rules plus rules nobody will reclaim (most likely written for an old prefix before a --prefix change, with directories already empty) fill all ${MAX_RULES} slots, ` +
+    `so slots can never be freed and these ${deferred} deferred builds will never get rules however many runs you wait; the next run with nothing else to write will abort (exit code 1). ` +
+    `Find the rules you no longer need with npx wrangler r2 bucket lifecycle list <bucket>, delete them manually, and run again once slots are freed.`
   );
 }
 
@@ -436,7 +436,7 @@ async function confirm(): Promise<boolean> {
   // 提示走 stderr，免得把 --json 的 stdout 弄脏
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
-    const answer = await rl.question("\n写入以上规则？[y/N] ");
+    const answer = await rl.question("\nWrite the rules above? [y/N] ");
     return /^y(es)?$/i.test(answer.trim());
   } finally {
     rl.close();

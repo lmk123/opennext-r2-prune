@@ -97,7 +97,7 @@ describe("withRetry", () => {
         1_000,
       ).catch((error: unknown) => error);
       await vi.runAllTimersAsync();
-      expect(String(await pending)).toMatch(/1 秒内没有收完响应/);
+      expect(String(await pending)).toMatch(/not fully received within 1 seconds/);
     } finally {
       vi.useRealTimers();
     }

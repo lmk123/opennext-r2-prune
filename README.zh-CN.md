@@ -59,7 +59,7 @@ DELETE。
    保证每轮都能挂上几条）。这一步放在上一步之后，
    刚写入、先不判的 build 不占名额。已经挂着规则的 build 照旧留着规则；剩下的名额不够给每个新判作废的
    build 各挂一条时，就分批挂：按写入时间从早到晚挂（`--grace-hours 0` 时没读写入时间，按 build id 排），
-   其余的在计划里单独列为「推迟」：这次不挂规则，也不算保留。R2 删完已挂规则的目录后，之后的运行会回收
+   其余的在计划里单独列为「推迟」（输出里标为 `defer`）：这次不挂规则，也不算保留。R2 删完已挂规则的目录后，之后的运行会回收
    那些规则、空出名额，逐轮挂完。名额一条不剩时不读写入时间（这时刚写入的 build 也列为推迟），名额永远
    空不出来、要退出时除外。
    名额被本工具为别的前缀写的、目录还没删完的规则占着时只推迟，不退出（R2 删完后那个前缀的运行会回收）；
@@ -80,7 +80,7 @@ DELETE。
 列一次预览、每个预览读一次 `BUILD_ID`。读站点、近期版本与预览几条线同时进行，各自内部并发探测。
 
 因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
-直接告诉你「规则已经是最新的，无需改动」。
+直接告诉你 `Rules are already up to date, no changes needed.`。
 
 ## 用法
 
@@ -94,6 +94,8 @@ npx opennext-r2-prune \
   --secret-access-key <R2_SECRET_ACCESS_KEY> \
   --dry-run
 ```
+
+命令行的输出和报错信息都是英文。
 
 确认计划无误后去掉 `--dry-run`。交互终端下会让你确认一次；非交互环境（定时任务）必须显式
 传 `--yes`。
@@ -227,7 +229,7 @@ console.log(result.expire, result.written, result.verified);
 选项与命令行开关一一对应，改成驼峰：`--build-id-url` → `buildIdUrl`、`--recent-builds` →
 `recentBuilds`、`--grace-hours` → `graceHours`、`--allow-root-prefix` → `allowRootPrefix`、`--dry-run` → `dryRun`，`--url` 对应
 `siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。参数校验的报错用
-上面的选项名；探测与安全校验阶段的报错沿用命令行的开关名（比如「请改用 --keep」），按这张对应表换算。
+上面的选项名；探测与安全校验阶段的报错沿用命令行的开关名（比如 `Use --keep … instead`），按这张对应表换算。
 
 需要先看计划、再决定写不写时，用两段式的 `planPrune`：
 

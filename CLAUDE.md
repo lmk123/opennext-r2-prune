@@ -22,7 +22,7 @@ pnpm test:e2e                               # 真实 R2 实测，自动读 .env�
 ## 约定
 
 - import 带 `.ts` 后缀：`start` 靠 Node 类型擦除直接跑源码，不会补后缀（不可擦除语法由 tsconfig 的 `erasableSyntaxOnly` 拦住）。
-- 代码注释、报错信息、commit message 都用中文；commit 用 `feat:` / `fix:` / `perf:` / `chore:` 前缀。
+- `src/` 里面向用户的文字（CLI 输出、`USAGE`、库抛出的报错信息）用英文；代码注释、测试名、commit message 用中文。commit 用 `feat:` / `fix:` / `perf:` / `chore:` 前缀。
 - 报错信息要说明是哪一步失败、怎么补救。
 - README 有两份：`README.md` 是英文（npm 页面展示它），`README.zh-CN.md` 是中文，内容逐节对应，改一份要同步另一份。
 - 改动行为时同步更新两份 README 以及 `cli.ts` 里的 `USAGE`。

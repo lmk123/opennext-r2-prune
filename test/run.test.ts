@@ -94,7 +94,7 @@ describe("collectPlan", () => {
         siteUrl: "https://example.com",
         fetchImpl: siteReplying("<html>404</html>", { headers: { "content-type": "text/html" } }),
       }),
-    ).rejects.toThrow(/HTML[\s\S]*请改用 --keep/);
+    ).rejects.toThrow(/HTML[\s\S]*Use --keep/);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
@@ -163,7 +163,7 @@ describe("collectPlan", () => {
     expect(state.plan.keep).toContainEqual({
       buildId: "deploying",
       reason: "fresh",
-      source: "写入于 2026-11-25T11:31:02.000Z",
+      source: "written at 2026-11-25T11:31:02.000Z",
     });
     expect(state.plan.expire.map((b) => b.buildId)).toEqual(["old1"]);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
@@ -214,7 +214,7 @@ describe("collectPlan", () => {
   });
 
   it("写入时间解析不出时中止，没有写请求", async () => {
-    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], writtenAt: { old1: "昨天" } });
+    const { store, calls } = fakeR2({ buildIds: ["live", "old1"], writtenAt: { old1: "yesterday" } });
     await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(
       XmlAssumptionError,
     );
@@ -250,7 +250,7 @@ describe("collectPlan", () => {
     const store = new R2Store({ ...CREDS, fetchImpl });
 
     await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"] })).rejects.toThrow(
-      /读取 build 目录的写入时间失败/,
+      /Reading the write time of a build directory failed/,
     );
     expect(slowAborted).toBe(true);
     expect(methods).not.toContain("PUT");
@@ -264,7 +264,7 @@ describe("collectPlan", () => {
     });
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["bogus"], force: true }),
-    ).rejects.toThrow(/没有交集/);
+    ).rejects.toThrow(/no overlap/);
     expect(calls.some((c) => new URL(c.url).searchParams.get("max-keys") === "1")).toBe(false);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
@@ -362,7 +362,7 @@ describe("collectPlan 与规则总数上限", () => {
     const { store, calls } = fakeR2({ buildIds: ["live", "old1"], lifecycle: userRules(MAX_RULES) });
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
-    ).rejects.toThrow(/核对 lifecycle 规则名额时中止/);
+    ).rejects.toThrow(/Aborted while checking lifecycle rule slots/);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
   });
 
@@ -410,7 +410,7 @@ describe("collectPlan 与规则总数上限", () => {
     });
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now }),
-    ).rejects.toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\//);
+    ).rejects.toThrow(/Aborted while checking lifecycle rule slots[\s\S]*site-b\//);
     expect(calls.some((c) => c.method === "PUT")).toBe(false);
     // 500 条规则同在一个前缀下，列一次目录就够，不逐条探查
     expect(otherScopeLists(calls, "site-b/")).toBe(1);
@@ -471,7 +471,7 @@ describe("collectPlan 与规则总数上限", () => {
     const store = new R2Store({ ...CREDS, fetchImpl });
 
     await expect(collectPlan({ store, prefix: "incremental-cache", keep: ["live"], now: () => now })).rejects.toThrow(
-      /列出本工具在别的缓存前缀下写过规则的 build 目录失败/,
+      /Listing build directories under other cache prefixes this tool has written rules for failed/,
     );
     expect(slowAborted).toBe(true);
     expect(methods).not.toContain("PUT");
@@ -574,7 +574,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     </Rule></LifecycleConfiguration>`;
     const { store, calls } = sharedBucket({ "": ["live", "old9", "site-a"] }, lifecycle);
     await expect(collectPlan({ store, prefix: "", allowRootPrefix: true, keep: ["live"] })).rejects.toThrow(
-      /互相嵌套/,
+      /is nested with/,
     );
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
@@ -583,7 +583,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     const bucket = sharedBucket({ "site-a/": ["live", "old1", "nested"], "site-a/nested/": ["live", "old2"] });
     await run(bucket.store, "site-a/nested");
     const before = bucket.calls.length;
-    await expect(collectPlan({ store: bucket.store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/互相嵌套/);
+    await expect(collectPlan({ store: bucket.store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/is nested with/);
     expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
   });
 
@@ -594,7 +594,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     expect(bucket.stored()).toContain("<ID>opennext-r2-prune:site-a/nested/</ID>");
     const before = bucket.calls.length;
     await expect(collectPlan({ store: bucket.store, prefix: "site-a/nested", keep: ["live"] })).rejects.toThrow(
-      /互相嵌套/,
+      /is nested with/,
     );
     expect(bucket.calls.slice(before).every((method) => method === "GET")).toBe(true);
   });
@@ -624,8 +624,8 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     </Rule></LifecycleConfiguration>`;
     const longPrefix = `${"p".repeat(240)}/`;
     const cases: { prefix: string; dirs: Record<string, string[]>; lifecycle: string | undefined; error: RegExp }[] = [
-      { prefix: "site-a", dirs: { "site-a/": ["live", "old1", "nested"] }, lifecycle, error: /互相嵌套/ },
-      { prefix: longPrefix, dirs: { [longPrefix]: ["live", "old1"] }, lifecycle: undefined, error: /更短的 --prefix/ },
+      { prefix: "site-a", dirs: { "site-a/": ["live", "old1", "nested"] }, lifecycle, error: /is nested with/ },
+      { prefix: longPrefix, dirs: { [longPrefix]: ["live", "old1"] }, lifecycle: undefined, error: /shorter --prefix/ },
       { prefix: "", dirs: { "": ["live", "old1"] }, lifecycle: undefined, error: /--allow-root-prefix/ },
     ];
     for (const c of cases) {
@@ -646,7 +646,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
   it("规则 ID 超出长度上限时中止，不发任何写请求", async () => {
     const prefix = `${"p".repeat(240)}/`;
     const { store, calls } = sharedBucket({ [prefix]: ["live", "old1"] });
-    await expect(collectPlan({ store, prefix, keep: ["live"] })).rejects.toThrow(/更短的 --prefix/);
+    await expect(collectPlan({ store, prefix, keep: ["live"] })).rejects.toThrow(/shorter --prefix/);
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
 
@@ -657,7 +657,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
       getLifecycle: async () => ({ prefix: "site-b/", own: [], foreign: [], others: [], malformed: [] }),
       putLifecycle: async () => void puts++,
     } as unknown as R2Store;
-    await expect(collectPlan({ store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/内部错误/);
+    await expect(collectPlan({ store, prefix: "site-a", keep: ["live"] })).rejects.toThrow(/Internal error/);
     expect(puts).toBe(0);
   });
 
@@ -671,7 +671,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     const seen: string[][] = [];
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
-    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    ).rejects.toThrow(/no way to tell which cache prefix they belong to/);
     expect(seen).toEqual([["opennext-r2-prune:incremental-cache/b2/", "opennext-r2-prune:a//"]]);
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
@@ -687,7 +687,7 @@ describe("多个站点共用一个 bucket（各用各的前缀）", () => {
     const seen: string[][] = [];
     await expect(
       collectPlan({ store, prefix: "incremental-cache", keep: ["live"], onWholeBucketRules: (ids) => void seen.push(ids) }),
-    ).rejects.toThrow(/无从判断它属于哪个缓存前缀/);
+    ).rejects.toThrow(/no way to tell which cache prefix they belong to/);
     expect(seen).toEqual([["opennext-r2-prune:old-cache/b1/"]]);
     expect(calls.every((method) => method === "GET")).toBe(true);
   });
@@ -863,7 +863,7 @@ describe("collectPlan + Cloudflare API", () => {
         fetchImpl: cf.fetchImpl,
         concurrency: 1,
       }),
-    ).rejects.toThrow(/预览 broken/);
+    ).rejects.toThrow(/Preview broken/);
     // 并发 1 时 broken 排在第一个，之后的 20 个预览一个都不该再探
     expect(cf.probed.filter((id) => id.startsWith("p"))).toEqual([]);
   });
@@ -896,7 +896,7 @@ describe("collectPlan + Cloudflare API", () => {
         },
         fetchImpl,
       }),
-    ).rejects.toThrow(/预览 broken/);
+    ).rejects.toThrow(/Preview broken/);
     // 给被中止的退避一点时间收尾，确认它没有再发请求
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(v1Probes).toBe(1);
@@ -1065,7 +1065,7 @@ describe("collectPlan + Cloudflare API", () => {
         cloudflare: { api: cf.api, worker: "w" },
         fetchImpl: cf.fetchImpl,
       }),
-    ).rejects.toThrow(/预览 broken/);
+    ).rejects.toThrow(/Preview broken/);
     // --keep 救不了读不到的预览，不能拿它当建议
     await expect(
       collectPlan({
@@ -1074,7 +1074,7 @@ describe("collectPlan + Cloudflare API", () => {
         cloudflare: { api: cf.api, worker: "w" },
         fetchImpl: cf.fetchImpl,
       }),
-    ).rejects.toThrow(/Cloudflare Access[\s\S]*去掉 --worker/);
+    ).rejects.toThrow(/Cloudflare Access[\s\S]*drop --worker/);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 
@@ -1105,7 +1105,7 @@ describe("collectPlan + Cloudflare API", () => {
         cloudflare: { api: cf.api, worker: "w" },
         fetchImpl: cf.fetchImpl,
       }),
-    ).rejects.toThrow(/没有可访问的 URL[\s\S]*Durable Object/);
+    ).rejects.toThrow(/has no reachable URL[\s\S]*Durable Object/);
   });
 
   it("线上 build 不在 bucket 里仍然报错", async () => {
@@ -1131,7 +1131,7 @@ describe("collectPlan + Cloudflare API", () => {
         cloudflare: { api: cf.api, worker: "w" },
         fetchImpl: cf.fetchImpl,
       }),
-    ).rejects.toThrow(/没有任何 deployment/);
+    ).rejects.toThrow(/has no deployments/);
   });
 });
 
@@ -1242,7 +1242,7 @@ describe("writeAndVerify", () => {
     const { puts, store, getCount } = statefulR2({ mangle: dropOwnPrefix });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(true);
-    expect(result.problems.join()).toContain("作用于整个 bucket");
+    expect(result.problems.join()).toContain("applies to the whole bucket");
     expect(puts).toHaveLength(2);
     expect(puts[1]).not.toContain("opennext-r2-prune:");
     expect(puts[1]).toContain("<ID>mine</ID>");
@@ -1255,7 +1255,7 @@ describe("writeAndVerify", () => {
       mangle: (xml) => dropOwnPrefix(xml).replace("<ID>opennext-r2-prune:incremental-cache/old1/</ID>", "<ID>renamed</ID>"),
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
-    expect(result.problems).toContain("规则 old1 读回来不见了");
+    expect(result.problems).toContain("rule old1 is missing when read back");
     expect(result.rolledBack).toBe(true);
     expect(puts[1]).not.toContain("renamed");
     expect(puts[1]).toContain("<ID>mine</ID>");
@@ -1276,7 +1276,7 @@ describe("writeAndVerify", () => {
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(false);
-    expect(String(result.rollbackError)).toContain("撤销后读回来仍有本工具的规则");
+    expect(String(result.rollbackError)).toContain("still read back after the rollback");
   });
 
   it("写入成功但回读失败时无从核对，照样撤销", async () => {
@@ -1288,7 +1288,7 @@ describe("writeAndVerify", () => {
     // 撤销之后也读不回来，无法确认；写入本身是成功的，新规则可能还在
     expect(result.rolledBack).toBe(false);
     expect(result.written).toBe(true);
-    expect(String(result.rollbackError)).toContain("回读确认失败");
+    expect(String(result.rollbackError)).toContain("reading it back to confirm failed");
   });
 
   it("只有外部规则条数不符时只给提示，不撤销本工具的规则", async () => {
@@ -1296,7 +1296,7 @@ describe("writeAndVerify", () => {
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBeNull();
     expect(result.problems).toEqual([]);
-    expect(result.warnings).toEqual(["外部规则写入 1 条，读回来 0 条"]);
+    expect(result.warnings).toEqual(["external rules: 1 written, 0 read back"]);
     expect(puts).toHaveLength(1);
   });
 
@@ -1312,7 +1312,7 @@ describe("writeAndVerify", () => {
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
     expect(result.rolledBack).toBe(true);
-    expect(result.warnings).toContain("撤销后外部规则写入 1 条，读回来 0 条");
+    expect(result.warnings).toContain("after the rollback, external rules: 1 written, 0 read back");
   });
 
   it("写入请求报错但其实已生效时，回读一致就当作已写入", async () => {
@@ -1335,12 +1335,12 @@ describe("writeAndVerify", () => {
   it("写入超时、读回来既不是新配置也不是旧配置时（生效了但被改写），照样撤销", async () => {
     const mutated: LifecycleDoc = { prefix: "incremental-cache/", own: [{ ...DOC.own[0]!, expireDays: 30 }], foreign: [FOREIGN] };
     const { store, putDocs, getCount } = scriptedStore({
-      puts: [new Error("网络超时"), null],
+      puts: [new Error("network timeout"), null],
       gets: [mutated, mutated, mutated, BEFORE],
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
-    expect(result.problems[0]).toContain("写入请求报错：网络超时");
-    expect(result.problems.join()).toContain("过期天数");
+    expect(result.problems[0]).toContain("the write request errored: network timeout");
+    expect(result.problems.join()).toContain("expiration days");
     expect(result.rolledBack).toBe(true);
     expect(result.written).toBe(false);
     expect(putDocs[1]).toEqual({ prefix: "incremental-cache/", own: [], foreign: [FOREIGN] });
@@ -1350,12 +1350,12 @@ describe("writeAndVerify", () => {
 
   it("写入超时且读不回来时无从判断，照样撤销，报错里同时写明两个原因", async () => {
     const { store, putDocs } = scriptedStore({
-      puts: [new Error("网络超时"), null],
-      gets: [new Error("读取超时"), BEFORE],
+      puts: [new Error("network timeout"), null],
+      gets: [new Error("read timeout"), BEFORE],
     });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
-    expect(result.problems).toEqual(["写入请求报错：网络超时"]);
-    expect(String(result.readBackError)).toContain("读取超时");
+    expect(result.problems).toEqual(["the write request errored: network timeout"]);
+    expect(String(result.readBackError)).toContain("read timeout");
     expect(result.rolledBack).toBe(true);
     expect(putDocs).toHaveLength(2);
   });
@@ -1363,7 +1363,7 @@ describe("writeAndVerify", () => {
   it("写入被明确拒绝且读不回来时，照常报写入失败，不撤销", async () => {
     const { store, putDocs } = scriptedStore({
       puts: [new S3Error("putLifecycle", 403, "AccessDenied", "Access Denied")],
-      gets: [new Error("读取超时")],
+      gets: [new Error("read timeout")],
     });
     await expect(writeAndVerify(store, DOC, BEFORE, NO_WAIT)).rejects.toThrow(WriteNotAppliedError);
     expect(putDocs).toHaveLength(1);
@@ -1386,8 +1386,8 @@ describe("writeAndVerify", () => {
   it("写入请求报错、读回来却有对整个 bucket 生效的规则时，照样撤销", async () => {
     const { puts, store } = statefulR2({ firstPutError: "applied", mangle: dropOwnPrefix });
     const result = await writeAndVerify(store, DOC, BEFORE, NO_WAIT);
-    expect(result.problems[0]).toContain("写入请求报错");
-    expect(result.problems.join()).toContain("作用于整个 bucket");
+    expect(result.problems[0]).toContain("the write request errored");
+    expect(result.problems.join()).toContain("applies to the whole bucket");
     expect(result.rolledBack).toBe(true);
     expect(puts).toHaveLength(2);
     expect(puts[1]).not.toContain("opennext-r2-prune:");

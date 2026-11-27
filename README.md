@@ -74,7 +74,7 @@ looks at the situation afresh and recomputes the complete answer.
    freshly written, undecided builds don't take a slot. Builds that already have a rule keep it; when the
    remaining slots aren't enough to give every newly obsolete build its own rule, rules are attached in
    batches: in order of write time, oldest first (with `--grace-hours 0` write times aren't read, so it
-   goes by build id), and the rest are listed separately in the plan as "deferred": no rule this time,
+   goes by build id), and the rest are listed separately in the plan as deferred (marked `defer`): no rule this time,
    but not kept either. Once R2 finishes deleting the directories that do have rules, later runs reclaim
    those rules, free up the slots, and attach the rest round by round. When there are no slots left at
    all, write times aren't read (and freshly written builds are listed as deferred too), except when the
@@ -120,7 +120,7 @@ probing concurrently internally.
 
 Because every run recomputes everything and overwrites the whole configuration, the tool is idempotent:
 if nothing changed, nothing is written; run it twice in a row and the second run simply tells you
-"rules are already up to date, no changes needed".
+"Rules are already up to date, no changes needed."
 
 ## Usage
 
@@ -281,7 +281,7 @@ Options map one-to-one to the command-line flags, in camelCase: `--build-id-url`
 `allowRootPrefix`, `--dry-run` → `dryRun`; `--url` maps to `siteUrl`, and `--keep` is a string array.
 There are also `fetch` (replaces all network requests) and `onRetry`. Parameter validation errors use the
 option names above; errors from the probing and safety-check stages keep the command-line flag names
-(e.g. "use --keep instead") — translate them with this mapping.
+(e.g. "Use --keep … instead") — translate them with this mapping.
 
 To look at the plan before deciding whether to write, use the two-phase `planPrune`:
 

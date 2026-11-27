@@ -161,7 +161,7 @@ describe("基本流程", () => {
     const planned = await planPrune(opts);
     expect(planned.keep).toEqual([
       { buildId: "build-a", reason: "explicit" },
-      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
+      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^written at \d{4}-\d\d-\d\dT/) },
     ]);
     expect(planned.expire).toEqual([]);
 
@@ -309,17 +309,17 @@ describe("安全校验没过时中止，且没有写请求", () => {
 
   it("前缀为空、保留的 build 不存在、保留集与现存 build 无交集", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
-    await expectAbort("", { keep: ["build-a"] }, /--prefix 为空/);
-    await expectAbort(SITE_A, { keep: ["no-such-build"] }, /不存在/);
-    await expectAbort(SITE_A, { keep: ["no-such-build"], force: true }, /没有交集/);
+    await expectAbort("", { keep: ["build-a"] }, /empty --prefix/);
+    await expectAbort(SITE_A, { keep: ["no-such-build"] }, /don't exist in the bucket/);
+    await expectAbort(SITE_A, { keep: ["no-such-build"], force: true }, /no overlap/);
   });
 
   it("前缀与已有规则的前缀互相嵌套", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
     await prune(options(SITE_A, { keep: ["build-a"] }).opts);
 
-    await expectAbort(E2E_ROOT, { keep: ["site-a"] }, /互相嵌套/);
-    await expectAbort(`${SITE_A}/build-a`, { keep: ["x"] }, /互相嵌套/);
+    await expectAbort(E2E_ROOT, { keep: ["site-a"] }, /is nested with/);
+    await expectAbort(`${SITE_A}/build-a`, { keep: ["x"] }, /is nested with/);
   });
 
   it("本工具标记开头、前缀里却有空格这类拆不开的字符的规则", async () => {
@@ -331,7 +331,7 @@ describe("安全校验没过时中止，且没有写请求", () => {
           `<Filter><Prefix>${E2E_ROOT}/never-used/</Prefix></Filter><Expiration><Days>3650</Days></Expiration></Rule>`,
       ]),
     );
-    await expectAbort(SITE_A, { keep: ["build-a"] }, /拆不出/, XmlAssumptionError);
+    await expectAbort(SITE_A, { keep: ["build-a"] }, /can't be split/, XmlAssumptionError);
   });
 
   it("planPrune 之后配置被改过，apply() 不写入", async () => {

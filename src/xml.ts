@@ -28,8 +28,8 @@ export class XmlAssumptionError extends Error {
 function assertLiteral(value: string, what: string): string {
   if (!LITERAL_SAFE.test(value)) {
     throw new XmlAssumptionError(
-      `${what} 含有预期之外的字符：${JSON.stringify(value)}。` +
-        `本工具假定该值只由字母、数字、_ - . / 组成，出现其它字符说明 bucket 内容不符合 OpenNext 的布局，已中止。`,
+      `${what} contains unexpected characters: ${JSON.stringify(value)}. ` +
+        `This tool assumes the value consists only of letters, digits and _ - . /; other characters mean the bucket contents don't match OpenNext's layout, so it aborted.`,
     );
   }
   return value;
@@ -65,7 +65,7 @@ export function parseListObjects(xml: string): ListObjectsResult {
   const commonPrefixes = blocks(xml, "CommonPrefixes")
     .map((block) => text(block, "Prefix"))
     .filter((p): p is string => p !== undefined)
-    .map((p) => assertLiteral(p, "CommonPrefixes 中的 Prefix"));
+    .map((p) => assertLiteral(p, "Prefix in CommonPrefixes"));
 
   return {
     commonPrefixes,
@@ -210,10 +210,10 @@ function parseRuleBody(block: string, strict: boolean): RuleBody {
   const barePrefix = filterPrefix === undefined ? text(block, "Prefix")?.trim() : undefined;
   const days = Number(text(text(block, "Expiration") ?? "", "Days")?.trim());
   return {
-    prefix: literal(filterPrefix ?? "", "规则中的 Prefix"),
+    prefix: literal(filterPrefix ?? "", "Prefix in a rule"),
     expireDays: Number.isInteger(days) && days > 0 ? days : 0,
     enabled: text(block, "Status")?.trim() === "Enabled",
-    ...(barePrefix ? { barePrefix: literal(barePrefix, "规则中的裸 Prefix") } : {}),
+    ...(barePrefix ? { barePrefix: literal(barePrefix, "Bare Prefix in a rule") } : {}),
   };
 }
 
@@ -223,19 +223,19 @@ function parseRuleBody(block: string, strict: boolean): RuleBody {
  */
 export function renderLifecycle(doc: LifecycleDoc): string {
   const rules = doc.own.map((rule) => {
-    assertLiteral(rule.buildId, "待写入规则的 buildId");
-    assertLiteral(rule.prefix, "待写入规则的 Prefix");
+    assertLiteral(rule.buildId, "buildId of a rule to write");
+    assertLiteral(rule.prefix, "Prefix of a rule to write");
     // ID 与实际作用的前缀不一致的规则写下去，下一趟会按 ID 认领它，删的却是别处
     if (rule.prefix !== rulePrefix(doc.prefix, rule.buildId)) {
       throw new XmlAssumptionError(
-        `待写入规则 ${rule.buildId} 的 Prefix 是 ${rule.prefix}，与缓存前缀「${doc.prefix}」对不上，已中止写入，` +
-          `没有发出写请求。直接调用 renderLifecycle / putLifecycle 时请让每条规则的 Prefix 等于 <缓存前缀><buildId>/；` +
-          `否则这是本工具的缺陷，请带上这条报错提 issue。`,
+        `The Prefix of rule ${rule.buildId} to write is ${rule.prefix}, which doesn't match the cache prefix "${doc.prefix}"; the write was aborted ` +
+          `and no write request was sent. When calling renderLifecycle / putLifecycle directly, make each rule's Prefix equal <cache prefix><buildId>/; ` +
+          `otherwise this is a bug in this tool, please open an issue with this error.`,
       );
     }
     if (!Number.isInteger(rule.expireDays) || rule.expireDays < 1) {
       throw new XmlAssumptionError(
-        `待写入规则 ${rule.buildId} 的过期天数不合法：${rule.expireDays}，S3 要求至少 1 天。`,
+        `Rule ${rule.buildId} to write has invalid expiration days: ${rule.expireDays}; S3 requires at least 1 day.`,
       );
     }
     return (

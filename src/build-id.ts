@@ -29,7 +29,7 @@ export function buildIdUrlFor(siteUrl: string): string {
     // 最常见的是漏了协议（SITE_URL=example.com）。不包一层，调用方拿到的是 URL
     // 构造器的原生 TypeError，会绕过 cli 的错误分类直接甩出堆栈。
     throw new BuildIdProbeError(
-      `站点地址不是合法的 URL：${JSON.stringify(siteUrl)}。请带上协议，例如 https://example.com。`,
+      `The site URL is not a valid URL: ${JSON.stringify(siteUrl)}. Include the protocol, e.g. https://example.com.`,
     );
   }
 }
@@ -62,19 +62,19 @@ export async function probeBuildId(
       signal,
     );
   } catch (error) {
-    throw new BuildIdProbeError(`请求 ${url} 失败：${String(error)}`);
+    throw new BuildIdProbeError(`Request to ${url} failed: ${String(error)}`);
   }
 
   if (isTransientStatus(response.status)) {
     throw new BuildIdProbeError(
-      `${url} 连续 ${MAX_ATTEMPTS} 次返回 HTTP ${response.status}` +
-        `（${response.status === 429 ? "被限流" : "服务端故障"}），稍后重跑即可。`,
+      `${url} returned HTTP ${response.status} ${MAX_ATTEMPTS} times in a row` +
+        ` (${response.status === 429 ? "rate limited" : "server error"}); just run again later.`,
       true,
     );
   }
   if (!response.ok) {
     throw new BuildIdProbeError(
-      `${url} 返回 HTTP ${response.status}，可能没有把 BUILD_ID 暴露出来。`,
+      `${url} returned HTTP ${response.status}; BUILD_ID may not be exposed.`,
     );
   }
 
@@ -82,14 +82,14 @@ export async function probeBuildId(
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("text/html")) {
     throw new BuildIdProbeError(
-      `${url} 返回的是 HTML（content-type: ${contentType}），说明请求被页面路由接管了，而不是命中静态的 BUILD_ID 文件。`,
+      `${url} returned HTML (content-type: ${contentType}), which means the request was handled by a page route instead of hitting the static BUILD_ID file.`,
     );
   }
 
   const buildId = (await response.text()).trim();
   if (!BUILD_ID_PATTERN.test(buildId)) {
     throw new BuildIdProbeError(
-      `${url} 的响应不像一个 build id：${JSON.stringify(buildId.slice(0, 80))}。`,
+      `The response from ${url} doesn't look like a build id: ${JSON.stringify(buildId.slice(0, 80))}.`,
     );
   }
 

@@ -77,7 +77,7 @@ async function sendWithTimeout(
   if (signal?.aborted) controller.abort(signal.reason);
   else signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(
-    () => controller.abort(new Error(`${timeoutMs / 1000} 秒内没有收完响应`)),
+    () => controller.abort(new Error(`response not fully received within ${timeoutMs / 1000} seconds`)),
     timeoutMs,
   );
   try {
