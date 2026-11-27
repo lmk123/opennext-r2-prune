@@ -2,87 +2,20 @@
 
 [English](README.md) | 简体中文
 
-清理 `@opennextjs/cloudflare` 部署在 Cloudflare R2 上的过期增量缓存。
+清理 `@opennextjs/cloudflare` 留在 Cloudflare R2 上、已经没人用的旧 build 增量缓存。
 
-每次发布，OpenNext 都会以新的 `BUILD_ID` 为名在 R2 里建一个缓存目录，且从不清理旧的。
-本工具找出已经没人用的 build 目录 —— 不是最近几次上线的、也不属于任何预览 —— 把它们交给
-R2 删掉。
+## 特点
 
-## 它为什么快
-
-S3/R2 是扁平的 key-value 存储，没有「删除目录」这种操作，所以常规做法（rclone、
-aws-cli、各种 S3 清理工具）都得先把目录里的对象一个个列出来再删。缓存对象积累到几十万个
-时，光是列举就成了主要开销 —— rclone 更慢，因为它连批量删除接口都不用，是逐个对象发
-DELETE。
-
-本工具换了条路：**给每个作废的 build 目录挂一条 R2 object lifecycle 规则**，把删除
-下沉给 R2 服务端。整个过程从不遍历缓存对象，目录里有 1 万还是 100 万个文件，代价完全
-一样。发给 R2 的请求数也几乎是恒定的：列一次目录、读一次现有规则、写一次新规则、再读回来
-核对一次，外加给这次要**新**挂规则的 build 各读一次写入时间（只取一个对象）—— 已经挂上规则的
-不再重看，所以 bucket 里积了 3 个还是 300 个待删的 build，定期跑时发出去的请求差不多一样多。只有第一次
-接手一个积了很多 build、还没挂过规则的 bucket 时，要把它们的写入时间逐个读一遍。
-
-这不是「给缓存设个自动过期时间」—— 线上 `BUILD_ID` 能活多久无法预知，那种用法不成立。
-这里 lifecycle 纯粹是执行手段：**该删哪些 build 由工具明确判定**，规则只负责替我们把
-已经判死刑的目录清掉。
-
-## 一次运行发生了什么
-
-整个过程是一条直线，本地不留任何状态或缓存文件 —— 每次运行都把情况重新看一遍，重新算出
-完整的答案。
-
-1. **看 bucket 里现在有哪些 build 目录。** 只问 R2 要「一级目录都有哪些」，通常一个请求就
-   返回了。目录里堆了多少缓存文件，这一步完全不关心 —— 这正是它快的原因。
-
-2. **读一遍 bucket 上现有的 lifecycle 规则。** 分成两堆：本工具自己加的（规则 ID 有固定
-   前缀），和你自己配的。后者原样收着，最后原样放回去。这一步与上一步同时进行。
-
-3. **问哪些 build 还有人在用。** 通过 Cloudflare API 找出最近几次上线的版本和全部预览，
-   逐个读它们的 `/BUILD_ID`（详见下文），并绕开一切中间缓存。任何一个读不到、或读回来的
-   东西不像一个 build id（比如是一整页 HTML），就当场退出，不会硬着头皮往下跑。
-   这一步放在列目录之后：探测要花些时间，期间新上传或上线的 build 不会出现在先前列出的
-   目录里，也就不会被误判作废。
-
-4. **算出这次该干什么。** 保留集之外的现存 build 全部作废，每个配一条删除规则（名额不够时见第 6 步）；已经删空的
-   目录，把规则回收掉；又活过来的 build（比如回滚），把规则摘掉。这一步不发任何请求，除了第 5、6 步
-   的读写入时间和名额核对，安全校验都在这里做完 —— 有一条不过就直接退出，根本走不到写入。
-
-5. **看看要新挂规则的 build 是不是刚写进来的。** OpenNext 部署时先把新 build 的缓存写进 R2，
-   再上传版本、切流量；正赶上部署时，新 build 已经在 bucket 里，却既不是线上也不在任何
-   deployment 里。所以对每个这次要新挂规则的 build，取它目录里的一个对象看写入时间，不满
-   `--grace-hours`（默认 24 小时）的先不判，下次运行再看。写入了多久按 R2 响应里的服务端时间算，跑工具的
-   机器时钟不准也不影响。读取失败或时间解析不出就退出；目录在这期间已被删空的照常挂规则，下次运行会回收。
-
-6. **数一数规则名额够不够。** R2 每个 bucket 最多 1000 条 lifecycle 规则，你自己的规则、本工具在
-   各个前缀下的规则共用这个上限。本工具挂规则时总数只挂到 990 条，给你自己的规则留 10 条余量（你自己的
-   规则、加上本工具为别的前缀写的、目录已经删空却没被回收的规则，已经挤进这段余量、达到 990 条时让给本工具，挂到 1000 条，
-   保证每轮都能挂上几条）。这一步放在上一步之后，
-   刚写入、先不判的 build 不占名额。已经挂着规则的 build 照旧留着规则；剩下的名额不够给每个新判作废的
-   build 各挂一条时，就分批挂：按写入时间从早到晚挂（`--grace-hours 0` 时没读写入时间，按 build id 排），
-   其余的在计划里单独列为「推迟」（输出里标为 `defer`）：这次不挂规则，也不算保留。R2 删完已挂规则的目录后，之后的运行会回收
-   那些规则、空出名额，逐轮挂完。名额一条不剩时不读写入时间（这时刚写入的 build 也列为推迟），名额永远
-   空不出来、要退出时除外。
-   名额被本工具为别的前缀写的、目录还没删完的规则占着时只推迟，不退出（R2 删完后那个前缀的运行会回收）；
-   但名额永远空不出来时会退出：你自己的规则、加上本工具为别的前缀写的、目录已经删空却没被回收的规则
-   （多半是改 `--prefix` 前的旧前缀，没有哪一趟会回收它们），就占满了 1000 条，又有新判作废的 build
-   要挂规则、这趟也没有别的改动要写时（还有别的改动要写时照常写入，计划和写入后的提示会说明名额永远空不出来）。
-   为了分辨这种情况，名额一条不剩、别的前缀的规则又多到可能占满名额时，会把那些前缀各列一遍
-   目录，看每条规则作用的目录还在不在。按条看而不是看整个前缀空不空：旧前缀里通常还留着切换时保留的 build，
-   前缀本身永远不空。名额为 0 时每次运行都要列一遍，好在列的是目录、不是每条规则一个请求。目录删空、规则还在也
-   可能只是在用的站点还没跑到回收那一趟，这时也会退出，让那个站点先跑一趟即可。
-
-7. **把计划打给你看，确认后写回去。** 写入是整份 lifecycle 配置的全量覆盖：你自己的规则
-   原样搬回，本工具的规则按上一步的结论重新生成。写完立刻把配置读回来逐条核对，确认每条规则
-   的前缀、天数都如实生效（见「安全设计」）。剩下的交给 R2，它通常在 24 小时内删完。
-
-花在 R2 上的通常只有四个请求，外加每个这次要新挂规则的 build 一个（因名额推迟的也算，下次运行会再读一次；名额一条不剩时不读，名额永远空不出来时照读）：列目录、读规则、读写入时间、写规则、回读核对（无需写入时没有后两个）。刚写入、暂不判的 build 没挂规则，宽限期内每次运行都会再读一次；第一次接手积了很多 build 的 bucket 时，每个都要读一次。名额一条不剩、本工具为别的前缀写的规则又多到可能占满名额时，那些前缀再各列一次目录（和列本前缀一样，通常每个前缀一个请求）。回读一时对不上会隔几秒重读，最多 3 次；仍不符或读不回来时再多一次撤销写入和一次确认回读。第三步的请求数则随「近期版本数 +
-预览数」增长：列 deployments（通常一页就够）、每个近期版本读一次 URL 再读一次 `BUILD_ID`、
-列一次预览、每个预览读一次 `BUILD_ID`。读站点、近期版本与预览几条线同时进行，各自内部并发探测。
-
-因为每次都是重算加全量覆盖，这个工具是幂等的：情况没变就什么都不写，连着跑两次，第二次会
-直接告诉你 `Rules are already up to date, no changes needed.`。
+- **快，且不随缓存规模变慢**：不逐个列举、删除缓存对象，而是给作废的 build 目录挂 R2 lifecycle 规则，由 R2 在后台删除。目录里有 1 万还是 100 万个文件，耗时一样。
+- **按事实判断保留哪些 build**：直接读线上版本和预览的 `/BUILD_ID`，默认保留最近 3 个线上 build 和所有预览的 build，不依赖本地构建产物。
+- **宁可中止，绝不多删**：任何探测失败、保留集为空、前缀为空等异常都会直接退出，不会降级成「删除全部」；刚写入不满 24 小时的 build 不删，正在部署的新版本不会被误删。
+- **只动自己的规则**：你在 bucket 上配的其它 lifecycle 规则原样保留；写入后回读逐条核对，不符就撤销。
+- **无状态、幂等**：每次运行重新算出完整结果，情况没变就什么都不写，适合放进定时任务。
+- **CLI 与库两用**：库入口只用 Web 标准 API，Node 22.12+ 和 Cloudflare Worker 里都能跑。
 
 ## 用法
+
+### 命令行
 
 ```bash
 npx opennext-r2-prune \
@@ -95,77 +28,27 @@ npx opennext-r2-prune \
   --dry-run
 ```
 
-命令行的输出和报错信息都是英文。
+确认打印出的计划无误后去掉 `--dry-run`。交互终端下会让你确认一次；非交互环境（定时任务）要显式传 `--yes`。所有参数都可以用环境变量代替，完整选项见 `--help`。命令行的输出和报错信息都是英文。
 
-确认计划无误后去掉 `--dry-run`。交互终端下会让你确认一次；非交互环境（定时任务）必须显式
-传 `--yes`。
+常用选项：
 
-所有参数都可以用环境变量代替，见 `--help`。
+| 选项 | 说明 |
+| --- | --- |
+| `--prefix` | 缓存前缀，默认 `incremental-cache`，与 OpenNext 的 `NEXT_INC_CACHE_R2_PREFIX` 一致 |
+| `--recent-builds` | 保留最近几个不同的线上 build，默认 3 |
+| `--keep` | 额外保留的 build id，可重复传 |
+| `--grace-hours` | 写入不满这么多小时的 build 不删，默认 24 |
+| `--url` | 没有 API token 时，只读站点当前的 `/BUILD_ID`（只能保住此刻线上的一个 build） |
 
-R2 API token 的权限见下文「定时任务」一节末尾：`--dry-run` 需要 Admin Read only，写入需要
-Admin Read & Write（Object 级 token 读写不了 lifecycle）。
+### 权限
 
-### 查看写入的规则
-
-工具写的就是 bucket 普通的 Object lifecycle 规则，Cloudflare Dashboard 上能直接看到，和你自己
-配的规则列在一起：
-
-```
-https://dash.cloudflare.com/<账号ID>/r2/<jurisdiction>/buckets/<bucket 名>/settings#object-lifecycle-rules
-```
-
-`<jurisdiction>` 通常是 `default`；bucket 建在 EU 等 jurisdiction 下（`--endpoint` 形如
-`https://<账号ID>.eu.r2.cloudflarestorage.com`）时换成对应的值，比如 `eu`。
-
-也可以用命令行（非 default jurisdiction 加 `--jurisdiction eu` 之类）：
-
-```bash
-npx wrangler r2 bucket lifecycle list <bucket 名>
-```
-
-本工具的规则 ID（即 Dashboard 上的规则名）形如 `opennext-r2-prune:<前缀>/<buildId>/`，前缀为空时是
-`opennext-r2-prune:<buildId>/`。**不要在 Dashboard 上手动改、删当前前缀下的这些规则**，想清理就再跑
-一次工具，它会自己回收已删完的、摘掉不该删的；运行期间改了配置，这一趟会在写入前中止。
-
-### 它怎么知道该保留哪些 build
-
-`@opennextjs/cloudflare` 不需要任何配置就把 `.next/BUILD_ID` 作为静态资源暴露在
-`/BUILD_ID` 上，而且每个 Worker 版本、每个预览都带着自己那份静态资源。所以最贴近事实的来源
-是「找到它的地址，读它的 `/BUILD_ID`」—— 比读本地构建产物可靠，尤其是构建发生在
-Cloudflare 云上、跑清理的机器上压根没有 `.next` 目录时。Cloudflare API 本身拿不到
-BUILD_ID，它只负责告诉我们该去读哪些地址。
-
-**保留集 = 最近 3 个不同的线上 BUILD_ID ∪ 所有预览当前的 BUILD_ID ∪ `--keep` 显式传入的**，
-其余现存 build 里，目录写入已满 `--grace-hours`（默认 24）小时的全部作废，不满的这次先不判。
-
-- **近期线上**：从最新的 deployment 往回翻，逐个读其中版本的 URL
-  （`<版本前缀>-<worker>.<子域>.workers.dev`）上的 `/BUILD_ID`，凑够 3 个**互不相同**的
-  BUILD_ID 就停。只改 secret / vars 也会产生新的版本和 deployment，但 BUILD_ID 不变，这类
-  不占名额。个数用 `--recent-builds` 调。最新那次 deployment 若处于灰度，里面的两个版本都算
-  线上。deployment 按需逐页往回翻，全部翻完仍凑不够时会明确提示，
-  更早的 build 需要用 `--keep` 保留。
-- **预览**：列出 Worker 的全部 [Previews](https://developers.cloudflare.com/workers/previews/)
-  （Workers Builds 给非生产分支跑的 `npx wrangler preview` 创建的就是它），读每个预览 URL
-  上的 `/BUILD_ID`。预览 URL 永远指向该预览最新的一次部署。
-
-近期线上或预览的 build 不在 bucket 里是正常的（旧 build 早已删完，或预览绑了别的 bucket），
-计划里会单独列出、不报错；最新线上版本或 `--keep` 的不在 bucket 里则照常报错 —— 哪怕同一个
-build 同时也是近期版本或预览。
-
-读版本的 `/BUILD_ID` 依赖版本预览 URL，Worker 需开启 workers.dev 与 `preview_urls`。
-**实现了 Durable Object 的 Worker（例如用了 OpenNext 的 DO 队列或 DO tag cache）不会生成版本
-预览 URL**，`--worker` 对它不可用，请改用下面的 `--url` 加 `--keep`。
-
-API token 需要 **Account › Workers Scripts › Read** 权限。
-
-没有 API token 时，也可以只用 `--url https://your-site.com` 读站点当前的 `/BUILD_ID`，
-那样只能保留此刻线上的一个 build，回滚目标和预览的缓存都会被判作废。
-
-任何一个探测失败都会直接退出，绝不会降级成「删除全部」。
+- **R2 API token**：写入需要 **Admin Read & Write**，只跑 `--dry-run` 用 **Admin Read only** 即可。lifecycle 是 bucket 级配置，Object 级 token 读写不了。Admin token 作用于整个账号，请妥善保管。
+- **Cloudflare API token**：需要 **Account › Workers Scripts › Read**。
+- Worker 需开启 workers.dev 与 `preview_urls`，工具要从这些地址读 `/BUILD_ID`。**实现了 Durable Object 的 Worker 没有版本预览 URL**，请改用 `--url` 加 `--keep`。
 
 ### 定时任务
 
-设计上就是给定时任务用的，每周或每月跑一次即可：
+每周或每月跑一次即可：
 
 ```yaml
 # .github/workflows/prune-r2-cache.yml
@@ -188,24 +71,13 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 ```
 
-R2 API token 需要 **Admin Read & Write** 权限；Cloudflare API token 需要 **Workers Scripts › Read**。
-
-lifecycle 是 bucket 级配置，R2 的 Object 级 token **不论只读还是读写**，读、写 lifecycle 都会被拒
-（403 AccessDenied，已在真实 R2 上实测），只有 Admin 级 token 能用。Admin 级 token 无法限定到单个
-bucket，作用于整个账号，请妥善保管、按需设置 TTL。只跑 `--dry-run` 时 **Admin Read only** 就够了，
-它不能写入任何东西，适合首次核对计划。
-
 ### 作为库调用
-
-同样的流程也可以在其它 JS 代码里以函数形式调用。库入口只用 Web 标准 API（`fetch`、
-`AbortSignal`），Node 22.12+ 与 Cloudflare Worker 里都能跑；它不读环境变量、不碰终端，参数全部显式传入。
 
 ```bash
 npm install opennext-r2-prune
 ```
 
 ```ts
-import { createHash } from "node:crypto";
 import { prune } from "opennext-r2-prune";
 
 const result = await prune({
@@ -215,218 +87,41 @@ const result = await prune({
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
   worker: "my-worker",
   apiToken: process.env.CLOUDFLARE_API_TOKEN!,
-  // dryRun: true,
   // 不给 confirm 就直接写入
   confirm: (plan) => plan.expire.length < 50,
-  // 可选：带上 Content-MD5（实测 R2 不校验它，Worker 里没有 MD5 可以不传）
-  md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
   // 务必报出来：探测失败而中止时，这是得知这些危险规则的唯一途径
   onWholeBucketRules: (ids) => console.warn("对整个 bucket 生效的规则：", ids),
 });
-console.log(result.expire, result.written, result.verified);
 ```
 
-选项与命令行开关一一对应，改成驼峰：`--build-id-url` → `buildIdUrl`、`--recent-builds` →
-`recentBuilds`、`--grace-hours` → `graceHours`、`--allow-root-prefix` → `allowRootPrefix`、`--dry-run` → `dryRun`，`--url` 对应
-`siteUrl`，`--keep` 是字符串数组；另有 `fetch`（替换全部网络请求）与 `onRetry`。参数校验的报错用
-上面的选项名；探测与安全校验阶段的报错沿用命令行的开关名（比如 `Use --keep … instead`），按这张对应表换算。
-
-需要先看计划、再决定写不写时，用两段式的 `planPrune`：
-
-```ts
-import { planPrune } from "opennext-r2-prune";
-
-const planned = await planPrune(options); // 只发读请求，探测与安全校验在这一步做完
-if (planned.changed && (await askSomeone(planned.expire))) {
-  const outcome = await planned.apply(); // 写入并回读核对；只能调用一次
-}
-```
-
-计划只在算出的那一刻成立，`planPrune` 与 `apply()` 之间别隔太久。`apply()` 写入前会重读 lifecycle 配置，
-算出计划之后被改过（别人改了规则、另一趟运行写过）就抛 `PlanError`，不写入任何东西。它**不会**重新探测线上 build：
-这期间有部署或回滚的话，被判作废的 build 可能又上线了，请重新调用 `planPrune`。
-
-失败一律以异常抛出，不会写到一半悄悄返回：
-
-- 参数不对抛 `PruneOptionsError`，一个请求都不发。
-- 探测、列举或安全校验失败（包括 `apply()` 写入前发现配置被改过）抛 `BuildIdProbeError`、`CloudflareApiError`、`S3Error`、`PlanError`、
-  `XmlAssumptionError` 之一，此时没有任何写请求。重试耗尽仍连不上 R2 也是 `S3Error`（`status` 为 0）。
-- 写入阶段失败抛 `PruneWriteError`：`message` 是带补救办法的完整说明，`written` / `verified` /
-  `rolledBack` / `warnings` 与 `--json` 里的同名字段含义相同。**`written` 为 `true` 时（撤销失败，
-  或写入阶段意外出错、无从确认）务必按 `message` 立即手动检查 bucket 的 lifecycle 规则。**
-- 重复调用同一个 `apply()` 是用法错误，抛普通 `Error`，不发任何请求；要再写入请重新调用 `planPrune`。
-
-返回值里的 `keep` 只含在 bucket 里的 build，不在的另见 `absent`（`--json` 的 `keep` 是两者合并）；
-每项的 `reason` 是 `online`（线上）、`recent`（近期线上）、`preview`（预览）、`explicit`（`keep` 传入）
-或 `fresh`（写入不满 `graceHours` 小时、暂不判作废，`source` 是写入时间；0.2.0 新增，按 `KeepReason` 穷举的代码升级时要补上）之一，同一个 build 有多个来源时取靠前的；
-`deferred` 是保留集之外、但规则名额不够这次没挂规则的 build（见「一次运行发生了什么」第 6 步；名额一条不剩时刚写入的也在其中），它们既不在 `expire` 里，也不算保留；
-`quotaExhausted` 为 `true` 时名额永远空不出来，`deferred` 等多少轮也挂不上，得手动清理规则（只在这趟还有别的改动要写时出现，没别的可写时直接抛 `PlanError`）；
-`cloudflare.recentBuilds` 小于期望个数说明 deployment 已经翻完，更早的 build 会被判作废。
+选项与命令行开关一一对应，改成驼峰（`--recent-builds` → `recentBuilds`），`--url` 对应 `siteUrl`。想先看计划再决定写不写，用两段式的 `planPrune(options)`，确认后调用它返回的 `apply()`。失败一律抛出带类型的异常（`PlanError`、`S3Error`、`PruneWriteError` 等）；`PruneWriteError` 的 `written` 为 `true` 时，请按报错说明立即检查 bucket 的 lifecycle 规则。
 
 ### 多个站点共用一个 bucket
 
-给每个站点配一个不同的缓存前缀（OpenNext 的 `NEXT_INC_CACHE_R2_PREFIX`），然后对每个站点各跑一次，
-`--prefix` 与 `--worker` / `--url` 一一对应地传；作为库调用时就对每个站点各调一次 `prune` / `planPrune`。
-规则 ID 是标记加上规则作用的整个前缀（比如 `opennext-r2-prune:incremental-cache/<buildId>/`），每趟只认领、改写、回收自己前缀下的规则，
-别的前缀的规则和你自己配的规则一样原样保留，两个站点的 build id 相同也不会撞。
+给每个站点配一个不同的缓存前缀，然后每个站点各跑一次，`--prefix` 与 `--worker` / `--url` 对应着传。前缀必须各不相同、不能互相嵌套、不能为空；几趟运行要依次进行，不要并发。
 
-- **前缀必须各不相同**。两个站点共用同一个前缀时，每趟的保留集只有本站点的 build，另一个站点的线上
-  build 会被判作废、挂上删除规则 —— 工具识别不出这种配置。
-- **前缀不能互相嵌套，任何一个站点都不能用空前缀**。外层前缀（比如 `site-a`）的一级目录里就有内层前缀
-  （`site-a/nested`）那一段，外层那一趟会把它当成一个作废 build，连同另一个站点的缓存整个删掉；空前缀
-  是所有前缀的外层。只要 bucket 上已有本工具为嵌套前缀写的规则，两边的运行都会中止；但内层站点还一条
-  规则都没写过时，外层那一趟识别不出来。
-- **依次运行，不要并发**。几趟运行写的是同一份 lifecycle 配置，写入前的重读只能拦住大部分冲突，挡不住
-  两趟几乎同时写入。
-- **规则名额是共用的**。一个站点积压了大量作废 build、分批挂规则时，它每轮回收的名额会在同一趟里挂回自己
-  积压的 build，别的站点这期间新判作废的 build 只能推迟（不会报错），要等那个站点的积压清完。
+### 注意事项
 
-## 安全设计
+- **删除不是即时的**，R2 通常在 24 小时内删完。
+- **回滚到已判作废的 build 后，立即手动跑一次**，摘掉它身上的删除规则（Next.js 16.2+ 的 build id 是确定性的，用同一个 id 重新部署时同理，部署前先用 `--keep` 保住）。
+- **已上传但迟迟没部署的版本只受 `--grace-hours` 保护**，打算隔很久再部署时请调大它，或用 `--keep` 保留。
+- 只用 `--url` 时只保留此刻线上的一个 build，回滚目标、预览、灰度中的旧版本都会被判作废。
+- R2 每个 bucket 最多 1000 条 lifecycle 规则，本工具一般最多用到 990 条，积压太多时会分批挂规则，多跑几轮才能清完。改了 `--prefix` 后，旧前缀下的规则不再归新前缀管，需要手动删除。
+- 不要在 Dashboard 上手动改、删本工具的规则（ID 形如 `opennext-r2-prune:<前缀>/<buildId>/`），想清理就再跑一次工具。规则可以在 Dashboard 的 bucket 设置里，或用 `npx wrangler r2 bucket lifecycle list <bucket>` 查看。
 
-删除不可逆，所以这几条是硬性的：
+## 工作原理
 
-- 作用域限死在 `<prefix>/<buildId>/` 之下，规则前缀带结尾斜杠（否则某个 buildId 恰是
-  另一个的前缀时会误删）。
-- 近期线上版本或任何一个预览的 BUILD_ID 探测不到就退出。
-- 保留集为空、或保留集与 bucket 里现存的 build 没有交集，都拒绝继续。因为刚写入而暂不判的 build
-  不算在保留集里，免得一个正在部署的新 build 替填错的前缀或站点撑起「有交集」。
-- 刚写入不满 `--grace-hours` 小时的 build 不挂规则（见「一次运行发生了什么」第 5 步）。读不到它的写入
-  时间就退出，不当成老 build 去删。
-- 要保留的 build 不在 bucket 里时报错退出 —— 通常意味着 bucket、`--prefix` 或域名填错了。
-  确认无误可用 `--force` 跳过。
-- **只碰自己加的规则**。规则 ID 统一为 `opennext-r2-prune:` 加上规则作用的前缀，比如
-  `opennext-r2-prune:incremental-cache/<buildId>/`（前缀为空时是 `opennext-r2-prune:<buildId>/`，结尾斜杠被服务端去掉也认得出），
-  每趟运行只认领当前 `--prefix` 下的规则；你在 bucket 上配的其它 lifecycle 规则、以及别的前缀下本工具的规则都原样保留。
-  带本工具标记、却拆不出前缀和 buildId 的 ID 会让运行中止，不猜它属于谁（其中对整个 bucket 生效的会先照常报出）。
-- 探测每个 `/BUILD_ID` 时都带 `Cache-Control: no-cache`。中间缓存若返回上一个版本的 id，工具就会
-  把线上正在服务的 build 判成作废 —— 这是它能造成的最坏后果，所以必须绕开缓存。
-- **前缀为空默认拒绝运行**。那意味着把 bucket 根下的每个一级目录都当成 build 缓存，`assets/`、
-  `backups/` 这类非缓存目录会一并被挂上删除规则 —— 这是本工具唯一能删到非缓存数据的路径。
-  bucket 确实只用来存一个站点的 OpenNext 缓存时，加 `--allow-root-prefix` 承认这个布局。
-- 列出来的 build 目录名不符合 OpenNext 的布局假设（含 XML 转义字符）时中止，不猜、也不
-  降级成警告 —— 那些值会被用来拼删除规则。
-- **写入前重读配置**。确认环节可能隔了很久，写入前再读一次 lifecycle，与算计划时读到的不一致（有人改了规则、
-  另一趟运行写过）就中止、不写入，以免整份覆盖抹掉别人的改动。
-- **写入后回读核对**。PUT 返回成功不代表规则按原样生效：实测 R2 会静默丢掉裸 `<Prefix>`，把只针对
-  一个 build 目录的删除规则变成作用于整个 bucket 的。所以每次写完都把配置读回来，逐条比对本工具
-  规则的前缀、过期天数、状态（同一个 buildId 读回多条也算不符），以及外部规则的条数。刚写完可能
-  短暂读到旧配置，所以本工具的规则不符时隔 2 秒重读，最多读 3 次（只有外部规则不符时不重读：本工具的
-  规则对上了就说明读到的已是新配置）。PUT 本身报错（超时等）时请求也可能已经生效，所以同样回读：
-  与期望一致就当作已写入并提示；读回来仍是写入前的配置，说明没写进去，照常报写入失败（旧配置里本就有
-  对整个 bucket 生效的本工具规则时则照样撤销）；读回来既不是新配置也不是旧配置（生效了但被服务端改写），
-  或者根本读不回来、无从判断，都按下面的流程撤销。PUT 被明确拒绝（4xx，限流的 429 除外）时不会生效，
-  只回读一次、不等重读；此时连读都读不回来就直接报写入失败。
-  - 本工具的规则仍对不上，或者根本读不回来、无从核对，就**立即撤掉本工具的全部规则**并以退出码 2
-    报错 —— 撤规则只会让删除推迟，绝不会删到数据。撤销时写回的是写入前读到的外部规则，而不是回读
-    结果：被服务端改掉 ID 的自有规则会被认成外部规则，照搬回读结果就等于把它留下。撤销写完同样要
-    读回来确认没有本工具的规则了，才算撤销成功；否则提示你立即手动检查。撤销后读回来外部规则条数
-    不符也会提示（可能是你的规则丢了，或被改掉 ID 的自有规则还在）。
-  - 只有外部规则条数不符时，本工具的规则是安全的，不撤销，只提示你检查自己的规则。
-  - `--json` 输出里的 `verified` / `rolledBack` / `warnings` 字段记录了核对、撤销与提示的结果；
-    `written` 表示本次的新规则是否留在了 bucket 上，撤销并确认后为 `false`；撤销失败时为 `true`
-    （可能还在），除非能确认写入本身就没生效（PUT 报错、读回来仍是写入前的配置）。
-  规则只用 `<Filter><Prefix>` 式样生成。
-- **已在生效的整 bucket 规则会被醒目报出**。读到本工具的规则没有 `<Filter><Prefix>`（比如被
-  R2 丢掉了前缀；读回来若带着裸 `<Prefix>`，R2 也不认，同样按整个 bucket 对待，报错里
-  会写出它的原值）时，在探测之前就向 stderr 打出警告，所以即便本次因列目录或探测失败中止、或只是 `--dry-run`，你也
-  能看到它；`--json` 里的 `wholeBucketRules` 照 bucket 上的原样列出这些规则的 ID。别的前缀下的、ID 格式不对的也会报出
-  （那个前缀可能已经弃用，再没有运行会报它），但只有当前前缀下的会在写入成功时被改写成正确的前缀，别的得手动删除。
-- 规则 ID 带着整个缓存前缀，按 bucket 里现有的目录算出的 ID 超过 255 个字符（S3 规范的上限）时在探测之前中止。
-  报错会分别写出前缀和目录名各占多少字符：前缀太长就换一个更短的，目录名本身就太长时它多半不是 build 缓存目录。
-- 一条规则都不剩时要清空配置。S3 规范不允许不含 `<Rule>` 的配置，R2 文档也没把
-  DeleteBucketLifecycle 列为已支持，所以先 PUT 空配置，被当作格式错误（400）拒掉再退回
-  `DELETE ?lifecycle`（DELETE 也失败时，报错里会一并写明 PUT 被拒的原因），生效与否由回读核对确认。实测 R2 接受
-  空配置的 PUT，读回来是一份不含 `<Rule>` 的配置；退回 DELETE 那条路径在 R2 上走不到，未实测。
+OpenNext 每次发布都会以新的 `BUILD_ID` 在 R2 里建一个缓存目录，却从不清理旧的。S3/R2 没有「删除目录」的操作，常规做法要把几十万个对象逐个列出再删，非常慢。
 
-## 已知限制
+本工具每次运行：
 
-- **删除不是即时的**，R2 通常在 24 小时内完成。跑完当场去看 bucket 还是满的，属正常。
-- lifecycle 规则上限 1000 条，你自己的规则和本工具所有前缀下的规则共用。工具每次运行会自动回收自己前缀下已经删完的规则，
-  正常使用不会触顶。积压的作废 build 太多、名额不够时，**一次只能挂一部分**：总数挂到 990 条为止（你自己的规则加上别的前缀下目录已删空、却没被回收的规则达到 990 条时挂到 1000 条），先挂写入最早的，
-  其余列为「推迟」、留给之后的运行（见「一次运行发生了什么」第 6 步），所以清完积压要多跑几轮，每轮之间要等 R2 删完上一批。
-  留下的 10 条余量是给你加自己的规则用的；用满之后 R2 会以 `MalformedXML` 拒绝写入，不会说是条数超了。
-  你自己的规则、加上本工具为旧前缀写的、目录已经删空的规则就占满了这个总数，又有新判作废的 build 要挂规则时，名额永远空不出来，
-  运行会中止（退出码 1），需要先手动清理规则；报错里列出的前缀若其实还有站点在用，让那个站点先跑一趟回收即可。
-- **改了 `--prefix` 之后，旧前缀下的规则就不再归这一趟管**，会一直留在 bucket 上占名额。旧目录删完后，
-  在 Dashboard 或用 `npx wrangler r2 bucket lifecycle list`（见「查看写入的规则」）找出 ID 形如 `opennext-r2-prune:<旧前缀>/<buildId>/`（旧前缀为空时是 `opennext-r2-prune:<buildId>/`）的规则手动删除。
-  新旧前缀互相嵌套（比如改成空前缀，或从 `incremental-cache` 改成 `incremental-cache/v2`）时，删掉这些规则之前
-  运行会一直中止。
-- Next.js 16.2+ 的 build ID 是确定性的，**回滚到一个已被判定作废的 build 后，应立即手动
-  跑一次本工具** —— 它会摘掉那条仍在生效的规则。摘除前 R2 可能已删掉部分缓存，那些页面会
-  在下次访问时回源重新渲染。
-  摘除的方式是全量重写：S3/R2 没有「删除单条规则」的接口，工具每次都把整份 lifecycle 配置
-  重新写回去，那条规则只是不再出现在新配置里（你自己配的规则原样搬回，不受影响）。上面
-  「自动回收已经删完的规则」也是同一个机制。所以摘除同样要真正写入 —— 带 `--dry-run` 不会
-  生效，非交互环境记得给 `--yes`。
-- 读 BUILD_ID 依赖 workers.dev 上的版本 URL 与预览 URL。Worker 关掉了 workers.dev /
-  preview URL，或者这些 URL 被 Cloudflare Access 保护着时，探测会失败、工具会中止。
-- **已上传但迟迟没部署的版本只受 `--grace-hours` 保护**（`opennextjs-cloudflare upload` /
-  `wrangler versions upload` 之后、`wrangler versions deploy` 之前）。它的缓存已经写进 R2，但不在任何
-  deployment 或预览里，写入超过 `--grace-hours` 小时后仍没上线就会被判作废。打算隔很久再部署时，
-  请调大 `--grace-hours`，或用 `--keep` 显式保留。
-- 写入时间取的是 build 目录里按 key 排第一的对象，已经挂上规则的 build 也不再看写入时间。所以老 build 的
-  这个对象若刚被 ISR 改写过，它只会晚一点才被判作废；但 Next.js 16.2+ **用同一个 build ID 重新部署一个已判作废的
-  build** 时，宽限期认不出它是新部署：目录里还留着旧对象时读到的是旧时间，已挂着规则时规则照样保留，新部署的
-  缓存可能在上线前就被删。重新部署这类 build 时，部署前用 `--keep` 保留它，上线后立即手动跑一次本工具（同上面
-  回滚那一条）。
-- 只用 `--url` 模式时只保留线上当前 BUILD_ID，**若恰好在灰度窗口内运行，灰度中旧版本的缓存
-  目录会被判定作废**。用 `--worker` 模式即可避免。
-- 预览的列举接口官方文档尚未写明分页形态，按 Cloudflare API 通用的 `result_info` 处理；
-  要翻多页时会再完整列一遍，两次得到的预览集合一致才采用，防止翻页期间有预览增删导致漏项或
-  重复；连续 3 遍都对不上则中止。
-  首次使用建议先 `--dry-run`，核对保留列表里的预览与 Dashboard 一致。
+1. **列出 bucket 里现有的 build 目录**（只列一级目录，通常一个请求）。
+2. **找出还在用的 build**：通过 Cloudflare API 找到最近的线上版本和全部预览，读它们的 `/BUILD_ID`（绕开缓存）。保留集 = 最近 3 个不同的线上 build ∪ 所有预览的 build ∪ `--keep`。
+3. **其余的 build 判为作废**，刚写入不满 `--grace-hours` 的除外。
+4. **整份重写 bucket 的 lifecycle 配置**：给每个作废 build 的目录挂一条删除规则，回收目录已经删空的规则，摘掉又要保留的 build 上的规则，你自己的规则原样保留。写完立即读回核对，不符就撤掉本工具的规则。
 
-## 开发
+之后由 R2 在后台删除。整个过程不遍历缓存对象，发给 R2 的请求数基本恒定。
 
-```bash
-pnpm install
-pnpm test
-pnpm build
-```
+## 许可
 
-### 真实 R2 实测
-
-`pnpm test` 只跑假 R2；`pnpm test:e2e`（`e2e/` 目录）在真实 bucket 上把整个流程跑一遍：布置 build 目录与
-lifecycle 配置，调用库和 CLI，再绕开被测代码直接读回 lifecycle 逐条核对。覆盖挂规则、幂等、回收、摘除、
-改过期天数、多前缀共存、清空配置、安全校验的中止（前缀为空、保留的 build 不存在、保留集与现存 build 无交集、
-前缀互相嵌套、拆不出归属的规则、计划之后配置被改过，且都没有写请求）、整 bucket 规则的报出与改写、
-CLI 的 `--dry-run` / `--yes`，以及下文列出的 R2 特性。改动行为后跑一遍即可。
-
-```bash
-cp .env.example .env   # 照注释填好凭证
-pnpm test:e2e
-```
-
-- 用到的环境变量都在 `.env.example` 里说明。`pnpm test:e2e` 会自动读 `.env`，shell 里已设的同名变量优先；
-  在 git worktree 里没有 `.env` 时读主仓库根下的。
-- **用一个专用的测试 bucket**：实测会整份改写它的 lifecycle 配置（开跑前记下、跑完原样写回；原本没有任何
-  配置时写回一份空配置），并清空 `e2e/` 下的对象。bucket 名里没有一段是 `test`（以连字符分隔，如
-  `opennext-r2-prune-test`；`latest` 这类只是含有 test 的不算）时拒绝运行，防止 `.env` 或 shell 里留着线上凭证时误跑。
-- 另外填了 `WORKER_NAME` 与 `CLOUDFLARE_API_TOKEN` 时，会多跑一组：探测该 Worker 此刻的线上、近期与预览
-  build，布置进测试 bucket，核对它们被保留、其余被判作废。Cloudflare 那边只发读请求。布置前后各探测一次，
-  两次对不上（期间 Worker 发了版）就重来，最多 3 次。
-- 开跑时先把原配置打在 stderr 上，并存进 bucket 根下的 `e2e-lifecycle-snapshot.json`，原配置写回之后才删掉它：
-  中途被打断、来不及写回时，照其中一份手动写回，再删掉这个对象。这个对象还在（另一趟实测正在跑，或上次被打断）、
-  或者 bucket 上还留着上次实测的规则（ID 以 `e2e-` 或 `opennext-r2-prune:e2e/` 开头）时拒绝运行，免得把残留
-  当成原配置记下、跑完照样写回。
-- R2 真正删除对象要等最长 24 小时，实测只核对规则，不等删除。
-
-以下 R2 的具体行为已在真实 bucket 上实测确认（2026-11），除新建 bucket 自带规则、权限两条外都由 `pnpm test:e2e` 反复核对：
-
-- **`<Filter><Prefix>` 式样**：R2 照单全收，读回来也原样是 `<Filter><Prefix>`。
-- **⚠️ R2 不认裸 `<Prefix>`**（直接挂在 `<Rule>` 下、不包 `<Filter>` 的老式写法）。它不报错，却会
-  **静默丢掉前缀**：读回来的规则没有任何 Prefix，`wrangler r2 bucket lifecycle list` 显示为
-  `prefix: (all prefixes)`，即这条删除规则对**整个 bucket** 生效，会把线上缓存乃至前缀之外的数据
-  一并删掉。因此原先的 `--lifecycle-style bare` 选项已删除，工具只生成 `<Filter><Prefix>`，并在
-  写入后回读核对兜底。
-- **`Content-MD5` 不被校验**：R2 接受带正确摘要、错误摘要或不带摘要的写入。工具照常发送它（符合
-  S3 规范，也兼容会校验的实现），但不要指望它在 R2 上提供完整性保证。
-- **新建的 bucket 自带一条 `Default Multipart Abort Rule`**，工具会把它当作外部规则原样保留（已实测）。
-  所以「bucket 没有任何规则时 GET 返回 404 / `NoSuchLifecycleConfiguration`」这条路径在 R2 上很难
-  走到，未实测；工具对它的处理是当作空配置。
-- **规则 ID 带结尾斜杠**（`opennext-r2-prune:<前缀>/<buildId>/`）R2 原样保留；读回的规则按 ID 排序，不保持写入顺序。
-- **空配置**：R2 接受不含 `<Rule>` 的 lifecycle PUT，之后 GET 返回 200 和一份空配置，而不是 404。
-- **权限**：lifecycle 只有 Admin 级 R2 token 能读写，Object 级 token（只读或读写）一律 403，见上文。
-
-写入后可用 `npx wrangler r2 bucket lifecycle list <BUCKET>` 核对规则是否如实写进去了，重点看每条
-`opennext-r2-prune:incremental-cache/<buildId>/` 规则的 `prefix` 是否与 ID 里的路径一致，而不是 `(all prefixes)`。
+[MIT](LICENSE)
