@@ -1,4 +1,5 @@
 import { normalizePrefix, rulePrefix } from "./prefix.ts";
+import { plural } from "./text.ts";
 import {
   type LifecycleDoc,
   MAX_RULE_ID_LENGTH,
@@ -374,7 +375,8 @@ function exhaustedMessage(budget: RuleBudget, deferred: number): string {
   // 目录删空了规则还在，可能是旧前缀没人回收，也可能是在用的站点还没跑到回收那一趟，所以两种补救都给
   const staleNote =
     budget.stale.length > 0
-      ? `, and ${budget.stale.length} of the rules this tool wrote for cache prefix ${scopes.join(", ")} target directories that are already empty but weren't reclaimed — ` +
+      ? `, plus ${plural(budget.stale.length, "rule")} this tool wrote for cache prefix ${scopes.join(", ")} whose ` +
+        `${budget.stale.length === 1 ? "directory is" : "directories are"} already empty but weren't reclaimed — ` +
         `most likely an old prefix from before a --prefix change, which no run will ever reclaim`
       : "";
   const staleFix =
@@ -383,8 +385,8 @@ function exhaustedMessage(budget: RuleBudget, deferred: number): string {
         `(rule IDs look like ${RULE_ID_PREFIX}<old prefix>/<buildId>/; deleting those whose directories are already empty can't delete anything by mistake)`
       : "";
   return (
-    `Aborted while checking lifecycle rule slots: R2 allows at most ${MAX_RULES} lifecycle rules per bucket, your own rules on the bucket number ` +
-    `${budget.users}${staleNote}. Slots can never be freed, so none of the ${deferred} obsolete builds can get a deletion rule; nothing was written.\n` +
+    `Aborted while checking lifecycle rule slots: R2 allows at most ${MAX_RULES} lifecycle rules per bucket, and the bucket has ` +
+    `${plural(budget.users, "rule")} of your own${staleNote}. Slots can never be freed, so ${plural(deferred, "obsolete build")} can't get a deletion rule; nothing was written.\n` +
     `Find the rules you no longer need with npx wrangler r2 bucket lifecycle list <bucket> and delete them manually${staleFix}, then run again once slots are freed.`
   );
 }

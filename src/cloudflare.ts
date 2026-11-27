@@ -91,7 +91,7 @@ export class CloudflareApi {
       fetched += items.length;
       const fresh = items.filter((d) => d.id === undefined || !seen.has(d.id));
       if (items.length > 0 && fresh.length === 0) {
-        throw paginationError(`every deployment on page ${page} was already seen; the pagination parameters may not be honored`, "deployments");
+        throw paginationError(`Every deployment on page ${page} was already seen; the pagination parameters may not be honored`, "deployments");
       }
       for (const d of fresh) if (d.id !== undefined) seen.add(d.id);
       if (fresh.length > 0) {

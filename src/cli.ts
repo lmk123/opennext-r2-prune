@@ -18,6 +18,7 @@ import {
 } from "./index.ts";
 import { MAX_RULES, RESERVED_RULES } from "./plan.ts";
 import { normalizePrefix } from "./prefix.ts";
+import { plural } from "./text.ts";
 import { ruleId } from "./xml.ts";
 
 /** 唯一允许使用 Node 专属 API 的一层：参数、环境变量、终端交互。 */
@@ -201,14 +202,16 @@ async function main(argv: string[]): Promise<number> {
     md5Base64: (body) => createHash("md5").update(body, "utf8").digest("base64"),
     onRetry,
     // 在探测之前就报：探测或校验失败时整趟中止，这条警告是用户唯一能看到它的地方
-    onWholeBucketRules: (ruleIds) =>
+    onWholeBucketRules: (ruleIds) => {
+      const one = ruleIds.length === 1;
       console.error(
-        `\n⚠️ Warning: ${ruleIds.length} of this tool's rules on the bucket have no <Filter><Prefix> prefix` +
-          ` (missing, or only a bare <Prefix> that R2 ignores), so they apply to the whole bucket: ${ruleIds.join(", ")}.\n` +
-          `R2 will use them to delete every object in the bucket. A successful write in this run only rewrites those under the current prefix (${ruleId(prefix, "<buildId>")}); ` +
+        `\n⚠️ Warning: ${plural(ruleIds.length, "rule")} of this tool's on the bucket ${one ? "has" : "have"} no <Filter><Prefix> prefix` +
+          ` (missing, or only a bare <Prefix> that R2 ignores), so ${one ? "it applies" : "they apply"} to the whole bucket: ${ruleIds.join(", ")}.\n` +
+          `R2 will use ${one ? "it" : "them"} to delete every object in the bucket. A successful write in this run only rewrites those under the current prefix (${ruleId(prefix, "<buildId>")}); ` +
           `for those under other prefixes, or if this run aborts or is only a --dry-run, ` +
           `check them right away with npx wrangler r2 bucket lifecycle list ${bucket} and delete them manually.`,
-      ),
+      );
+    },
   });
 
   // --json 时 stdout 只放最后那一份 JSON，人类可读的内容一律改走 stderr
@@ -218,8 +221,8 @@ async function main(argv: string[]): Promise<number> {
   // deployment 翻完了还凑不够名额时不能悄悄少保留：回滚目标可能就在被判作废的那几个里
   if (planned.cloudflare && planned.cloudflare.recentBuilds < recentBuilds) {
     console.error(
-      `\nNote: only found ${planned.cloudflare.recentBuilds} distinct recent live builds (--recent-builds is ${recentBuilds}) ` +
-        `after going through all ${planned.cloudflare.deploymentsScanned} deployments. Older builds will be judged obsolete; ` +
+      `\nNote: only found ${plural(planned.cloudflare.recentBuilds, "distinct recent live build")} (--recent-builds is ${recentBuilds}) ` +
+        `after going through all ${plural(planned.cloudflare.deploymentsScanned, "deployment")}. Older builds will be judged obsolete; ` +
         `keep the ones you need explicitly with --keep.`,
     );
   }
@@ -266,10 +269,10 @@ async function main(argv: string[]): Promise<number> {
       const added = planned.expire.filter((b) => b.state === "new").length;
       const updated = planned.expire.filter((b) => b.state === "updated").length;
       note(
-        `\nRules written and verified by reading back: ${added} added, ${updated} updated, rules reclaimed for ${planned.reclaim.length} builds.` +
+        `\nRules written and verified by reading back: ${added} added, ${updated} updated, rules reclaimed for ${plural(planned.reclaim.length, "build")}.` +
           `\nR2 usually finishes deleting these directories within 24 hours; the next run reclaims the finished rules automatically.` +
           (planned.deferred.length > 0 && !planned.quotaExhausted
-            ? `\n${planned.deferred.length} more obsolete builds got no rule for lack of rule slots; a later run attaches them once slots are freed.`
+            ? `\n${plural(planned.deferred.length, "more obsolete build")} got no rule for lack of rule slots; a later run attaches the rules once slots are freed.`
             : ""),
       );
       if (planned.quotaExhausted) console.error(`\nNote: ${quotaExhaustedNote(planned.deferred.length)}`);
@@ -339,12 +342,12 @@ function printPlan(plan: PrunePlanSummary): void {
   }
   if (plan.cloudflare) {
     console.log(
-      `Cloudflare: looked through the latest ${plan.cloudflare.deploymentsScanned} deployments, ` +
-        `${plan.cloudflare.previews} previews in total`,
+      `Cloudflare: looked through the latest ${plural(plan.cloudflare.deploymentsScanned, "deployment")}, ` +
+        `${plural(plan.cloudflare.previews, "preview")} in total`,
     );
   }
 
-  console.log(`\nKeeping ${plan.keep.length} builds:`);
+  console.log(`\nKeeping ${plural(plan.keep.length, "build")}:`);
   for (const build of plan.keep) {
     console.log(`  keep      ${build.buildId}  ${keepNote(build)}`);
   }
@@ -357,7 +360,7 @@ function printPlan(plan: PrunePlanSummary): void {
   }
 
   if (plan.expire.length > 0) {
-    console.log(`\nHanding ${plan.expire.length} builds to R2 for deletion:`);
+    console.log(`\nHanding ${plural(plan.expire.length, "build")} to R2 for deletion:`);
     for (const build of plan.expire) {
       console.log(`  delete    ${build.buildId}  ${EXPIRE_NOTE[build.state]}`);
     }
@@ -367,7 +370,7 @@ function printPlan(plan: PrunePlanSummary): void {
     console.log(
       `\nNot enough lifecycle rule slots (R2 allows at most ${MAX_RULES} per bucket; this tool normally leaves ${RESERVED_RULES} spare for your own rules, ` +
         `filling all ${MAX_RULES} only when your own rules plus other prefixes' rules whose directories are empty but not reclaimed have eaten into that margin), ` +
-        `so these ${plan.deferred.length} builds outside the keep set get no rule this time (with no slots left, write times may not have been read, so freshly written builds may be listed here too):`,
+        `so no rule is attached this time to the following ${plural(plan.deferred.length, "build")} outside the keep set (with no slots left, write times may not have been read, so freshly written builds may be listed here too):`,
     );
     if (plan.quotaExhausted) {
       for (const build of plan.deferred) console.log(`  defer     ${build.buildId}  slots can never be freed, rules need manual cleanup`);
@@ -385,7 +388,7 @@ function printPlan(plan: PrunePlanSummary): void {
   const emptied = plan.reclaim.filter((r) => r.reason === "emptied");
 
   if (emptied.length > 0) {
-    console.log(`\nReclaiming finished rules for ${emptied.length} builds:`);
+    console.log(`\nReclaiming finished rules for ${plural(emptied.length, "build")}:`);
     for (const rule of emptied) console.log(`  reclaim   ${rule.buildId}  directory is empty`);
   }
 
@@ -427,7 +430,7 @@ function toJson(plan: PrunePlanSummary) {
 function quotaExhaustedNote(deferred: number): string {
   return (
     `Your own rules plus rules nobody will reclaim (most likely written for an old prefix before a --prefix change, with directories already empty) fill all ${MAX_RULES} slots, ` +
-    `so slots can never be freed and these ${deferred} deferred builds will never get rules however many runs you wait; the next run with nothing else to write will abort (exit code 1). ` +
+    `so slots can never be freed and ${plural(deferred, "deferred build")} will never get rules however many runs you wait; the next run with nothing else to write will abort (exit code 1). ` +
     `Find the rules you no longer need with npx wrangler r2 bucket lifecycle list <bucket>, delete them manually, and run again once slots are freed.`
   );
 }

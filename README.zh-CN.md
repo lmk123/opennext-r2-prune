@@ -49,7 +49,7 @@ npx opennext-r2-prune \
   --dry-run
 ```
 
-确认打印出的计划无误后，去掉 `--dry-run` 再跑一次。交互终端下会请你确认一次；非交互环境（如定时任务）需要显式传 `--yes`。所有参数都可以用环境变量代替，完整选项见 `--help`。
+确认打印出的计划无误后，去掉 `--dry-run` 再跑一次。交互终端下会请你确认一次；非交互环境（如定时任务）需要显式传 `--yes`。凭证、bucket、`--worker`、`--api-token`、`--url` 与 `--prefix` 可以用环境变量代替，变量名与完整选项见 `--help`。
 
 常用选项：
 
@@ -109,7 +109,7 @@ const result = await prune({
 });
 ```
 
-选项与命令行开关一一对应，改成驼峰写法（`--recent-builds` → `recentBuilds`），`--url` 对应 `siteUrl`。想先看计划再决定是否写入，可以用两段式的 `planPrune(options)`，确认后再调用它返回的 `apply()`。失败一律以带类型的异常抛出（`PlanError`、`S3Error`、`PruneWriteError` 等）；`PruneWriteError` 的 `written` 为 `true` 时，请按报错说明立即检查 bucket 的 lifecycle 规则。
+带值的开关以及 `--force`、`--allow-root-prefix` 都有对应的选项，改成驼峰写法（`--recent-builds` → `recentBuilds`），`--url` 对应 `siteUrl`。其余开关没有同名选项：代替 `--dry-run` 的是两段式的 `planPrune(options)`，先看计划，确认后再调用它返回的 `apply()`；代替 `--yes` 的是不传 `confirm`；代替 `--verbose` 的是传 `onRetry`。失败一律以带类型的异常抛出（`PlanError`、`S3Error`、`PruneWriteError` 等）；`PruneWriteError` 的 `written` 为 `true` 时，请按报错说明立即检查 bucket 的 lifecycle 规则。
 
 ### 多个站点共用一个 bucket
 
@@ -122,7 +122,7 @@ const result = await prune({
 - **已上传但迟迟没有部署的版本只受 `--grace-hours` 保护**。打算隔很久再部署时，请调大它，或用 `--keep` 保留。
 - 只用 `--url` 时只会保留此刻线上的那一个 build，回滚目标、预览以及灰度中的旧版本都会被判作废。
 - R2 每个 bucket 最多 1000 条 lifecycle 规则，本工具一般最多用到 990 条。积压太多时会分批挂规则，需要多跑几轮才能清完。改了 `--prefix` 后，旧前缀下的规则不再由工具管理，需要手动删除。
-- 不要在 Dashboard 上手动修改或删除本工具的 Object lifecycle 规则（ID 形如 `opennext-r2-prune:<前缀>/<buildId>/`），想清理就再跑一次工具。规则可以在 Dashboard 的 bucket 设置里查看，也可以用 `npx wrangler r2 bucket lifecycle list <bucket>`。
+- 不要在 Dashboard 上手动修改或删除本工具在当前前缀下的 Object lifecycle 规则（ID 形如 `opennext-r2-prune:<前缀>/<buildId>/`），想清理就再跑一次工具。旧前缀下的规则，以及工具报错里明确要求手动删除的规则不在此列。规则可以在 Dashboard 的 bucket 设置里查看，也可以用 `npx wrangler r2 bucket lifecycle list <bucket>`。
 
 ## 工作原理
 

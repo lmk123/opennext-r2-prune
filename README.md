@@ -49,7 +49,7 @@ npx opennext-r2-prune \
   --dry-run
 ```
 
-Once the printed plan looks right, drop `--dry-run` and run it again. In an interactive terminal you're asked to confirm once; in a non-interactive environment (such as a scheduled job) pass `--yes` explicitly. Every option can be supplied via an environment variable instead; see `--help` for the full list.
+Once the printed plan looks right, drop `--dry-run` and run it again. In an interactive terminal you're asked to confirm once; in a non-interactive environment (such as a scheduled job) pass `--yes` explicitly. The credentials, bucket, `--worker`, `--api-token`, `--url` and `--prefix` can be supplied via environment variables instead; see `--help` for the variable names and the full list of options.
 
 Common options:
 
@@ -109,7 +109,7 @@ const result = await prune({
 });
 ```
 
-Options map one-to-one to the command-line flags in camelCase (`--recent-builds` → `recentBuilds`), and `--url` maps to `siteUrl`. To look at the plan before deciding whether to write, use the two-phase `planPrune(options)` and call the `apply()` it returns once you've confirmed. Every failure is thrown as a typed exception (`PlanError`, `S3Error`, `PruneWriteError`, etc.); when a `PruneWriteError` has `written` set to `true`, follow its message and check the bucket's lifecycle rules right away.
+Options that take a value, plus `--force` and `--allow-root-prefix`, map to the command-line flags in camelCase (`--recent-builds` → `recentBuilds`), and `--url` maps to `siteUrl`. The remaining flags have no option of the same name: instead of `--dry-run`, use the two-phase `planPrune(options)` to look at the plan, and call the `apply()` it returns once you've confirmed; instead of `--yes`, leave out `confirm`; instead of `--verbose`, pass `onRetry`. Every failure is thrown as a typed exception (`PlanError`, `S3Error`, `PruneWriteError`, etc.); when a `PruneWriteError` has `written` set to `true`, follow its message and check the bucket's lifecycle rules right away.
 
 ### Several sites sharing one bucket
 
@@ -122,7 +122,7 @@ Give each site a different cache prefix, then run once per site, passing `--pref
 - **A version that's uploaded but not deployed for a long time is only protected by `--grace-hours`**. If you plan to deploy much later, raise it, or keep the build with `--keep`.
 - With `--url` alone, only the one build that's live right now is kept; rollback targets, previews and the older version in a gradual rollout are all judged obsolete.
 - R2 allows at most 1000 lifecycle rules per bucket, and this tool normally uses at most 990 of them. With a large backlog it attaches rules in batches, so it takes a few runs to clear. After changing `--prefix`, rules under the old prefix are no longer managed by the tool and need to be deleted manually.
-- Don't manually edit or delete this tool's Object lifecycle rules in the Dashboard (IDs look like `opennext-r2-prune:<prefix>/<buildId>/`); to clean up, just run the tool again. You can view the rules in the bucket's settings in the Dashboard, or with `npx wrangler r2 bucket lifecycle list <bucket>`.
+- Don't manually edit or delete this tool's Object lifecycle rules under the current prefix in the Dashboard (IDs look like `opennext-r2-prune:<prefix>/<buildId>/`); to clean up, just run the tool again. The exceptions are rules under an old prefix and the cases where the tool's own message tells you to delete rules manually. You can view the rules in the bucket's settings in the Dashboard, or with `npx wrangler r2 bucket lifecycle list <bucket>`.
 
 ## How it works
 
