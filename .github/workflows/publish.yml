@@ -1,6 +1,7 @@
 # 推送 vX.Y.Z 形式的 tag 时发布到 npm。
 # 用 npm Trusted Publishing（OIDC）认证，不需要 NPM_TOKEN；需要先在 npmjs.com 包设置的
 # Trusted Publisher 里登记本仓库和这个文件名（publish.yml），改文件名要同步改那边。
+# 那条配置的权限要允许 npm publish：只允许 npm stage publish 时，下面的发布会报 403 OIDC permission denied。
 name: publish
 
 on:
@@ -11,7 +12,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Trusted Publishing 靠 OIDC token 认证，同时自动生成 provenance
+  id-token: write # Trusted Publishing 靠 OIDC token 认证，同时自动生成 provenance（仅限公开仓库，仓库转私有后就没有）
 
 jobs:
   publish:
