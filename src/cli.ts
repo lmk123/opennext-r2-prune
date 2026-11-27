@@ -55,7 +55,7 @@ Optional:
                                Write times aren't read when no slots are left (except when slots can never be freed and the run aborts)
   --dry-run                    Only print the plan, don't write
   --yes, -y                    Skip confirmation. Required in non-interactive environments
-  --json                       Print a machine-readable result (only after writing; includes written / verified / rolledBack / warnings;
+  --json                       Print a machine-readable result at the end, after any write (includes written / verified / rolledBack / warnings;
                                deferred lists builds that got no rule for lack of slots; quotaExhausted true means slots can never be freed and rules need manual cleanup)
   --force                      Skip the "kept builds must exist in the bucket" check
   --allow-root-prefix          Acknowledge an empty --prefix (cache stored directly at the bucket root)
@@ -222,7 +222,7 @@ async function main(argv: string[]): Promise<number> {
   if (planned.cloudflare && planned.cloudflare.recentBuilds < recentBuilds) {
     console.error(
       `\nNote: only found ${plural(planned.cloudflare.recentBuilds, "distinct recent live build")} (--recent-builds is ${recentBuilds}) ` +
-        `after going through all ${plural(planned.cloudflare.deploymentsScanned, "deployment")}. Older builds will be judged obsolete; ` +
+        `after going through ${planned.cloudflare.deploymentsScanned === 1 ? "the only deployment" : `all ${planned.cloudflare.deploymentsScanned} deployments`}. Older builds will be judged obsolete; ` +
         `keep the ones you need explicitly with --keep.`,
     );
   }

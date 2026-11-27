@@ -218,7 +218,9 @@ export class R2Store {
       const response = await this.#request("getLifecycle", `${this.#base}?lifecycle`);
       return parseLifecycle(await response.text(), prefix);
     } catch (error) {
-      // 从未配过规则的 bucket 会返回 404 NoSuchLifecycleConfiguration，那是空配置不是错误
+      // S3 规范：从未配过规则的 bucket 返回 404 NoSuchLifecycleConfiguration，按空配置处理。
+      // R2 上没实测过：新建 bucket 自带一条 Default Multipart Abort Rule，这条路径很难走到
+      // （清空配置后 R2 读回的是 200 加一份空配置，见 e2e）
       if (error instanceof S3Error && (error.status === 404 || error.code === "NoSuchLifecycleConfiguration")) {
         return { prefix: normalizePrefix(prefix), own: [], foreign: [], others: [], malformed: [] };
       }
