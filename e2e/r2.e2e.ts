@@ -283,7 +283,7 @@ describe("基本流程", () => {
     expect(result.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(result).toMatchObject({ written: true, verified: true });
     await expectRules([]);
-    // R2 对空配置的态度没有文档，README 记下的实测结论：接受空配置的 PUT（不退回 DELETE），之后读到 200 和一份空配置
+    // R2 对空配置的态度没有文档，实测结论：接受空配置的 PUT（不退回 DELETE），之后读到 200 和一份空配置
     expect(run.spy.writes().map((c) => c.method)).toEqual(["PUT"]);
     const after = await r2.getLifecycle();
     expect(after.status).toBe(200);
@@ -378,7 +378,7 @@ describe("对整个 bucket 生效的规则", () => {
   });
 });
 
-describe("README 里记下的 R2 实测特性", () => {
+describe("R2 的实测特性（文档没写，靠这组用例盯住）", () => {
   it("R2 静默丢掉直接挂在 <Rule> 下的裸 <Prefix>，规则变成对整个 bucket 生效", async () => {
     await r2.setLifecycle(
       lifecycleXml([

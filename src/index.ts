@@ -10,7 +10,7 @@ import { ruleId } from "./xml.ts";
  * 参数、环境变量、终端交互仍归 cli.ts。
  *
  * 参数校验（validate）按库选项名报错；探测与安全校验阶段的报错沿用 CLI 的开关名（--keep、--url……），
- * 对应关系见 README「Using as a library」（中文版「作为库调用」）。
+ * 对应关系：开关名去掉 `--` 改成驼峰，`--url` 对应 siteUrl。
  */
 
 export { BuildIdProbeError } from "./build-id.ts";
