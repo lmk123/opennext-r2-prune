@@ -12,7 +12,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Trusted Publishing 靠 OIDC token 认证；provenance 只在公开仓库生成，本仓库私有时不会有
+  id-token: write # Trusted Publishing 靠 OIDC token 认证，同时自动生成 provenance（仅限公开仓库，仓库转私有后就没有）
 
 jobs:
   publish:
