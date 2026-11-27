@@ -12,7 +12,7 @@ I started out deleting them with `rclone`, but it was painfully slow, so I wrote
 
 ## Features
 
-- **Fast, and doesn't slow down as the cache grows**: the tool only reads the build directory names in the bucket and writes lifecycle rules for the directories that are no longer needed; R2 does the actual deletion in the background (usually within 24 hours). So it takes the same time no matter how many files a directory holds.
+- **Fast, and doesn't slow down as the cache grows**: the tool never walks the cached objects: it reads the build directory names in the bucket (plus one object's write time for each build about to get a new rule) and writes lifecycle rules for the directories that are no longer needed; R2 does the actual deletion in the background (usually within 24 hours). So it takes the same time no matter how many files a directory holds.
 - **Decides what to keep from the facts**: it reads `/BUILD_ID` directly from the live versions and previews on workers.dev, keeping the 3 most recent live builds and every preview's build by default, without relying on local build output.
 - **Aborts rather than over-deletes**: probe failures, finding no builds to keep, an empty prefix and other anomalies all make it exit right away instead of degrading to "delete everything"; builds written less than 24 hours ago aren't deleted either, so a new version in the middle of deploying is never deleted by mistake.
 - **Works as a CLI and a library**: the library entry point only uses Web standard APIs, so it also runs in environments like Cloudflare Workers.
@@ -133,7 +133,7 @@ S3/R2 has no "delete directory" operation, so the usual approach lists the objec
 3. **Judges the remaining builds obsolete**, except those written less than `--grace-hours` (default 24 hours) ago.
 4. **Rewrites the bucket's whole lifecycle configuration**: attaches a deletion rule to each obsolete build's directory, reclaims rules whose directories are already empty, removes rules from builds that need to be kept again, and keeps your own rules as they are. Right after writing it reads the configuration back to verify, and removes this tool's rules if anything doesn't match.
 
-R2 then deletes in the background. The whole process never walks the cached objects, and the number of requests sent to R2 stays nearly constant.
+R2 then deletes in the background. The whole process never walks the cached objects, so the number of requests sent to R2 doesn't depend on how many objects there are: besides a handful of fixed requests, each build about to get a new rule costs one request to read its write time, so the first run on a bucket with a large backlog of builds reads each of them once.
 
 ## License
 

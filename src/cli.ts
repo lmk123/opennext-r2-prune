@@ -205,7 +205,7 @@ async function main(argv: string[]): Promise<number> {
     onWholeBucketRules: (ruleIds) => {
       const one = ruleIds.length === 1;
       console.error(
-        `\n⚠️ Warning: ${plural(ruleIds.length, "rule")} of this tool's on the bucket ${one ? "has" : "have"} no <Filter><Prefix> prefix` +
+        `\n⚠️ Warning: ${plural(ruleIds.length, "rule")} written by this tool ${one ? "has" : "have"} no <Filter><Prefix>` +
           ` (missing, or only a bare <Prefix> that R2 ignores), so ${one ? "it applies" : "they apply"} to the whole bucket: ${ruleIds.join(", ")}.\n` +
           `R2 will use ${one ? "it" : "them"} to delete every object in the bucket. A successful write in this run only rewrites those under the current prefix (${ruleId(prefix, "<buildId>")}); ` +
           `for those under other prefixes, or if this run aborts or is only a --dry-run, ` +

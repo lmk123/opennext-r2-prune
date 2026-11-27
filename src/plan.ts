@@ -173,8 +173,10 @@ export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "pre
   if (nested.length > 0) {
     const shown = (scope: string) => (scope === "" ? "(empty, i.e. the bucket root)" : scope);
     const scopes = [...new Set(nested.map((rule) => rule.scope))];
+    const many = scopes.length > 1;
     throw new PlanError(
-      `The bucket has rules this tool wrote for cache prefix ${scopes.map(shown).join(", ")}, which is nested with this run's prefix ${shown(current.prefix)}: ` +
+      `The bucket has rules this tool wrote for cache ${many ? "prefixes" : "prefix"} ${scopes.map(shown).join(", ")}, ` +
+        `${many ? "each of which" : "which"} is nested with this run's prefix ${shown(current.prefix)}: ` +
         `a run for the outer prefix would treat the inner prefix's directory as a build, judge it obsolete and delete the other site's cache along with it, so it aborted.\n` +
         `Give every site sharing the bucket a prefix that isn't nested with the others; if those prefixes are abandoned, find these rules with npx wrangler r2 bucket lifecycle list, ` +
         `delete them manually, then run again: ${nested.map((rule) => rule.id).join(", ")}.`,
@@ -375,7 +377,7 @@ function exhaustedMessage(budget: RuleBudget, deferred: number): string {
   // 目录删空了规则还在，可能是旧前缀没人回收，也可能是在用的站点还没跑到回收那一趟，所以两种补救都给
   const staleNote =
     budget.stale.length > 0
-      ? `, plus ${plural(budget.stale.length, "rule")} this tool wrote for cache prefix ${scopes.join(", ")} whose ` +
+      ? `, plus ${plural(budget.stale.length, "rule")} this tool wrote for cache ${scopes.length > 1 ? "prefixes" : "prefix"} ${scopes.join(", ")} whose ` +
         `${budget.stale.length === 1 ? "directory is" : "directories are"} already empty but weren't reclaimed — ` +
         `most likely an old prefix from before a --prefix change, which no run will ever reclaim`
       : "";

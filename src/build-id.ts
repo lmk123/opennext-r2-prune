@@ -67,7 +67,7 @@ export async function probeBuildId(
 
   if (isTransientStatus(response.status)) {
     throw new BuildIdProbeError(
-      `${url} returned HTTP ${response.status} ${MAX_ATTEMPTS} times in a row` +
+      `${url} returned HTTP ${response.status} on all ${MAX_ATTEMPTS} attempts` +
         ` (${response.status === 429 ? "rate limited" : "server error"}); just run again later.`,
       true,
     );

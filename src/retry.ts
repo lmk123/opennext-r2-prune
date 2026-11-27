@@ -4,6 +4,8 @@
  * 网络层失败到最后一次仍未成功，则抛出最后那个错误。和调用方一样不碰 Node 专属 API。
  */
 
+import { plural } from "./text.ts";
+
 export const MAX_ATTEMPTS = 3;
 /** 服务端给的 Retry-After 再长也只等这么久，免得定时任务被一个响应头挂住 */
 const MAX_RETRY_AFTER_MS = 60_000;
@@ -77,7 +79,7 @@ async function sendWithTimeout(
   if (signal?.aborted) controller.abort(signal.reason);
   else signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(
-    () => controller.abort(new Error(`response not fully received within ${timeoutMs / 1000} seconds`)),
+    () => controller.abort(new Error(`response not fully received within ${plural(timeoutMs / 1000, "second")}`)),
     timeoutMs,
   );
   try {
