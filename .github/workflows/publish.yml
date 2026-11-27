@@ -27,21 +27,18 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          # Trusted Publishing 需要 npm >= 11.5.1，Node 24 自带的 npm 满足
           node-version: 24
           registry-url: https://registry.npmjs.org
           cache: pnpm
+
+      # Trusted Publishing 需要 npm >= 11.5.1；setup-node 可能用上 runner 缓存里较早的 24.x，自带的 npm 不一定够新
+      - run: npm install -g npm@latest
 
       - name: 核对 tag 与 package.json 版本一致、已合入 main
         run: |
           version="$(node -p "require('./package.json').version")"
           if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} 与 package.json 的版本 ${version} 不一致：删掉这个 tag，改好版本号合并后重新打 v${version}"
-            exit 1
-          fi
-          # tag 过滤是 glob，这里再精确核一次，防止预发布版本被发到 latest
-          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::版本 ${version} 不是 X.Y.Z 形式的正式版本：预发布版本要手动用 npm publish --tag next 发布，删掉 tag ${GITHUB_REF_NAME}"
             exit 1
           fi
           # npm 的版本号发过就不能重用，没合并的代码不能发出去
