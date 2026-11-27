@@ -13,8 +13,8 @@ OpenNext 启用 R2 增量缓存后，每次上线都会用新的 build id 另存
 ## 特点
 
 - **快，且不随缓存规模变慢**：工具只读取 bucket 里的 build 目录名，再给不再需要的目录写上 lifecycle 规则，真正的删除由 R2 在后台完成（通常在 24 小时内）。因此不管目录里有多少文件，耗时都一样。
-- **按事实判断保留哪些 build**：直接读线上版本和预览的 `/BUILD_ID`，默认保留最近 3 个线上 build 和所有预览的 build，不依赖本地构建产物。
-- **宁可中止，绝不多删**：探测失败、找不到任何要保留的 build、前缀为空等异常都会直接退出，不会退化成「全部删除」；写入不满 24 小时的 build 也不删，正在部署的新版本不会被误删。
+- **按事实判断保留哪些 build**：直接读线上版本和预览在 workers.dev 上的 `/BUILD_ID`，默认保留最近 3 个线上 build 和所有预览的 build，不依赖本地构建产物。
+- **宁可中止，绝不多删**：探测失败、找不到任何要保留的 build、前缀为空等异常都会直接退出，不会退化成「全部删除」；写入不满 24 小时的 build 也不删，因此正在部署的新版本不会被误删。
 - **CLI 与库两用**：库入口只用 Web 标准 API，在 Cloudflare Worker 这类环境里也能运行。
 
 ## 用法
@@ -22,7 +22,7 @@ OpenNext 启用 R2 增量缓存后，每次上线都会用新的 build id 另存
 ### 准备工作
 
 1. **创建 R2 API token**，用来读写 bucket 的 lifecycle 规则：
-   1. 在 Cloudflare Dashboard 打开 **R2 Object Storage** 页面，在 **Account Details** 中点击 **API Tokens** 旁的 **Manage**。
+   1. 进入 [R2 的 API Tokens 页面](https://dash.cloudflare.com/r2/api-tokens)。
    2. 点击 **Create Account API token**（也可以选 **Create User API token**，但你被移出该账号后它会失效）。
    3. **Permissions** 选 **Admin Read & Write**；如果只想先用 `--dry-run` 看看计划，选 **Admin Read only** 即可。不要选 Object 开头的权限：lifecycle 是 bucket 级配置，Object 权限的 token 读写不了。
    4. 创建后复制 **Access Key ID** 和 **Secret Access Key**，分别对应 `--access-key-id` 和 `--secret-access-key`。Secret Access Key 只显示这一次。
@@ -30,10 +30,10 @@ OpenNext 启用 R2 增量缓存后，每次上线都会用新的 build id 另存
    Admin 权限的 token 无法限定到单个 bucket，对整个账号生效，请妥善保管。
 2. **创建 Cloudflare API token**，用来查询 Worker 的线上版本和预览（只用 `--url` 时不需要）：
    1. 打开 [API Tokens](https://dash.cloudflare.com/profile/api-tokens)（右上角头像 › **My Profile** › **API Tokens**），点击 **Create Token**。
-   2. 不选模板，从头创建自定义 token。
-   3. 添加一条权限 **Account › Workers Scripts › Read**，账号范围选 Worker 所在的账号。
+   2. 依次选择 **Start from scratch** › **Start with an Account policy**。
+   3. 在 **Policies** 里搜索 `Workers Scripts`，勾选它的 **Read** 权限。
    4. 点击 **Continue to summary**，再点 **Create Token**，复制生成的 token，对应 `--api-token`。token 只显示这一次。
-3. **记下 Account ID**：R2 Object Storage 页面的 **Account Details** 里就有，对应 `--account-id`。
+3. **记下 Account ID**：[R2 Object Storage 页面](https://dash.cloudflare.com/r2/overview)的 **Account Details** 里就有，对应 `--account-id`。
 4. **确认 Worker 开启了 workers.dev 域名与 `preview_urls`**，工具要从这些地址读 `/BUILD_ID`。**实现了 Durable Object 的 Worker 不会生成版本预览 URL**，这种情况请改用 `--url` 加 `--keep`。
 
 ### 命令行
@@ -41,9 +41,9 @@ OpenNext 启用 R2 增量缓存后，每次上线都会用新的 build id 另存
 ```bash
 npx opennext-r2-prune \
   --worker <WORKER_NAME> \
+  --bucket <R2_BUCKET> \
   --api-token <CLOUDFLARE_API_TOKEN> \
   --account-id <CLOUDFLARE_ACCOUNT_ID> \
-  --bucket <R2_BUCKET> \
   --access-key-id <R2_ACCESS_KEY_ID> \
   --secret-access-key <R2_SECRET_ACCESS_KEY> \
   --dry-run
@@ -122,7 +122,7 @@ const result = await prune({
 - **已上传但迟迟没有部署的版本只受 `--grace-hours` 保护**。打算隔很久再部署时，请调大它，或用 `--keep` 保留。
 - 只用 `--url` 时只会保留此刻线上的那一个 build，回滚目标、预览以及灰度中的旧版本都会被判作废。
 - R2 每个 bucket 最多 1000 条 lifecycle 规则，本工具一般最多用到 990 条。积压太多时会分批挂规则，需要多跑几轮才能清完。改了 `--prefix` 后，旧前缀下的规则不再由工具管理，需要手动删除。
-- 不要在 Dashboard 上手动修改或删除本工具的规则（ID 形如 `opennext-r2-prune:<前缀>/<buildId>/`），想清理就再跑一次工具。规则可以在 Dashboard 的 bucket 设置里查看，也可以用 `npx wrangler r2 bucket lifecycle list <bucket>`。
+- 不要在 Dashboard 上手动修改或删除本工具的 Object lifecycle 规则（ID 形如 `opennext-r2-prune:<前缀>/<buildId>/`），想清理就再跑一次工具。规则可以在 Dashboard 的 bucket 设置里查看，也可以用 `npx wrangler r2 bucket lifecycle list <bucket>`。
 
 ## 工作原理
 
