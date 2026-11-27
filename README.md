@@ -109,7 +109,7 @@ const result = await prune({
 });
 ```
 
-Options that take a value, plus `--force` and `--allow-root-prefix`, map to the command-line flags in camelCase (`--recent-builds` → `recentBuilds`), and `--url` maps to `siteUrl`. The remaining flags have no option of the same name: instead of `--dry-run`, use the two-phase `planPrune(options)` to look at the plan, and call the `apply()` it returns once you've confirmed; instead of `--yes`, leave out `confirm`; instead of `--verbose`, pass `onRetry`. Every failure is thrown as a typed exception (`PlanError`, `S3Error`, `PruneWriteError`, etc.); when a `PruneWriteError` has `written` set to `true`, follow its message and check the bucket's lifecycle rules right away.
+Options that take a value, plus `--force`, `--allow-root-prefix` and `--dry-run`, map to the command-line flags in camelCase (`--recent-builds` → `recentBuilds`), and `--url` maps to `siteUrl`. To look at the plan before deciding, you can also use the two-phase `planPrune(options)` and call the `apply()` it returns once you've confirmed. The remaining flags have no option of the same name: instead of `--yes`, leave out `confirm`; instead of `--verbose`, pass `onRetry`. Every failure is thrown as a typed exception (`PlanError`, `S3Error`, `PruneWriteError`, etc.); when a `PruneWriteError` has `written` set to `true`, follow its message and check the bucket's lifecycle rules right away.
 
 ### Several sites sharing one bucket
 

@@ -109,7 +109,7 @@ const result = await prune({
 });
 ```
 
-带值的开关以及 `--force`、`--allow-root-prefix` 都有对应的选项，改成驼峰写法（`--recent-builds` → `recentBuilds`），`--url` 对应 `siteUrl`。其余开关没有同名选项：代替 `--dry-run` 的是两段式的 `planPrune(options)`，先看计划，确认后再调用它返回的 `apply()`；代替 `--yes` 的是不传 `confirm`；代替 `--verbose` 的是传 `onRetry`。失败一律以带类型的异常抛出（`PlanError`、`S3Error`、`PruneWriteError` 等）；`PruneWriteError` 的 `written` 为 `true` 时，请按报错说明立即检查 bucket 的 lifecycle 规则。
+带值的开关以及 `--force`、`--allow-root-prefix`、`--dry-run` 都有对应的选项，改成驼峰写法（`--recent-builds` → `recentBuilds`），`--url` 对应 `siteUrl`。想先看计划再决定，也可以用两段式的 `planPrune(options)`，确认后再调用它返回的 `apply()`。其余开关没有同名选项：代替 `--yes` 的是不传 `confirm`；代替 `--verbose` 的是传 `onRetry`。失败一律以带类型的异常抛出（`PlanError`、`S3Error`、`PruneWriteError` 等）；`PruneWriteError` 的 `written` 为 `true` 时，请按报错说明立即检查 bucket 的 lifecycle 规则。
 
 ### 多个站点共用一个 bucket
 
