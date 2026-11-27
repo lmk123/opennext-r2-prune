@@ -44,7 +44,7 @@ describe("probeBuildId", () => {
   it("响应不像 build id 就报错，而不是拿去当保留项", async () => {
     await expect(
       probeBuildId("https://example.com/BUILD_ID", reply("hello world!")),
-    ).rejects.toThrow(/不像一个 build id/);
+    ).rejects.toThrow(/doesn't look like a build id/);
   });
 
   it("带上防缓存头，避免中间缓存返回上一个版本的 id", async () => {
@@ -105,8 +105,8 @@ describe("probeBuildId", () => {
       const error = (await result) as BuildIdProbeError;
       expect(error).toBeInstanceOf(BuildIdProbeError);
       expect(error.transient).toBe(true);
-      expect(error.message).toMatch(/被限流[\s\S]*稍后重跑/);
-      expect(error.message).not.toMatch(/暴露/);
+      expect(error.message).toMatch(/rate limited[\s\S]*run again later/);
+      expect(error.message).not.toMatch(/not be exposed/);
     } finally {
       vi.useRealTimers();
     }

@@ -1,4 +1,5 @@
 import { normalizePrefix, rulePrefix } from "./prefix.ts";
+import { plural } from "./text.ts";
 import {
   type LifecycleDoc,
   MAX_RULE_ID_LENGTH,
@@ -138,29 +139,29 @@ export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "pre
   // 这是本工具唯一能删到非缓存数据的路径，所以要求显式承认。
   if (normalizePrefix(prefix) === "" && !input.allowRootPrefix) {
     throw new PlanError(
-      "--prefix 为空意味着把 bucket 根下的每一个一级目录都当成 build 缓存，" +
-        "非缓存目录（assets/、backups/ 等）会一并被挂上删除规则。\n" +
-        "确认这个 bucket 只用来存 OpenNext 缓存，可加 --allow-root-prefix。",
+      "An empty --prefix means treating every top-level directory at the bucket root as a build cache, " +
+        "so non-cache directories (assets/, backups/, etc.) would get deletion rules too.\n" +
+        "If you're sure this bucket only stores the OpenNext cache, add --allow-root-prefix.",
     );
   }
 
   // 规则归属按前缀划分，拿 A 前缀的配置给 B 前缀算计划会把 A 的规则全部回收掉
   if (normalizePrefix(prefix) !== current.prefix) {
     throw new PlanError(
-      `内部错误：lifecycle 配置按前缀「${current.prefix}」分拣，计划却按「${normalizePrefix(prefix)}」计算，已中止，` +
-        `没有写入任何改动。直接调用 makePlan 时请确认 current 是用同一个前缀读出的（getLifecycle(prefix)）；` +
-        `否则这是本工具的缺陷，请带上这条报错提 issue。`,
+      `Internal error: the lifecycle configuration was sorted by prefix "${current.prefix}", but the plan was computed for "${normalizePrefix(prefix)}"; aborted ` +
+        `without writing anything. When calling makePlan directly, make sure current was read with the same prefix (getLifecycle(prefix)); ` +
+        `otherwise this is a bug in this tool, please open an issue with this error.`,
     );
   }
 
   // 拆不出归属的规则不猜：它可能是任何一个站点的。对整个 bucket 生效的已由调用方先报过
   if (current.malformed.length > 0) {
     const listed = current.malformed
-      .map((rule) => (isWholeBucket(rule) ? `${rule.id}（没有 <Filter><Prefix>，正对整个 bucket 生效！）` : rule.id))
-      .join("、");
+      .map((rule) => (isWholeBucket(rule) ? `${rule.id} (no <Filter><Prefix>, currently applies to the whole bucket!)` : rule.id))
+      .join(", ");
     throw new XmlAssumptionError(
-      `bucket 上有规则以本工具的标记开头，却拆不出「${RULE_ID_PREFIX}<规则作用的前缀>」里的缓存前缀与 buildId：${listed}，` +
-        `无从判断它属于哪个缓存前缀，已中止。请用 npx wrangler r2 bucket lifecycle list 核对后手动删除这些规则再重跑。`,
+      `The bucket has rules starting with this tool's marker whose IDs can't be split into the cache prefix and buildId of "${RULE_ID_PREFIX}<prefix the rule targets>": ${listed}. ` +
+        `There's no way to tell which cache prefix they belong to, so it aborted. Check them with npx wrangler r2 bucket lifecycle list, delete them manually, then run again.`,
     );
   }
 
@@ -170,13 +171,15 @@ export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "pre
     (rule) => rule.scope.startsWith(current.prefix) || current.prefix.startsWith(rule.scope),
   );
   if (nested.length > 0) {
-    const shown = (scope: string) => (scope === "" ? "（空，即 bucket 根）" : scope);
+    const shown = (scope: string) => (scope === "" ? "(empty, i.e. the bucket root)" : scope);
     const scopes = [...new Set(nested.map((rule) => rule.scope))];
+    const many = scopes.length > 1;
     throw new PlanError(
-      `bucket 上有本工具为缓存前缀 ${scopes.map(shown).join("、")} 写的规则，与本次的前缀 ${shown(current.prefix)} 互相嵌套：` +
-        `外层前缀的运行会把内层前缀所在的目录当成一个 build，判作废后连同另一个站点的缓存整个删掉，已中止。\n` +
-        `请给共用 bucket 的每个站点换成互不嵌套的前缀；若那些前缀已经弃用，用 npx wrangler r2 bucket lifecycle list ` +
-        `找出这些规则手动删除后重跑：${nested.map((rule) => rule.id).join("、")}。`,
+      `The bucket has rules this tool wrote for cache ${many ? "prefixes" : "prefix"} ${scopes.map(shown).join(", ")}, ` +
+        `${many ? "each of which" : "which"} is nested with this run's prefix ${shown(current.prefix)}: ` +
+        `a run for the outer prefix would treat the inner prefix's directory as a build, judge it obsolete and delete the other site's cache along with it, so it aborted.\n` +
+        `Give every site sharing the bucket a prefix that isn't nested with the others; if those prefixes are abandoned, find these rules with npx wrangler r2 bucket lifecycle list, ` +
+        `delete them manually, then run again: ${nested.map((rule) => rule.id).join(", ")}.`,
     );
   }
 
@@ -189,11 +192,11 @@ export function checkLayout(input: Pick<PlanInput, "existing" | "current" | "pre
     // 前缀为空时 ID 仍超长，只能是目录名本身太长，换前缀无济于事
     const fix =
       ruleId("", tooLong).length > MAX_RULE_ID_LENGTH
-        ? `目录名本身就太长，换前缀也没用：OpenNext 的 build id 不会这么长，请确认它是不是缓存目录，不是就把它移出 ${normalizePrefix(prefix) || "bucket 根"}。`
-        : `请换一个更短的 --prefix（同时改 OpenNext 的 NEXT_INC_CACHE_R2_PREFIX）；若目录名长得反常，先确认它是不是缓存目录。`;
+        ? `The directory name itself is too long, so changing the prefix won't help: OpenNext build ids are never this long. Check whether it's a cache directory, and if not, move it out of ${normalizePrefix(prefix) || "the bucket root"}.`
+        : `Switch to a shorter --prefix (and change OpenNext's NEXT_INC_CACHE_R2_PREFIX too); if the directory name is unusually long, first check whether it's a cache directory.`;
     throw new PlanError(
-      `目录 ${tooLong} 判作废时要写的规则 ID ${id} 长 ${id.length} 个字符（缓存前缀占 ${prefixLength}、目录名占 ${tooLong.length}），` +
-        `超过 lifecycle 规则 ID 的 ${MAX_RULE_ID_LENGTH} 字符上限，已中止。${fix}`,
+      `The rule ID ${id} to write if directory ${tooLong} is judged obsolete is ${id.length} characters long (cache prefix ${prefixLength}, directory name ${tooLong.length}), ` +
+        `exceeding the ${MAX_RULE_ID_LENGTH}-character limit for lifecycle rule IDs, so it aborted. ${fix}`,
     );
   }
 }
@@ -218,7 +221,7 @@ export function makePlan(input: PlanInput): PrunePlan {
   // fresh 只是暂且不判，不能拿它充当保留集，见 KeepReason
   const judged = new Set(input.keep.filter((b) => b.reason !== "fresh").map((b) => b.buildId));
   if (judged.size === 0) {
-    throw new PlanError("保留集为空，拒绝继续 —— 那会把所有 build 缓存都标记为删除。");
+    throw new PlanError("The keep set is empty; refusing to continue — that would mark every build cache for deletion.");
   }
 
   const keep: KeptBuild[] = [];
@@ -235,15 +238,15 @@ export function makePlan(input: PlanInput): PrunePlan {
   }
   if (missing.length > 0 && !input.force) {
     throw new PlanError(
-      `要保留的 build 在 bucket 里不存在：${missing.join(", ")}。\n` +
-        `通常意味着 bucket、--prefix、站点域名或 --worker 有一个填错了。确认无误可加 --force 跳过这项检查。`,
+      `Builds to keep don't exist in the bucket: ${missing.join(", ")}.\n` +
+        `This usually means one of the bucket, --prefix, the site domain or --worker is wrong. Once you've confirmed it's correct, add --force to skip this check.`,
     );
   }
 
   const expireIds = existing.filter((id) => !keepMap.has(id));
   if (expireIds.length > 0 && !existing.some((id) => judged.has(id))) {
     throw new PlanError(
-      "保留集与 bucket 里现存的 build 没有交集，拒绝把全部 build 缓存标记为删除。",
+      "The keep set has no overlap with the builds in the bucket; refusing to mark every build cache for deletion.",
     );
   }
 
@@ -374,18 +377,19 @@ function exhaustedMessage(budget: RuleBudget, deferred: number): string {
   // 目录删空了规则还在，可能是旧前缀没人回收，也可能是在用的站点还没跑到回收那一趟，所以两种补救都给
   const staleNote =
     budget.stale.length > 0
-      ? `，本工具为缓存前缀 ${scopes.join("、")} 写的规则里还有 ${budget.stale.length} 条，作用的目录已经删空却没被回收——` +
-        `多半是改 --prefix 前的旧前缀，不会有哪一趟运行回收它们`
+      ? `, plus ${plural(budget.stale.length, "rule")} this tool wrote for cache ${scopes.length > 1 ? "prefixes" : "prefix"} ${scopes.join(", ")} whose ` +
+        `${budget.stale.length === 1 ? "directory is" : "directories are"} already empty but weren't reclaimed — ` +
+        `most likely an old prefix from before a --prefix change, which no run will ever reclaim`
       : "";
   const staleFix =
     budget.stale.length > 0
-      ? `。那些前缀若其实还有站点在用，让那个站点先跑一趟，它会回收自己已删完的规则；确认已经弃用就手动删掉` +
-        `（规则 ID 形如 ${RULE_ID_PREFIX}<旧前缀>/<buildId>/；目录已经删空的那些，删掉不会误删任何东西）`
+      ? `. If a site still uses those prefixes, run that site once first and it will reclaim its own finished rules; if they're confirmed abandoned, delete them manually ` +
+        `(rule IDs look like ${RULE_ID_PREFIX}<old prefix>/<buildId>/; deleting those whose directories are already empty can't delete anything by mistake)`
       : "";
   return (
-    `核对 lifecycle 规则名额时中止：R2 每个 bucket 最多 ${MAX_RULES} 条 lifecycle 规则，bucket 上你自己的规则有 ` +
-    `${budget.users} 条${staleNote}，名额永远空不出来，${deferred} 个作废 build 一条删除规则都挂不上，没有写入任何改动。\n` +
-    `请用 npx wrangler r2 bucket lifecycle list <bucket> 找出不再需要的规则手动删掉${staleFix}，空出名额后重跑。`
+    `Aborted while checking lifecycle rule slots: R2 allows at most ${MAX_RULES} lifecycle rules per bucket, and the bucket has ` +
+    `${plural(budget.users, "rule")} of your own${staleNote}. Slots can never be freed, so ${plural(deferred, "obsolete build")} can't get a deletion rule; nothing was written.\n` +
+    `Find the rules you no longer need with npx wrangler r2 bucket lifecycle list <bucket> and delete them manually${staleFix}, then run again once slots are freed.`
   );
 }
 
@@ -461,36 +465,36 @@ export function verifyWritten(expected: LifecycleDoc, actual: LifecycleDoc): Ver
   for (const want of expected.own) {
     const rules = actualById.get(want.buildId) ?? [];
     if (rules.length === 0) {
-      own.push(`规则 ${want.buildId} 读回来不见了`);
+      own.push(`rule ${want.buildId} is missing when read back`);
       continue;
     }
-    if (rules.length > 1) own.push(`规则 ${want.buildId} 读回来有 ${rules.length} 条`);
+    if (rules.length > 1) own.push(`rule ${want.buildId} reads back as ${rules.length} rules`);
     for (const got of rules) {
       if (got.prefix !== want.prefix) {
         const shown =
           got.prefix !== ""
             ? got.prefix
             : got.barePrefix
-              ? `空，只有 R2 不认的裸 <Prefix>${got.barePrefix}（按作用于整个 bucket 对待！）`
-              : "空（作用于整个 bucket！）";
-        own.push(`规则 ${want.buildId} 的前缀读回来是 ${shown}，应为 ${want.prefix}`);
+              ? `empty, with only a bare <Prefix>${got.barePrefix} that R2 ignores (treated as applying to the whole bucket!)`
+              : "empty (applies to the whole bucket!)";
+        own.push(`rule ${want.buildId} reads back with prefix ${shown}, expected ${want.prefix}`);
       }
       if (got.expireDays !== want.expireDays) {
-        own.push(`规则 ${want.buildId} 的过期天数读回来是 ${got.expireDays}，应为 ${want.expireDays}`);
+        own.push(`rule ${want.buildId} reads back with ${got.expireDays} expiration days, expected ${want.expireDays}`);
       }
       if (got.enabled !== want.enabled) {
-        own.push(`规则 ${want.buildId} 的状态读回来是 ${got.enabled ? "启用" : "停用"}，应为 ${want.enabled ? "启用" : "停用"}`);
+        own.push(`rule ${want.buildId} reads back as ${got.enabled ? "enabled" : "disabled"}, expected ${want.enabled ? "enabled" : "disabled"}`);
       }
     }
   }
   for (const rule of actual.own) {
-    if (!expectedIds.has(rule.buildId)) own.push(`读回来多出一条本工具的规则 ${rule.buildId}`);
+    if (!expectedIds.has(rule.buildId)) own.push(`an extra rule of this tool, ${rule.buildId}, was read back`);
   }
 
   const foreign =
     actual.foreign.length === expected.foreign.length
       ? []
-      : [`外部规则写入 ${expected.foreign.length} 条，读回来 ${actual.foreign.length} 条`];
+      : [`external rules: ${expected.foreign.length} written, ${actual.foreign.length} read back`];
   return { own, foreign };
 }
 

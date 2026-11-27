@@ -77,18 +77,18 @@ describe("安全校验", () => {
   it("要保留的 build 不在 bucket 里时拒绝继续", () => {
     expect(() =>
       makePlan(input({ keep: [{ buildId: "bogus", reason: "explicit" }] })),
-    ).toThrow(/不存在/);
+    ).toThrow(/don't exist in the bucket/);
   });
 
   it("--force 可以放行「不在 bucket 里」，但仍不允许清空全部", () => {
     expect(() =>
       makePlan(input({ keep: [{ buildId: "bogus", reason: "explicit" }], force: true })),
-    ).toThrow(/没有交集/);
+    ).toThrow(/no overlap/);
   });
 
   it("刚写入的 build 不能充当保留集", () => {
     // 只剩 fresh 时等于什么都没探测到；它也不能替填错的 --keep 撑起「有交集」
-    expect(() => makePlan(input({ keep: [{ buildId: "old1", reason: "fresh" }] }))).toThrow(/保留集为空/);
+    expect(() => makePlan(input({ keep: [{ buildId: "old1", reason: "fresh" }] }))).toThrow(/keep set is empty/);
     expect(() =>
       makePlan(
         input({
@@ -99,7 +99,7 @@ describe("安全校验", () => {
           force: true,
         }),
       ),
-    ).toThrow(/没有交集/);
+    ).toThrow(/no overlap/);
   });
 
   it("刚写入的 build 照常保留，不挂规则", () => {
@@ -243,7 +243,7 @@ describe("规则总数上限", () => {
 
   it("用户自己的规则占满上限、一条新规则都挂不上时中止，并说明怎么补救", () => {
     expect(() => makePlan(input({ current: lifecycle([], foreign(MAX_RULES)) }))).toThrow(
-      /核对 lifecycle 规则名额时中止[\s\S]*1000 条[\s\S]*wrangler r2 bucket lifecycle list/,
+      /Aborted while checking lifecycle rule slots[\s\S]*1000 lifecycle rules[\s\S]*wrangler r2 bucket lifecycle list/,
     );
   });
 
@@ -285,7 +285,7 @@ describe("规则总数上限", () => {
           emptyRuleDirs: new Set(others.map(otherRuleDir)),
         }),
       ),
-    ).toThrow(/核对 lifecycle 规则名额时中止[\s\S]*site-b\/[\s\S]*wrangler r2 bucket lifecycle list/);
+    ).toThrow(/Aborted while checking lifecycle rule slots[\s\S]*site-b\/[\s\S]*wrangler r2 bucket lifecycle list/);
   });
 
   it("别的前缀的规则只按目录已删空的那几条算永久占用，没占满时只推迟、不中止", () => {
@@ -539,7 +539,7 @@ describe("多来源保留集", () => {
   it("online 不在 bucket 里依然报错", () => {
     expect(() =>
       makePlan(input({ keep: [{ buildId: "bogus", reason: "online" }] })),
-    ).toThrow(/不存在/);
+    ).toThrow(/don't exist in the bucket/);
   });
 
   it("--keep 的 build 同时是近期版本时，不在 bucket 里仍要报错", () => {
@@ -575,13 +575,13 @@ describe("verifyWritten", () => {
     };
     expect(verifyWritten(doc, actual)).toEqual({
       own: [
-        "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
-        "规则 old1 的过期天数读回来是 2，应为 1",
-        "规则 old1 的状态读回来是 停用，应为 启用",
-        "规则 old2 读回来不见了",
-        "读回来多出一条本工具的规则 extra",
+        "rule old1 reads back with prefix empty (applies to the whole bucket!), expected incremental-cache/old1/",
+        "rule old1 reads back with 2 expiration days, expected 1",
+        "rule old1 reads back as disabled, expected enabled",
+        "rule old2 is missing when read back",
+        "an extra rule of this tool, extra, was read back",
       ],
-      foreign: ["外部规则写入 1 条，读回来 0 条"],
+      foreign: ["external rules: 1 written, 0 read back"],
     });
   });
 
@@ -592,8 +592,8 @@ describe("verifyWritten", () => {
       foreign: ["<ID>mine</ID>"],
     };
     expect(verifyWritten(doc, actual).own).toEqual([
-      "规则 old1 读回来有 2 条",
-      "规则 old1 的前缀读回来是 空（作用于整个 bucket！），应为 incremental-cache/old1/",
+      "rule old1 reads back as 2 rules",
+      "rule old1 reads back with prefix empty (applies to the whole bucket!), expected incremental-cache/old1/",
     ]);
   });
 
@@ -613,7 +613,7 @@ describe("verifyWritten 报出裸 Prefix", () => {
       malformed: [],
     };
     expect(verifyWritten(doc, actual).own).toEqual([
-      "规则 old1 的前缀读回来是 空，只有 R2 不认的裸 <Prefix>incremental-cache/old1/（按作用于整个 bucket 对待！），应为 incremental-cache/old1/",
+      "rule old1 reads back with prefix empty, with only a bare <Prefix>incremental-cache/old1/ that R2 ignores (treated as applying to the whole bucket!), expected incremental-cache/old1/",
     ]);
     expect(wholeBucketRules(actual)).toEqual(["opennext-r2-prune:incremental-cache/old1/"]);
   });
@@ -671,20 +671,20 @@ describe("多个前缀共用 bucket", () => {
 
   it("别的前缀在本前缀之下时中止：本前缀的一级目录里就有那个站点", () => {
     expect(() => makePlan(input({ current: withOthers("incremental-cache/", "incremental-cache/nested/") }))).toThrow(
-      /互相嵌套/,
+      /is nested with/,
     );
   });
 
   it("本前缀在别的前缀之下时同样中止", () => {
     expect(() =>
       makePlan(input({ prefix: "site-a/nested", current: withOthers("site-a/nested/", "site-a/") })),
-    ).toThrow(/互相嵌套/);
+    ).toThrow(/is nested with/);
   });
 
   it("前缀为空、而 bucket 上有别的前缀的规则时中止", () => {
     expect(() =>
       makePlan(input({ prefix: "", allowRootPrefix: true, current: withOthers("", "site-a/") })),
-    ).toThrow(/互相嵌套/);
+    ).toThrow(/is nested with/);
   });
 
   it("别的前缀嵌套时，报错里照原样列出那些规则的 ID", () => {
@@ -695,7 +695,7 @@ describe("多个前缀共用 bucket", () => {
 
   it("规则 ID 超出长度上限时中止，说明是前缀太长", () => {
     const prefix = `${"p".repeat(240)}/`;
-    expect(() => makePlan(input({ prefix, current: withOthers(prefix) }))).toThrow(/更短的 --prefix/);
+    expect(() => makePlan(input({ prefix, current: withOthers(prefix) }))).toThrow(/shorter --prefix/);
   });
 
   it("目录名本身就让 ID 超长时，不叫人换前缀", () => {
@@ -708,8 +708,8 @@ describe("多个前缀共用 bucket", () => {
       }
     })();
     expect(error).toBeInstanceOf(PlanError);
-    expect(error!.message).toMatch(/目录名本身就太长/);
-    expect(error!.message).not.toMatch(/更短的 --prefix/);
+    expect(error!.message).toMatch(/directory name itself is too long/);
+    expect(error!.message).not.toMatch(/shorter --prefix/);
   });
 
   it("有格式不对的本工具规则时中止，并点出其中对整个 bucket 生效的", () => {
@@ -718,10 +718,10 @@ describe("多个前缀共用 bucket", () => {
       malformed: [{ id: "opennext-r2-prune:", prefix: "", expireDays: 1, enabled: true }],
     };
     expect(() => makePlan(input({ current }))).toThrow(XmlAssumptionError);
-    expect(() => makePlan(input({ current }))).toThrow(/opennext-r2-prune:（没有 <Filter><Prefix>，正对整个 bucket 生效！）/);
+    expect(() => makePlan(input({ current }))).toThrow(/opennext-r2-prune: \(no <Filter><Prefix>, currently applies to the whole bucket!\)/);
   });
 
   it("计划用的前缀与配置分拣时的前缀不一致时中止", () => {
-    expect(() => makePlan(input({ current: withOthers("site-b/") }))).toThrow(/内部错误/);
+    expect(() => makePlan(input({ current: withOthers("site-b/") }))).toThrow(/Internal error/);
   });
 });

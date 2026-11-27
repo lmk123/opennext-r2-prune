@@ -161,7 +161,7 @@ describe("基本流程", () => {
     const planned = await planPrune(opts);
     expect(planned.keep).toEqual([
       { buildId: "build-a", reason: "explicit" },
-      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^写入于 \d{4}-\d\d-\d\dT/) },
+      { buildId: "build-b", reason: "fresh", source: expect.stringMatching(/^written at \d{4}-\d\d-\d\dT/) },
     ]);
     expect(planned.expire).toEqual([]);
 
@@ -283,7 +283,7 @@ describe("基本流程", () => {
     expect(result.reclaim).toEqual([{ buildId: "gone", reason: "emptied" }]);
     expect(result).toMatchObject({ written: true, verified: true });
     await expectRules([]);
-    // R2 对空配置的态度没有文档，README 记下的实测结论：接受空配置的 PUT（不退回 DELETE），之后读到 200 和一份空配置
+    // R2 对空配置的态度没有文档，实测结论：接受空配置的 PUT（不退回 DELETE），之后读到 200 和一份空配置
     expect(run.spy.writes().map((c) => c.method)).toEqual(["PUT"]);
     const after = await r2.getLifecycle();
     expect(after.status).toBe(200);
@@ -309,17 +309,17 @@ describe("安全校验没过时中止，且没有写请求", () => {
 
   it("前缀为空、保留的 build 不存在、保留集与现存 build 无交集", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
-    await expectAbort("", { keep: ["build-a"] }, /--prefix 为空/);
-    await expectAbort(SITE_A, { keep: ["no-such-build"] }, /不存在/);
-    await expectAbort(SITE_A, { keep: ["no-such-build"], force: true }, /没有交集/);
+    await expectAbort("", { keep: ["build-a"] }, /empty --prefix/);
+    await expectAbort(SITE_A, { keep: ["no-such-build"] }, /don't exist in the bucket/);
+    await expectAbort(SITE_A, { keep: ["no-such-build"], force: true }, /no overlap/);
   });
 
   it("前缀与已有规则的前缀互相嵌套", async () => {
     await r2.seedBuilds(SITE_A, ["build-a", "build-b"]);
     await prune(options(SITE_A, { keep: ["build-a"] }).opts);
 
-    await expectAbort(E2E_ROOT, { keep: ["site-a"] }, /互相嵌套/);
-    await expectAbort(`${SITE_A}/build-a`, { keep: ["x"] }, /互相嵌套/);
+    await expectAbort(E2E_ROOT, { keep: ["site-a"] }, /is nested with/);
+    await expectAbort(`${SITE_A}/build-a`, { keep: ["x"] }, /is nested with/);
   });
 
   it("本工具标记开头、前缀里却有空格这类拆不开的字符的规则", async () => {
@@ -331,7 +331,7 @@ describe("安全校验没过时中止，且没有写请求", () => {
           `<Filter><Prefix>${E2E_ROOT}/never-used/</Prefix></Filter><Expiration><Days>3650</Days></Expiration></Rule>`,
       ]),
     );
-    await expectAbort(SITE_A, { keep: ["build-a"] }, /拆不出/, XmlAssumptionError);
+    await expectAbort(SITE_A, { keep: ["build-a"] }, /can't be split/, XmlAssumptionError);
   });
 
   it("planPrune 之后配置被改过，apply() 不写入", async () => {
@@ -378,7 +378,7 @@ describe("对整个 bucket 生效的规则", () => {
   });
 });
 
-describe("README 里记下的 R2 实测特性", () => {
+describe("R2 的实测特性（文档没写，靠这组用例盯住）", () => {
   it("R2 静默丢掉直接挂在 <Rule> 下的裸 <Prefix>，规则变成对整个 bucket 生效", async () => {
     await r2.setLifecycle(
       lifecycleXml([

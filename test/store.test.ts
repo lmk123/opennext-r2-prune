@@ -61,7 +61,7 @@ describe("buildWrittenAt", () => {
 
   it("解析不出时间时中止，不当成老 build", async () => {
     const { fetchImpl } = stub([
-      ok(`<ListBucketResult><Contents><Key>incremental-cache/b1/a</Key><LastModified>昨天</LastModified></Contents></ListBucketResult>`),
+      ok(`<ListBucketResult><Contents><Key>incremental-cache/b1/a</Key><LastModified>yesterday</LastModified></Contents></ListBucketResult>`),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
     await expect(store.buildWrittenAt("incremental-cache", "b1")).rejects.toThrow(XmlAssumptionError);
@@ -70,7 +70,7 @@ describe("buildWrittenAt", () => {
   it("读取被拒时说明是哪一步", async () => {
     const { fetchImpl } = stub([ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 })]);
     const store = new R2Store({ ...CREDS, fetchImpl });
-    await expect(store.buildWrittenAt("incremental-cache", "b1")).rejects.toThrow(/读取 build 目录的写入时间失败/);
+    await expect(store.buildWrittenAt("incremental-cache", "b1")).rejects.toThrow(/Reading the write time of a build directory failed/);
   });
 });
 
@@ -155,7 +155,7 @@ describe("lifecycle", () => {
 
   it("其它错误照常抛出", async () => {
     const { fetchImpl } = stub([
-      ok("<Error><Code>AccessDenied</Code><Message>没有权限</Message></Error>", { status: 403 }),
+      ok("<Error><Code>AccessDenied</Code><Message>no permission</Message></Error>", { status: 403 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
     await expect(store.getLifecycle("incremental-cache")).rejects.toThrow(S3Error);
@@ -169,7 +169,7 @@ describe("lifecycle", () => {
     const error = await store.getLifecycle("incremental-cache").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(S3Error);
     expect(error).toMatchObject({ operation: "getLifecycle", status: 403, code: "AccessDenied" });
-    expect((error as S3Error).message).toContain("读取 lifecycle 规则失败（HTTP 403，AccessDenied：Access Denied）");
+    expect((error as S3Error).message).toContain("Reading lifecycle rules failed (HTTP 403, AccessDenied: Access Denied)");
     expect((error as S3Error).message).toContain("Admin Read only");
   });
 
@@ -177,17 +177,17 @@ describe("lifecycle", () => {
     const { fetchImpl } = stub([ok("<Error><Code>AccessDenied</Code></Error>", { status: 403 })]);
     const store = new R2Store({ ...CREDS, fetchImpl });
     const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
-    expect(error.message).toContain("写入 lifecycle 规则失败（HTTP 403，AccessDenied）");
+    expect(error.message).toContain("Writing lifecycle rules failed (HTTP 403, AccessDenied)");
     expect(error.message).toContain("Admin Read & Write");
   });
 
   it("非 403 的错误不附加权限提示", async () => {
     const { fetchImpl } = stub([
-      ok("<Error><Code>NoSuchBucket</Code><Message>bucket 不存在</Message></Error>", { status: 404 }),
+      ok("<Error><Code>NoSuchBucket</Code><Message>bucket does not exist</Message></Error>", { status: 404 }),
     ]);
     const store = new R2Store({ ...CREDS, fetchImpl });
     const error = (await store.listBuildIds("incremental-cache").catch((e: unknown) => e)) as S3Error;
-    expect(error.message).toBe("列出 build 目录失败（HTTP 404，NoSuchBucket：bucket 不存在）");
+    expect(error.message).toBe("Listing build directories failed (HTTP 404, NoSuchBucket: bucket does not exist)");
   });
 
   it("清空配置时 PUT 空配置被当格式错误拒掉，就退回 DELETE", async () => {
@@ -209,8 +209,8 @@ describe("lifecycle", () => {
     const store = new R2Store({ ...CREDS, fetchImpl });
     const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
     expect(error).toMatchObject({ operation: "deleteLifecycle", status: 403, code: "AccessDenied" });
-    expect(error.message).toContain("清空 lifecycle 规则失败（HTTP 403，AccessDenied）");
-    expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
+    expect(error.message).toContain("Clearing lifecycle rules failed (HTTP 403, AccessDenied)");
+    expect(error.message).toContain("The earlier PUT of an empty configuration was rejected (HTTP 400, MalformedXML)");
     expect(error.message).toContain("Admin Read & Write");
   });
 
@@ -271,13 +271,13 @@ describe("重试", () => {
     let call = 0;
     const fetchImpl = (async () => {
       call++;
-      return new Response("<Error><Code>InvalidAccessKeyId</Code><Message>密钥无效</Message></Error>", {
+      return new Response("<Error><Code>InvalidAccessKeyId</Code><Message>invalid key</Message></Error>", {
         status: 403,
       });
     }) as unknown as typeof fetch;
 
     const store = new R2Store({ ...CREDS, fetchImpl });
-    await expect(store.listBuildIds("incremental-cache")).rejects.toThrow("密钥无效");
+    await expect(store.listBuildIds("incremental-cache")).rejects.toThrow("invalid key");
     expect(call).toBe(1);
   });
 
@@ -293,7 +293,7 @@ describe("重试", () => {
     expect(error).toBeInstanceOf(S3Error);
     expect(error).toMatchObject({ status: 0, code: "network", operation: "list" });
     // undici 的真正原因在 cause 里，报错要带上，原始错误也要挂在 cause 上
-    expect((error as S3Error).message).toMatch(/列出 build 目录失败（没有拿到响应[\s\S]*ENOTFOUND[\s\S]*endpoint 可达/);
+    expect((error as S3Error).message).toMatch(/Listing build directories failed \(no response[\s\S]*ENOTFOUND[\s\S]*endpoint are reachable/);
     expect((error as S3Error).cause).toBeInstanceOf(TypeError);
     expect(call).toBe(3);
   });
@@ -308,8 +308,8 @@ describe("重试", () => {
     const store = new R2Store({ ...CREDS, fetchImpl });
     const error = (await store.putLifecycle({ prefix: "incremental-cache/", own: [], foreign: [] }).catch((e: unknown) => e)) as S3Error;
     expect(error).toMatchObject({ operation: "deleteLifecycle", status: 0, code: "network" });
-    expect(error.message).toContain("此前 PUT 空配置被拒（HTTP 400，MalformedXML）");
-    expect(error.message).toContain("请确认网络与 endpoint 可达");
+    expect(error.message).toContain("The earlier PUT of an empty configuration was rejected (HTTP 400, MalformedXML)");
+    expect(error.message).toContain("Check that the network and endpoint are reachable");
     expect(error.cause).toBeInstanceOf(TypeError);
   });
 });

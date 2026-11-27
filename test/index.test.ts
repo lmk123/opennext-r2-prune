@@ -88,7 +88,7 @@ describe("prune", () => {
   it("recentBuilds 不配 worker、expireDays / graceHours 非法都拒绝，一个请求都不发", async () => {
     const world = fakeWorld({ buildIds: ["live"], online: "live" });
     await expect(prune({ ...CREDS, ...SITE, recentBuilds: 5, fetch: world.fetch })).rejects.toThrow(
-      /recentBuilds 需要配合 worker/,
+      /recentBuilds requires worker/,
     );
     await expect(prune({ ...CREDS, ...SITE, expireDays: 1.5, fetch: world.fetch })).rejects.toThrow(/expireDays/);
     await expect(prune({ ...CREDS, ...SITE, graceHours: -1, fetch: world.fetch })).rejects.toThrow(/graceHours/);
@@ -141,7 +141,7 @@ describe("prune", () => {
     const error = await prune({ ...CREDS, ...SITE, fetch: world.fetch }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PruneWriteError);
     expect(error).toMatchObject({ written: false, verified: null, rolledBack: null });
-    expect((error as PruneWriteError).message).toMatch(/写入 lifecycle 规则失败（HTTP 403/);
+    expect((error as PruneWriteError).message).toMatch(/Writing lifecycle rules failed \(HTTP 403/);
   });
 
   it("核对不符时撤销并抛 PruneWriteError，撤销成功则标明规则已不在", async () => {
@@ -149,7 +149,7 @@ describe("prune", () => {
     const error = await prune({ ...CREDS, ...SITE, fetch: world.fetch }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PruneWriteError);
     expect(error).toMatchObject({ written: false, verified: false, rolledBack: true });
-    expect((error as PruneWriteError).message).toMatch(/已撤掉本工具在该前缀下的全部规则/);
+    expect((error as PruneWriteError).message).toMatch(/Removed all of this tool's rules under this prefix/);
     expect(world.puts()).toHaveLength(2);
   });
 
@@ -158,7 +158,7 @@ describe("prune", () => {
     const error = await prune({ ...CREDS, ...SITE, fetch: world.fetch }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PruneWriteError);
     expect(error).toMatchObject({ written: true, verified: false, rolledBack: false });
-    expect((error as PruneWriteError).message).toMatch(/撤掉本工具的规则时失败了[\s\S]*ID 形如 opennext-r2-prune:incremental-cache\/<buildId>\/ 的规则/);
+    expect((error as PruneWriteError).message).toMatch(/Removing this tool's rules failed[\s\S]*rules with IDs like opennext-r2-prune:incremental-cache\/<buildId>\//);
   });
 
   it("endpoint 为空串时按 accountId 拼默认地址", async () => {
@@ -214,19 +214,19 @@ describe("planPrune", () => {
         "<Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>",
     );
     await expect(planned.apply()).rejects.toThrow(PlanError);
-    await expect(planned.apply()).rejects.toThrow(/只能调用一次/);
+    await expect(planned.apply()).rejects.toThrow(/can only be called once/);
     expect(world.puts()).toHaveLength(0);
   });
 
   it("写入阶段意外出错时按「可能已写入」报，并给出手动检查的办法", async () => {
     const world = fakeWorld({ buildIds: ["live", "old"], online: "live" });
     const planned = await planPrune({ ...CREDS, ...SITE, fetch: world.fetch });
-    hooks.writeAndVerifyThrows = new TypeError("意外");
+    hooks.writeAndVerifyThrows = new TypeError("unexpected");
     try {
       const error = await planned.apply().catch((e: unknown) => e);
       expect(error).toBeInstanceOf(PruneWriteError);
       expect(error).toMatchObject({ written: true, verified: null, rolledBack: null });
-      expect((error as PruneWriteError).message).toMatch(/无从确认规则是否已写入[\s\S]*ID 形如 opennext-r2-prune:incremental-cache\/<buildId>\/ 的规则/);
+      expect((error as PruneWriteError).message).toMatch(/can't confirm whether the rules were written[\s\S]*rules with IDs like opennext-r2-prune:incremental-cache\/<buildId>\//);
     } finally {
       hooks.writeAndVerifyThrows = undefined;
     }
@@ -237,7 +237,7 @@ describe("planPrune", () => {
     const planned = await planPrune({ ...CREDS, ...SITE, fetch: world.fetch });
     expect(world.puts()).toHaveLength(0);
     await planned.apply();
-    await expect(planned.apply()).rejects.toThrow(/只能调用一次/);
+    await expect(planned.apply()).rejects.toThrow(/can only be called once/);
     expect(world.puts()).toHaveLength(1);
   });
 });

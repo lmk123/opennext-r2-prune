@@ -42,25 +42,25 @@ export interface BuildWrittenAt {
 export type S3Operation = "list" | "listOtherScope" | "writtenAt" | "getLifecycle" | "putLifecycle" | "deleteLifecycle";
 
 const OPERATION_LABEL: Record<S3Operation, string> = {
-  list: "列出 build 目录",
-  listOtherScope: "列出本工具在别的缓存前缀下写过规则的 build 目录",
-  writtenAt: "读取 build 目录的写入时间",
-  getLifecycle: "读取 lifecycle 规则",
-  putLifecycle: "写入 lifecycle 规则",
-  deleteLifecycle: "清空 lifecycle 规则",
+  list: "Listing build directories",
+  listOtherScope: "Listing build directories under other cache prefixes this tool has written rules for",
+  writtenAt: "Reading the write time of a build directory",
+  getLifecycle: "Reading lifecycle rules",
+  putLifecycle: "Writing lifecycle rules",
+  deleteLifecycle: "Clearing lifecycle rules",
 };
 
 // R2 的 token 权限分 Object 级（可限定 bucket）与 Admin 级（整个账号）。lifecycle 是 bucket 级配置，
 // 实测 Object 级 token 不论只读还是读写，GET / PUT ?lifecycle 都返回 403 AccessDenied，只有 Admin 级能用。
 const PERMISSION_HINT: Record<S3Operation, string> = {
-  list: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
-  listOtherScope: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
-  writtenAt: "R2 token 需要能读取该 bucket 的对象，并确认 token 授权的 bucket 包含它。",
+  list: "The R2 token must be able to read objects in this bucket; check that the buckets the token is scoped to include it.",
+  listOtherScope: "The R2 token must be able to read objects in this bucket; check that the buckets the token is scoped to include it.",
+  writtenAt: "The R2 token must be able to read objects in this bucket; check that the buckets the token is scoped to include it.",
   getLifecycle:
-    "lifecycle 是 bucket 级配置，R2 的 Object 级 token（无论只读还是读写）都读不到。" +
-    "只跑 --dry-run 需要 Admin Read only，写入规则需要 Admin Read & Write。",
-  putLifecycle: "写入 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都写不了。",
-  deleteLifecycle: "清空 lifecycle 规则需要 Admin Read & Write 权限的 R2 token，Object 级 token 与 Admin Read only 都做不了。",
+    "Lifecycle is bucket-level configuration, which R2 Object-level tokens (read-only or read-write) can't read. " +
+    "--dry-run alone needs Admin Read only; writing rules needs Admin Read & Write.",
+  putLifecycle: "Writing lifecycle rules needs an R2 token with Admin Read & Write; neither Object-level tokens nor Admin Read only can write them.",
+  deleteLifecycle: "Clearing lifecycle rules needs an R2 token with Admin Read & Write; neither Object-level tokens nor Admin Read only can do it.",
 };
 
 export class S3Error extends Error {
@@ -87,11 +87,11 @@ export class S3Error extends Error {
     context?: string,
     cause?: unknown,
   ) {
-    const reason = detail && detail !== code ? `${code}：${detail}` : code;
+    const reason = detail && detail !== code ? `${code}: ${detail}` : code;
     const hint = status === 403 ? `\n${PERMISSION_HINT[operation]}` : "";
-    const where = status === 0 ? "没有拿到响应" : `HTTP ${status}`;
+    const where = status === 0 ? "no response" : `HTTP ${status}`;
     super(
-      `${OPERATION_LABEL[operation]}失败（${where}，${reason}）${context ? `。${context}` : ""}${hint}`,
+      `${OPERATION_LABEL[operation]} failed (${where}, ${reason})${context ? `. ${context}` : ""}${hint}`,
       cause === undefined ? undefined : { cause },
     );
     this.name = "S3Error";
@@ -131,7 +131,7 @@ export class R2Store {
     } catch (error) {
       // 重试耗尽的网络层失败也归成 S3Error（status 为 0），和 cloudflare.ts 一致：库的调用方按文档列出的
       // 错误类型分类，cli 也不会甩堆栈。status 0 不在 4xx 里，写入时仍按「可能已生效」回读核对
-      throw new S3Error(operation, 0, "network", networkReason(error), "请确认网络与 endpoint 可达，稍后重跑", error);
+      throw new S3Error(operation, 0, "network", networkReason(error), "Check that the network and endpoint are reachable, then run again later", error);
     }
     if (response.status < 400) return response;
 
@@ -174,8 +174,8 @@ export class R2Store {
       // 把规则回收掉，那些目录就再没人清理了 —— 而且全程 0 退出，看不出漏了东西。
       if (result.isTruncated && !result.nextContinuationToken) {
         throw new XmlAssumptionError(
-          "列举结果说还有下一页（IsTruncated=true）却没有 NextContinuationToken，" +
-            "无法确认已经看到全部 build，已中止。",
+          "The listing says there is another page (IsTruncated=true) but has no NextContinuationToken, " +
+            "so it can't confirm all builds were seen; aborted.",
         );
       }
       token = result.isTruncated ? result.nextContinuationToken : undefined;
@@ -204,8 +204,8 @@ export class R2Store {
     // 读不出时间就无从判断它是不是正在部署的新 build，不能当成老的去删
     if (Number.isNaN(time)) {
       throw new XmlAssumptionError(
-        `读取 build ${buildId} 的写入时间时，对象的 LastModified 是 ${JSON.stringify(raw)}，解析不出时间，` +
-          `无法判断它是不是刚写入、还没上线的 build，已中止。可加 --grace-hours 0 跳过这项检查。`,
+        `While reading the write time of build ${buildId}, the object's LastModified was ${JSON.stringify(raw)}, which can't be parsed as a time, ` +
+          `so it can't tell whether this is a freshly written build that isn't live yet; aborted. Add --grace-hours 0 to skip this check.`,
       );
     }
     const date = Date.parse(response.headers.get("date") ?? "");
@@ -218,7 +218,9 @@ export class R2Store {
       const response = await this.#request("getLifecycle", `${this.#base}?lifecycle`);
       return parseLifecycle(await response.text(), prefix);
     } catch (error) {
-      // 从未配过规则的 bucket 会返回 404 NoSuchLifecycleConfiguration，那是空配置不是错误
+      // S3 规范：从未配过规则的 bucket 返回 404 NoSuchLifecycleConfiguration，按空配置处理。
+      // R2 上没实测过：新建 bucket 自带一条 Default Multipart Abort Rule，这条路径很难走到
+      // （清空配置后 R2 读回的是 200 加一份空配置，见 e2e）
       if (error instanceof S3Error && (error.status === 404 || error.code === "NoSuchLifecycleConfiguration")) {
         return { prefix: normalizePrefix(prefix), own: [], foreign: [], others: [], malformed: [] };
       }
@@ -247,15 +249,15 @@ export class R2Store {
       } catch (deleteError) {
         // DELETE 的报错会盖住 PUT 被拒的原因，两步都失败时要一并说清
         if (!(deleteError instanceof S3Error)) throw deleteError;
-        const putReason = error.detail && error.detail !== error.code ? `${error.code}：${error.detail}` : error.code;
-        const before = `此前 PUT 空配置被拒（HTTP ${error.status}，${putReason}），才改用 DELETE 清空`;
+        const putReason = error.detail && error.detail !== error.code ? `${error.code}: ${error.detail}` : error.code;
+        const before = `The earlier PUT of an empty configuration was rejected (HTTP ${error.status}, ${putReason}), so it fell back to DELETE to clear it`;
         throw new S3Error(
           "deleteLifecycle",
           deleteError.status,
           deleteError.code,
           deleteError.detail,
           // DELETE 自己的补救办法（比如网络失败时的「确认 endpoint 可达」）接在前情后面，不能丢
-          deleteError.context ? `${before}。${deleteError.context}` : before,
+          deleteError.context ? `${before}. ${deleteError.context}` : before,
           deleteError.cause,
         );
       }
@@ -268,7 +270,7 @@ function networkReason(error: unknown): string {
   const text = String(error);
   if (!(error instanceof Error) || error.cause === undefined) return text;
   const cause = error.cause instanceof Error ? error.cause.message : String(error.cause);
-  return `${text}（${cause}）`;
+  return `${text} (${cause})`;
 }
 
 function extractCode(xml: string): string | undefined {

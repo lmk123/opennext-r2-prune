@@ -75,8 +75,8 @@ export class CloudflareApi {
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) {
         throw paginationError(
-          `列举 deployment 翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`,
-          "deployment",
+          `Listing deployments went through ${MAX_PAGES} pages without reaching the end; the pagination parameters may not be honored`,
+          "deployments",
         );
       }
       const { result, result_info: info } = await this.#get<{
@@ -91,7 +91,7 @@ export class CloudflareApi {
       fetched += items.length;
       const fresh = items.filter((d) => d.id === undefined || !seen.has(d.id));
       if (items.length > 0 && fresh.length === 0) {
-        throw paginationError(`第 ${page} 页的 deployment 全是翻过的，分页参数可能没被接受`, "deployment");
+        throw paginationError(`Every deployment on page ${page} was already seen; the pagination parameters may not be honored`, "deployments");
       }
       for (const d of fresh) if (d.id !== undefined) seen.add(d.id);
       if (fresh.length > 0) {
@@ -133,9 +133,9 @@ export class CloudflareApi {
     }
     throw paginationError(
       duplicate !== undefined && previous === undefined
-        ? `连续 ${MAX_LIST_ATTEMPTS} 次列举预览，预览 ${duplicate} 都在不同的页里重复出现，分页参数可能没被接受`
-        : `连续 ${MAX_LIST_ATTEMPTS} 次列举预览的结果都不一致，预览可能正在频繁增删`,
-      "预览",
+        ? `In ${MAX_LIST_ATTEMPTS} consecutive listings of previews, preview ${duplicate} appeared on more than one page; the pagination parameters may not be honored`
+        : `${MAX_LIST_ATTEMPTS} consecutive listings of previews all disagreed; previews may be being added or removed frequently`,
+      "previews",
     );
   }
 
@@ -154,7 +154,7 @@ export class CloudflareApi {
     let firstPage: { names: string[]; paginated: boolean } | undefined;
     for (let page = 1; ; page++) {
       if (page > MAX_PAGES) {
-        throw paginationError(`列举预览翻了 ${MAX_PAGES} 页还没结束，分页参数可能没被接受`, "预览");
+        throw paginationError(`Listing previews went through ${MAX_PAGES} pages without reaching the end; the pagination parameters may not be honored`, "previews");
       }
       const { result, result_info: info } = await this.#get<{ name: string; urls?: string[] }[] | null>(
         `/workers/workers/${encodeURIComponent(worker)}/previews`,
@@ -205,11 +205,11 @@ export class CloudflareApi {
       );
     } catch (error) {
       // 重试耗尽的网络层失败也归成「预期内的失败」，否则 cli 会甩出一整段堆栈
-      throw new CloudflareApiError(0, "network", `GET ${url.pathname} 请求失败：${String(error)}`);
+      throw new CloudflareApiError(0, "network", `GET ${url.pathname} failed: ${String(error)}`);
     }
     // 重试耗尽仍是 429 / 5xx 时，别让人以为是 token 或参数填错了
     const transient = isTransientStatus(response.status)
-      ? `（连续 ${MAX_ATTEMPTS} 次${response.status === 429 ? "被限流" : "服务端故障"}，稍后重跑即可）`
+      ? ` (${response.status === 429 ? "rate limited" : "server error"} ${MAX_ATTEMPTS} times in a row; just run again later)`
       : "";
 
     let body: Envelope<T>;
@@ -219,7 +219,7 @@ export class CloudflareApi {
       throw new CloudflareApiError(
         response.status,
         String(response.status),
-        `GET ${url.pathname} 返回的不是 JSON（HTTP ${response.status}）${transient}`,
+        `GET ${url.pathname} didn't return JSON (HTTP ${response.status})${transient}`,
       );
     }
     if (!response.ok || !body.success) {
@@ -227,15 +227,15 @@ export class CloudflareApi {
       throw new CloudflareApiError(
         response.status,
         String(first?.code ?? response.status),
-        `GET ${url.pathname} 失败：${first?.message ?? `HTTP ${response.status}`}${transient}`,
+        `GET ${url.pathname} failed: ${first?.message ?? `HTTP ${response.status}`}${transient}`,
       );
     }
     return body;
   }
 }
 
-function paginationError(reason: string, what: "预览" | "deployment"): CloudflareApiError {
-  return new CloudflareApiError(0, "pagination", `${reason}，无法确认已经看到全部${what}，已中止。`);
+function paginationError(reason: string, what: "previews" | "deployments"): CloudflareApiError {
+  return new CloudflareApiError(0, "pagination", `${reason}. Can't confirm all ${what} were seen; aborted.`);
 }
 
 /**
